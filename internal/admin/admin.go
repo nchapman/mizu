@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/nchapman/repeat/internal/auth"
 	"github.com/nchapman/repeat/internal/config"
 	"github.com/nchapman/repeat/internal/feeds"
 	"github.com/nchapman/repeat/internal/post"
@@ -25,28 +26,123 @@ type Server struct {
 	posts  *post.Store
 	feeds  *feeds.Service
 	poller *feeds.Poller
+	auth   *auth.Auth
 	bgCtx  context.Context // lives for the process lifetime; used for fire-and-forget jobs
 }
 
-func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller) *Server {
-	return &Server{bgCtx: bgCtx, cfg: cfg, posts: posts, feeds: feedSvc, poller: poller}
+func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller, a *auth.Auth) *Server {
+	return &Server{bgCtx: bgCtx, cfg: cfg, posts: posts, feeds: feedSvc, poller: poller, auth: a}
 }
 
 func (s *Server) Routes(r chi.Router) {
-	// TODO: auth middleware (cookie session, password from config).
 	r.Route("/api", func(r chi.Router) {
-		r.Get("/posts", s.listPosts)
-		r.Post("/posts", s.createPost)
+		// Public endpoints — used by the SPA before login to decide
+		// whether to render setup, login, or the app shell.
+		r.Get("/me", s.me)
+		r.Post("/setup", s.setup)
+		r.Post("/login", s.login)
+		r.Post("/logout", s.logout)
 
-		r.Get("/subscriptions", s.listSubscriptions)
-		r.Post("/subscriptions", s.addSubscription)
-		r.Delete("/subscriptions", s.removeSubscription)
+		// Everything else requires a valid session.
+		r.Group(func(r chi.Router) {
+			r.Use(s.auth.Middleware)
 
-		r.Get("/timeline", s.timeline)
-		r.Post("/items/{id}/read", s.markItemRead)
-		r.Delete("/items/{id}/read", s.markItemUnread)
+			r.Get("/posts", s.listPosts)
+			r.Post("/posts", s.createPost)
+
+			r.Get("/subscriptions", s.listSubscriptions)
+			r.Post("/subscriptions", s.addSubscription)
+			r.Delete("/subscriptions", s.removeSubscription)
+
+			r.Get("/timeline", s.timeline)
+			r.Post("/items/{id}/read", s.markItemRead)
+			r.Delete("/items/{id}/read", s.markItemUnread)
+		})
 	})
 	r.Get("/*", s.serveSPA)
+}
+
+// --- auth endpoints ---
+
+func (s *Server) me(w http.ResponseWriter, r *http.Request) {
+	var token string
+	if c, err := r.Cookie(auth.CookieName); err == nil {
+		token = c.Value
+	}
+	configured, authed := s.auth.Status(token)
+	writeJSON(w, http.StatusOK, map[string]bool{
+		"configured":    configured,
+		"authenticated": authed,
+	})
+}
+
+func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Password string `json:"password"`
+		Token    string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	err := s.auth.SetPassword(in.Password, in.Token)
+	if errors.Is(err, auth.ErrAlreadyConfigured) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	if errors.Is(err, auth.ErrPasswordTooShort) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if errors.Is(err, auth.ErrBadSetupToken) {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Auto-login after setup so the user lands directly in the app.
+	token, err := s.auth.CreateSession()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	auth.SetCookie(w, token)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	if !s.auth.Configured() {
+		http.Error(w, "not configured", http.StatusConflict)
+		return
+	}
+	var in struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if !s.auth.Verify(in.Password) {
+		http.Error(w, "invalid password", http.StatusUnauthorized)
+		return
+	}
+	token, err := s.auth.CreateSession()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	auth.SetCookie(w, token)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(auth.CookieName); err == nil {
+		s.auth.DestroySession(c.Value)
+	}
+	auth.ClearCookie(w)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type postDTO struct {

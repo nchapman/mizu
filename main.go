@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/nchapman/repeat/internal/admin"
+	"github.com/nchapman/repeat/internal/auth"
 	"github.com/nchapman/repeat/internal/config"
 	"github.com/nchapman/repeat/internal/feeds"
 	"github.com/nchapman/repeat/internal/post"
@@ -62,7 +63,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("site: %v", err)
 	}
-	adminSrv := admin.New(ctx, cfg, posts, feedSvc, poller)
+	authSvc, err := auth.New(cfg.Paths.State)
+	if err != nil {
+		log.Fatalf("auth: %v", err)
+	}
+	if t := authSvc.SetupToken(); t != "" {
+		log.Printf("first-run setup required — visit %s/admin and use this one-time token: %s",
+			cfg.Site.BaseURL, t)
+	}
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		authSvc.ReapSessions(ctx)
+	}()
+	adminSrv := admin.New(ctx, cfg, posts, feedSvc, poller, authSvc)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)

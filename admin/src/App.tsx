@@ -9,15 +9,151 @@ type Post = {
   path: string;
 };
 
+type Me = { configured: boolean; authenticated: boolean };
+
 export function App() {
+  const [me, setMe] = useState<Me | null>(null);
+
+  async function loadMe() {
+    const r = await fetch("/admin/api/me");
+    setMe(await r.json());
+  }
+  useEffect(() => {
+    loadMe();
+  }, []);
+
+  if (!me) return null;
+  if (!me.configured) return <Setup onDone={loadMe} />;
+  if (!me.authenticated) return <Login onDone={loadMe} />;
+  return <Home onLogout={loadMe} />;
+}
+
+const shellStyle: React.CSSProperties = {
+  font: "15px/1.5 system-ui",
+  maxWidth: 640,
+  margin: "2em auto",
+  padding: "0 1em",
+};
+
+function Setup({ onDone }: { onDone: () => void }) {
+  const [token, setToken] = useState("");
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setErr("");
+    if (!token.trim()) return setErr("Setup token required (printed in the server log).");
+    if (pw.length < 8) return setErr("Password must be at least 8 characters.");
+    if (pw !== pw2) return setErr("Passwords don't match.");
+    setBusy(true);
+    try {
+      const r = await fetch("/admin/api/setup", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password: pw, token: token.trim() }),
+      });
+      if (!r.ok) {
+        setErr((await r.text()) || "Setup failed.");
+        return;
+      }
+      onDone();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div style={shellStyle}>
+      <h1 style={{ fontSize: "1.2em" }}>Welcome to repeat</h1>
+      <p style={{ color: "#555" }}>
+        Set a password to lock down the admin UI. The one-time setup token was printed to your
+        server log when repeat started — paste it below to prove you're the operator.
+      </p>
+      <form onSubmit={submit} style={{ border: "1px solid #ddd", borderRadius: 8, padding: "1em" }}>
+        <label style={{ display: "block", marginBottom: ".5em" }}>
+          <div style={{ fontSize: ".9em", color: "#555" }}>Setup token</div>
+          <input autoFocus value={token} onChange={(e) => setToken(e.target.value)}
+            spellCheck={false} autoCapitalize="off"
+            style={{ width: "100%", padding: ".4em", fontSize: "1em", fontFamily: "monospace" }} />
+        </label>
+        <label style={{ display: "block", marginBottom: ".5em" }}>
+          <div style={{ fontSize: ".9em", color: "#555" }}>New password</div>
+          <input type="password" value={pw} onChange={(e) => setPw(e.target.value)}
+            style={{ width: "100%", padding: ".4em", fontSize: "1em" }} />
+        </label>
+        <label style={{ display: "block", marginBottom: ".5em" }}>
+          <div style={{ fontSize: ".9em", color: "#555" }}>Confirm password</div>
+          <input type="password" value={pw2} onChange={(e) => setPw2(e.target.value)}
+            style={{ width: "100%", padding: ".4em", fontSize: "1em" }} />
+        </label>
+        {err && <div style={{ color: "#b00", fontSize: ".9em", marginBottom: ".5em" }}>{err}</div>}
+        <button type="submit" disabled={busy}>{busy ? "Saving…" : "Set password"}</button>
+      </form>
+    </div>
+  );
+}
+
+function Login({ onDone }: { onDone: () => void }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setErr("");
+    setBusy(true);
+    try {
+      const r = await fetch("/admin/api/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password: pw }),
+      });
+      if (!r.ok) {
+        setErr(r.status === 401 ? "Wrong password." : (await r.text()) || "Login failed.");
+        return;
+      }
+      onDone();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div style={shellStyle}>
+      <h1 style={{ fontSize: "1.2em" }}>Sign in</h1>
+      <form onSubmit={submit} style={{ border: "1px solid #ddd", borderRadius: 8, padding: "1em" }}>
+        <input type="password" autoFocus placeholder="Password" value={pw}
+          onChange={(e) => setPw(e.target.value)}
+          style={{ width: "100%", padding: ".4em", fontSize: "1em", marginBottom: ".5em" }} />
+        {err && <div style={{ color: "#b00", fontSize: ".9em", marginBottom: ".5em" }}>{err}</div>}
+        <button type="submit" disabled={busy || !pw}>{busy ? "Signing in…" : "Sign in"}</button>
+      </form>
+    </div>
+  );
+}
+
+function Home({ onLogout }: { onLogout: () => void }) {
   const [posts, setPosts] = useState<Post[]>([]);
   const [body, setBody] = useState("");
   const [title, setTitle] = useState("");
   const [showTitle, setShowTitle] = useState(false);
   const [posting, setPosting] = useState(false);
 
+  const [loadErr, setLoadErr] = useState("");
   async function load() {
     const r = await fetch("/admin/api/posts");
+    if (r.status === 401) {
+      onLogout();
+      return;
+    }
+    if (!r.ok) {
+      setLoadErr(`Failed to load posts (${r.status})`);
+      return;
+    }
+    setLoadErr("");
     setPosts(await r.json());
   }
   useEffect(() => {
@@ -44,9 +180,19 @@ export function App() {
     }
   }
 
+  async function logout() {
+    await fetch("/admin/api/logout", { method: "POST" });
+    onLogout();
+  }
+
   return (
-    <div style={{ font: "15px/1.5 system-ui", maxWidth: 640, margin: "2em auto", padding: "0 1em" }}>
-      <h1 style={{ fontSize: "1.2em" }}>repeat</h1>
+    <div style={shellStyle}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <h1 style={{ fontSize: "1.2em" }}>repeat</h1>
+        <button type="button" onClick={logout} style={{ background: "none", border: "none", color: "#666", cursor: "pointer" }}>
+          Sign out
+        </button>
+      </div>
 
       <form onSubmit={submit} style={{ marginBottom: "2em", border: "1px solid #ddd", borderRadius: 8, padding: "1em" }}>
         {showTitle && (
@@ -73,6 +219,8 @@ export function App() {
           </button>
         </div>
       </form>
+
+      {loadErr && <div style={{ color: "#b00", fontSize: ".9em", marginBottom: "1em" }}>{loadErr}</div>}
 
       {posts.map((p) => (
         <article key={p.id} style={{ marginBottom: "1.5em", paddingBottom: "1em", borderBottom: "1px solid #eee" }}>
