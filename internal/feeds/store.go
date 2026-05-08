@@ -1,0 +1,256 @@
+// Package feeds is the inbound side of repeat: feeds the user subscribes to,
+// items fetched from those feeds, and read state.
+//
+// Two storage layers cooperate:
+//
+//   - subscriptions.opml on disk is the durable, portable source of truth
+//     for the user's subscription list.
+//   - cache/repeat.db (SQLite) is a regeneratable cache of fetched items
+//     and read state, indexed for timeline queries.
+//
+// The DB can be deleted at any time: the next poll will repopulate items
+// from the OPML. Read state is the only thing that doesn't survive a wipe;
+// a future iteration may move it to a JSON sidecar for portability.
+package feeds
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+const schema = `
+CREATE TABLE IF NOT EXISTS feeds (
+  id              INTEGER PRIMARY KEY,
+  url             TEXT NOT NULL UNIQUE,
+  title           TEXT,
+  site_url        TEXT,
+  category        TEXT,
+  etag            TEXT,
+  last_modified   TEXT,
+  last_fetched_at INTEGER,
+  last_error      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS items (
+  id           INTEGER PRIMARY KEY,
+  feed_id      INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+  guid         TEXT NOT NULL,
+  url          TEXT,
+  title        TEXT,
+  author       TEXT,
+  content      TEXT,
+  published_at INTEGER,
+  fetched_at   INTEGER NOT NULL,
+  read_at      INTEGER,
+  UNIQUE(feed_id, guid)
+);
+
+CREATE INDEX IF NOT EXISTS items_published_idx ON items(published_at DESC);
+`
+
+type Feed struct {
+	ID            int64
+	URL           string
+	Title         string
+	SiteURL       string
+	Category      string
+	ETag          string
+	LastModified  string
+	LastFetchedAt time.Time
+	LastError     string
+}
+
+type Item struct {
+	ID          int64
+	FeedID      int64
+	FeedTitle   string
+	GUID        string
+	URL         string
+	Title       string
+	Author      string
+	Content     string
+	PublishedAt time.Time
+	FetchedAt   time.Time
+	ReadAt      *time.Time
+}
+
+type Store struct {
+	db *sql.DB
+}
+
+func OpenStore(cacheDir string) (*Store, error) {
+	dsn := filepath.Join(cacheDir, "repeat.db") + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("schema: %w", err)
+	}
+	return &Store{db: db}, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+// UpsertFeed inserts or updates a feed by URL, preserving fetch metadata
+// (etag, last_modified) on conflict so an OPML re-import doesn't force a
+// full re-fetch.
+func (s *Store) UpsertFeed(ctx context.Context, f *Feed) (int64, error) {
+	const q = `
+INSERT INTO feeds (url, title, site_url, category)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(url) DO UPDATE SET
+  title    = COALESCE(NULLIF(excluded.title, ''), feeds.title),
+  site_url = COALESCE(NULLIF(excluded.site_url, ''), feeds.site_url),
+  category = excluded.category
+RETURNING id`
+	var id int64
+	err := s.db.QueryRowContext(ctx, q, f.URL, f.Title, f.SiteURL, f.Category).Scan(&id)
+	return id, err
+}
+
+func (s *Store) DeleteFeedByURL(ctx context.Context, url string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM feeds WHERE url = ?`, url)
+	return err
+}
+
+func (s *Store) ListFeeds(ctx context.Context) ([]Feed, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, url, COALESCE(title,''), COALESCE(site_url,''), COALESCE(category,''),
+       COALESCE(etag,''), COALESCE(last_modified,''), COALESCE(last_fetched_at,0),
+       COALESCE(last_error,'')
+FROM feeds ORDER BY title`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Feed
+	for rows.Next() {
+		var f Feed
+		var fetched int64
+		if err := rows.Scan(&f.ID, &f.URL, &f.Title, &f.SiteURL, &f.Category,
+			&f.ETag, &f.LastModified, &fetched, &f.LastError); err != nil {
+			return nil, err
+		}
+		if fetched > 0 {
+			f.LastFetchedAt = time.Unix(fetched, 0)
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// MarkFetched updates fetch metadata after a successful poll.
+func (s *Store) MarkFetched(ctx context.Context, feedID int64, etag, lastModified string) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE feeds SET etag = ?, last_modified = ?, last_fetched_at = ?, last_error = NULL
+WHERE id = ?`, etag, lastModified, time.Now().Unix(), feedID)
+	return err
+}
+
+func (s *Store) MarkFetchError(ctx context.Context, feedID int64, msg string) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE feeds SET last_fetched_at = ?, last_error = ? WHERE id = ?`,
+		time.Now().Unix(), msg, feedID)
+	return err
+}
+
+// InsertItem inserts a single item, ignoring duplicates on (feed_id, guid).
+// Returns true if the row was newly inserted.
+func (s *Store) InsertItem(ctx context.Context, it *Item) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+INSERT INTO items (feed_id, guid, url, title, author, content, published_at, fetched_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(feed_id, guid) DO NOTHING`,
+		it.FeedID, it.GUID, it.URL, it.Title, it.Author, it.Content,
+		nullableUnix(it.PublishedAt), it.FetchedAt.Unix())
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// Timeline returns items across all feeds, newest first. `before` is an
+// exclusive cursor on published_at; pass zero for the most recent page.
+func (s *Store) Timeline(ctx context.Context, before time.Time, limit int, unreadOnly bool) ([]Item, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	args := []any{}
+	where := "1=1"
+	if !before.IsZero() {
+		where += " AND items.published_at < ?"
+		args = append(args, before.Unix())
+	}
+	if unreadOnly {
+		where += " AND items.read_at IS NULL"
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, `
+SELECT items.id, items.feed_id, COALESCE(feeds.title,''), items.guid,
+       COALESCE(items.url,''), COALESCE(items.title,''), COALESCE(items.author,''),
+       COALESCE(items.content,''), COALESCE(items.published_at,0), items.fetched_at,
+       items.read_at
+FROM items JOIN feeds ON feeds.id = items.feed_id
+WHERE `+where+`
+ORDER BY items.published_at DESC, items.id DESC
+LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Item
+	for rows.Next() {
+		var it Item
+		var pub, fetched int64
+		var read sql.NullInt64
+		if err := rows.Scan(&it.ID, &it.FeedID, &it.FeedTitle, &it.GUID, &it.URL,
+			&it.Title, &it.Author, &it.Content, &pub, &fetched, &read); err != nil {
+			return nil, err
+		}
+		if pub > 0 {
+			it.PublishedAt = time.Unix(pub, 0)
+		}
+		it.FetchedAt = time.Unix(fetched, 0)
+		if read.Valid {
+			t := time.Unix(read.Int64, 0)
+			it.ReadAt = &t
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) MarkRead(ctx context.Context, itemID int64, read bool) error {
+	if read {
+		_, err := s.db.ExecContext(ctx, `UPDATE items SET read_at = ? WHERE id = ?`, time.Now().Unix(), itemID)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE items SET read_at = NULL WHERE id = ?`, itemID)
+	return err
+}
+
+// FeedFetchInfo returns the conditional-GET headers for the next poll.
+func (s *Store) FeedFetchInfo(ctx context.Context, feedID int64) (etag, lastModified string, err error) {
+	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(etag,''), COALESCE(last_modified,'') FROM feeds WHERE id = ?`, feedID)
+	err = row.Scan(&etag, &lastModified)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	}
+	return
+}
+
+func nullableUnix(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t.Unix()
+}

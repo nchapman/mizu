@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -12,6 +13,7 @@ type Config struct {
 	Site   Site   `yaml:"site"`
 	Server Server `yaml:"server"`
 	Paths  Paths  `yaml:"paths"`
+	Poller Poller `yaml:"poller"`
 }
 
 type Site struct {
@@ -26,12 +28,18 @@ type Server struct {
 }
 
 type Paths struct {
-	Content   string `yaml:"content"`
-	Media     string `yaml:"media"`
-	Cache     string `yaml:"cache"`
-	State     string `yaml:"state"`
-	AdminDist string `yaml:"admin_dist"`
-	Templates string `yaml:"templates"`
+	Content       string `yaml:"content"`
+	Media         string `yaml:"media"`
+	Cache         string `yaml:"cache"`
+	State         string `yaml:"state"`
+	AdminDist     string `yaml:"admin_dist"`
+	Templates     string `yaml:"templates"`
+	Subscriptions string `yaml:"subscriptions"`
+}
+
+type Poller struct {
+	Interval  time.Duration `yaml:"interval"`
+	UserAgent string        `yaml:"user_agent"`
 }
 
 func Load(path string) (*Config, error) {
@@ -42,6 +50,15 @@ func Load(path string) (*Config, error) {
 	var c Config
 	if err := yaml.Unmarshal(b, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if c.Poller.Interval == 0 {
+		c.Poller.Interval = time.Hour
+	}
+	if c.Poller.UserAgent == "" {
+		c.Poller.UserAgent = "repeat/0.1"
+	}
+	if c.Paths.Subscriptions == "" {
+		c.Paths.Subscriptions = "./subscriptions.opml"
 	}
 	for _, dir := range []string{
 		filepath.Join(c.Paths.Content, "posts"),
