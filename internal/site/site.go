@@ -1,8 +1,10 @@
 package site
 
 import (
+	"bytes"
 	"fmt"
 	"html/template"
+	"log"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -50,7 +52,10 @@ type renderedPost struct {
 }
 
 func (s *Server) render(p *post.Post) renderedPost {
-	html, _ := p.RenderHTML()
+	html, err := p.RenderHTML()
+	if err != nil {
+		log.Printf("render post %s: %v", p.ID, err)
+	}
 	return renderedPost{Post: p, HTML: template.HTML(html)}
 }
 
@@ -103,7 +108,10 @@ func (s *Server) rss(w http.ResponseWriter, r *http.Request) {
 		Created:     time.Now(),
 	}
 	for _, p := range s.posts.Recent(50) {
-		html, _ := p.RenderHTML()
+		html, err := p.RenderHTML()
+		if err != nil {
+			log.Printf("rss render %s: %v", p.ID, err)
+		}
 		title := p.Title
 		if title == "" {
 			title = p.Excerpt(80)
@@ -116,13 +124,25 @@ func (s *Server) rss(w http.ResponseWriter, r *http.Request) {
 			Created:     p.Date,
 		})
 	}
+	var buf bytes.Buffer
+	if err := feed.WriteRss(&buf); err != nil {
+		log.Printf("rss write: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
-	_ = feed.WriteRss(w)
+	_, _ = buf.WriteTo(w)
 }
 
+// exec renders into a buffer first so a mid-render template error doesn't
+// leave the client with a partial 200 response.
 func (s *Server) exec(w http.ResponseWriter, name string, data any) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.tpls[name].ExecuteTemplate(w, name, data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	var buf bytes.Buffer
+	if err := s.tpls[name].ExecuteTemplate(&buf, name, data); err != nil {
+		log.Printf("template %s: %v", name, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = buf.WriteTo(w)
 }

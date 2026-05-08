@@ -48,21 +48,28 @@ func (p *Post) RenderHTML() (string, error) {
 }
 
 // Excerpt returns a short text-only preview for index listings.
+// max is a rune count, not a byte count, so we don't slice mid-codepoint.
 func (p *Post) Excerpt(max int) string {
 	body := strings.TrimSpace(p.Body)
-	if len(body) <= max {
+	runes := []rune(body)
+	if len(runes) <= max {
 		return body
 	}
-	return body[:max] + "…"
+	return string(runes[:max]) + "…"
 }
 
 // Store loads, lists, and writes posts. Single-user scale: all posts live in memory.
 type Store struct {
 	dir string
 
-	mu    sync.RWMutex
-	byID  map[string]*Post
-	order []*Post // newest first
+	mu      sync.RWMutex
+	byID    map[string]*Post
+	bySlug  map[string]*Post // key: "YYYY/MM/DD/slug" — articles only
+	order   []*Post          // newest first
+}
+
+func slugKey(p *Post) string {
+	return fmt.Sprintf("%04d/%02d/%02d/%s", p.Date.Year(), p.Date.Month(), p.Date.Day(), slugify(p.Title))
 }
 
 func NewStore(contentDir string) (*Store, error) {
@@ -79,6 +86,7 @@ func (s *Store) reload() error {
 		return err
 	}
 	byID := make(map[string]*Post)
+	bySlug := make(map[string]*Post)
 	var order []*Post
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
@@ -89,12 +97,16 @@ func (s *Store) reload() error {
 			return fmt.Errorf("read %s: %w", e.Name(), err)
 		}
 		byID[p.ID] = p
+		if !p.IsNote() {
+			bySlug[slugKey(p)] = p
+		}
 		order = append(order, p)
 	}
 	sort.Slice(order, func(i, j int) bool { return order[i].Date.After(order[j].Date) })
 
 	s.mu.Lock()
 	s.byID = byID
+	s.bySlug = bySlug
 	s.order = order
 	s.mu.Unlock()
 	return nil
@@ -122,16 +134,13 @@ func (s *Store) ByID(id string) (*Post, bool) {
 func (s *Store) BySlug(year, month, day int, slug string) (*Post, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, p := range s.order {
-		if p.IsNote() {
-			continue
-		}
-		if p.Date.Year() == year && int(p.Date.Month()) == month && p.Date.Day() == day && slugify(p.Title) == slug {
-			return p, true
-		}
-	}
-	return nil, false
+	p, ok := s.bySlug[fmt.Sprintf("%04d/%02d/%02d/%s", year, month, day, slug)]
+	return p, ok
 }
+
+// ErrSlugTaken is returned when a new article's date+slug would collide with
+// an existing post's URL. The caller should change the title.
+var ErrSlugTaken = errors.New("post with this date and slug already exists")
 
 // Create writes a new post to disk and adds it to the in-memory index.
 func (s *Store) Create(title, body string, tags []string) (*Post, error) {
@@ -143,11 +152,24 @@ func (s *Store) Create(title, body string, tags []string) (*Post, error) {
 		Body:  body,
 	}
 	p.Filename = filenameFor(p)
+
+	s.mu.Lock()
+	if !p.IsNote() {
+		if _, taken := s.bySlug[slugKey(p)]; taken {
+			s.mu.Unlock()
+			return nil, ErrSlugTaken
+		}
+	}
+	s.mu.Unlock()
+
 	if err := writeFile(filepath.Join(s.dir, p.Filename), p); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	s.byID[p.ID] = p
+	if !p.IsNote() {
+		s.bySlug[slugKey(p)] = p
+	}
 	s.order = append([]*Post{p}, s.order...)
 	s.mu.Unlock()
 	return p, nil
@@ -204,11 +226,12 @@ func writeFile(path string, p *Post) error {
 }
 
 func filenameFor(p *Post) string {
-	stem := p.ID
-	if !p.IsNote() {
-		stem = slugify(p.Title)
+	if p.IsNote() {
+		return fmt.Sprintf("%s-%s.md", p.Date.Format("2006-01-02"), p.ID)
 	}
-	return fmt.Sprintf("%s-%s.md", p.Date.Format("2006-01-02"), stem)
+	// Articles include a short ID suffix so distinct posts that slugify to the
+	// same string on the same day don't overwrite each other.
+	return fmt.Sprintf("%s-%s-%s.md", p.Date.Format("2006-01-02"), slugify(p.Title), p.ID[:4])
 }
 
 // --- helpers ---

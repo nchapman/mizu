@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 )
@@ -43,8 +44,8 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	for _, dir := range []string{
-		c.Paths.Content + "/posts",
-		c.Paths.Content + "/drafts",
+		filepath.Join(c.Paths.Content, "posts"),
+		filepath.Join(c.Paths.Content, "drafts"),
 		c.Paths.Media,
 		c.Paths.Cache,
 		c.Paths.State,

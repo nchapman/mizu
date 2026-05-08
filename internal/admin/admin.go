@@ -2,9 +2,10 @@ package admin
 
 import (
 	"encoding/json"
-	"io/fs"
+	"errors"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -76,6 +77,10 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p, err := s.posts.Create(in.Title, in.Body, in.Tags)
+	if errors.Is(err, post.ErrSlugTaken) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -85,29 +90,40 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 
 // serveSPA serves the built React admin from disk. Falls back to a placeholder
 // page if admin/dist doesn't exist yet (i.e. you haven't run `npm run build`).
+//
+// Path traversal: since we use http.ServeFile (not http.FileServer), we
+// must clean the URL path ourselves and verify the resolved file stays
+// inside the dist directory.
 func (s *Server) serveSPA(w http.ResponseWriter, r *http.Request) {
-	dist := s.cfg.Paths.AdminDist
-	if _, err := os.Stat(filepath.Join(dist, "index.html")); err != nil {
+	dist, err := filepath.Abs(s.cfg.Paths.AdminDist)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	indexPath := filepath.Join(dist, "index.html")
+	if _, err := os.Stat(indexPath); err != nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(placeholderHTML))
 		return
 	}
-	rel := strings.TrimPrefix(r.URL.Path, "/admin")
-	if rel == "" || rel == "/" {
-		http.ServeFile(w, r, filepath.Join(dist, "index.html"))
+
+	rel := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/admin"))
+	if rel == "/" {
+		http.ServeFile(w, r, indexPath)
 		return
 	}
-	full := filepath.Join(dist, rel)
+	full := filepath.Join(dist, filepath.FromSlash(rel))
+	if !strings.HasPrefix(full, dist+string(os.PathSeparator)) {
+		http.NotFound(w, r)
+		return
+	}
 	if info, err := os.Stat(full); err == nil && !info.IsDir() {
 		http.ServeFile(w, r, full)
 		return
 	}
 	// SPA fallback: unknown paths render the app shell.
-	http.ServeFile(w, r, filepath.Join(dist, "index.html"))
+	http.ServeFile(w, r, indexPath)
 }
-
-// _ keeps the fs import satisfied for future embed.FS swap.
-var _ = fs.ValidPath
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
