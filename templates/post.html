@@ -1,0 +1,9 @@
+{{template "base" .}}
+{{define "title"}}{{if .Post.Title}}{{.Post.Title}} · {{end}}{{.Site.Title}}{{end}}
+{{define "main"}}
+<article>
+  <time datetime="{{.Post.Date.Format "2006-01-02T15:04:05Z07:00"}}">{{.Post.Date.Format "Jan 2, 2006"}}</time>
+  {{if .Post.Title}}<h2>{{.Post.Title}}</h2>{{end}}
+  <div class="body">{{.Post.HTML}}</div>
+</article>
+{{end}}

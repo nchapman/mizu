@@ -1,0 +1,10 @@
+/repeat
+/config.yml
+/content/
+/media/
+/cache/
+/state/
+/admin/dist/
+/admin/node_modules/
+*.bak
+.DS_Store

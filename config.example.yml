@@ -1,0 +1,16 @@
+site:
+  title: My Site
+  author: Your Name
+  base_url: http://localhost:8080
+  description: A repeat-powered site.
+
+server:
+  addr: ":8080"
+
+paths:
+  content: ./content
+  media: ./media
+  cache: ./cache
+  state: ./state
+  admin_dist: ./admin/dist
+  templates: ./templates

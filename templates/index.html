@@ -1,0 +1,13 @@
+{{template "base" .}}
+{{define "main"}}
+{{range .Posts}}
+<article>
+  <time datetime="{{.Date.Format "2006-01-02T15:04:05Z07:00"}}">{{.Date.Format "Jan 2, 2006"}}</time>
+  {{if .Title}}<h2><a href="{{.Path}}">{{.Title}}</a></h2>{{end}}
+  <div class="body">{{.HTML}}</div>
+  {{if not .Title}}<a href="{{.Path}}">permalink</a>{{end}}
+</article>
+{{else}}
+<p>No posts yet.</p>
+{{end}}
+{{end}}
