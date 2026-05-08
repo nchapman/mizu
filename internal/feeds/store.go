@@ -178,17 +178,34 @@ ON CONFLICT(feed_id, guid) DO NOTHING`,
 	return n > 0, nil
 }
 
+// TimelineCursor is the page boundary for Timeline. It is composite —
+// (published_at, id) — because many items can share a published_at,
+// especially zero-time items. Using only published_at would skip or
+// duplicate items across pages.
+type TimelineCursor struct {
+	PublishedAt time.Time
+	ID          int64
+}
+
+func (c TimelineCursor) IsZero() bool { return c.ID == 0 && c.PublishedAt.IsZero() }
+
 // Timeline returns items across all feeds, newest first. `before` is an
-// exclusive cursor on published_at; pass zero for the most recent page.
-func (s *Store) Timeline(ctx context.Context, before time.Time, limit int, unreadOnly bool) ([]Item, error) {
+// exclusive composite cursor; pass the zero value for the first page.
+func (s *Store) Timeline(ctx context.Context, before TimelineCursor, limit int, unreadOnly bool) ([]Item, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
 	args := []any{}
 	where := "1=1"
 	if !before.IsZero() {
-		where += " AND items.published_at < ?"
-		args = append(args, before.Unix())
+		// SQLite supports row-value comparison: (a, b) < (?, ?) is the
+		// standard tuple-less-than that gives a correct strict ordering.
+		var pub int64
+		if !before.PublishedAt.IsZero() {
+			pub = before.PublishedAt.Unix()
+		}
+		where += " AND (COALESCE(items.published_at, 0), items.id) < (?, ?)"
+		args = append(args, pub, before.ID)
 	}
 	if unreadOnly {
 		where += " AND items.read_at IS NULL"
@@ -201,7 +218,7 @@ SELECT items.id, items.feed_id, COALESCE(feeds.title,''), items.guid,
        items.read_at
 FROM items JOIN feeds ON feeds.id = items.feed_id
 WHERE `+where+`
-ORDER BY items.published_at DESC, items.id DESC
+ORDER BY COALESCE(items.published_at, 0) DESC, items.id DESC
 LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
@@ -229,13 +246,29 @@ LIMIT ?`, args...)
 	return out, rows.Err()
 }
 
+// ErrItemNotFound is returned by MarkRead when the item ID doesn't
+// match any row, so handlers can map it to 404.
+var ErrItemNotFound = errors.New("item not found")
+
 func (s *Store) MarkRead(ctx context.Context, itemID int64, read bool) error {
+	var res sql.Result
+	var err error
 	if read {
-		_, err := s.db.ExecContext(ctx, `UPDATE items SET read_at = ? WHERE id = ?`, time.Now().Unix(), itemID)
+		res, err = s.db.ExecContext(ctx, `UPDATE items SET read_at = ? WHERE id = ?`, time.Now().Unix(), itemID)
+	} else {
+		res, err = s.db.ExecContext(ctx, `UPDATE items SET read_at = NULL WHERE id = ?`, itemID)
+	}
+	if err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE items SET read_at = NULL WHERE id = ?`, itemID)
-	return err
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrItemNotFound
+	}
+	return nil
 }
 
 // FeedFetchInfo returns the conditional-GET headers for the next poll.

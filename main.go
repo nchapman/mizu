@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -38,7 +39,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("feed store: %v", err)
 	}
-	defer feedStore.Close()
 
 	feedSvc := feeds.NewService(feedStore, cfg.Paths.Subscriptions, cfg.Site.Title)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -47,7 +47,16 @@ func main() {
 		log.Fatalf("load opml: %v", err)
 	}
 	poller := feeds.NewPoller(feedStore, cfg.Poller.Interval, cfg.Poller.UserAgent)
-	go poller.Run(ctx)
+
+	// Track the poller goroutine so we can wait for it to drain before
+	// closing the database. Otherwise an in-flight PollOne can hit a
+	// closed connection on shutdown.
+	var bg sync.WaitGroup
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		poller.Run(ctx)
+	}()
 
 	siteSrv, err := site.New(cfg, posts)
 	if err != nil {
@@ -75,4 +84,6 @@ func main() {
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()
 	_ = srv.Shutdown(shutCtx)
+	bg.Wait()
+	_ = feedStore.Close()
 }

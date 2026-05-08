@@ -128,7 +128,7 @@ func toSubDTO(f feeds.Feed) subscriptionDTO {
 }
 
 func (s *Server) listSubscriptions(w http.ResponseWriter, r *http.Request) {
-	list, err := s.feeds.Store.ListFeeds(r.Context())
+	list, err := s.feeds.ListFeeds(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -154,6 +154,10 @@ func (s *Server) addSubscription(w http.ResponseWriter, r *http.Request) {
 	f, err := s.feeds.Subscribe(r.Context(), in.URL, in.Title, in.SiteURL, in.Category)
 	if errors.Is(err, feeds.ErrInvalidURL) {
 		http.Error(w, "invalid feed url", http.StatusBadRequest)
+		return
+	}
+	if errors.Is(err, feeds.ErrBlockedAddress) {
+		http.Error(w, "feed url resolves to a blocked address", http.StatusBadRequest)
 		return
 	}
 	if err != nil {
@@ -207,21 +211,51 @@ type timelineResponse struct {
 	NextCursor string            `json:"next_cursor,omitempty"`
 }
 
+// Cursor format: "<unix_seconds>:<item_id>". Both halves are needed
+// because items often share a published_at; pagination by timestamp
+// alone would skip ties or repeat them across pages.
+func parseTimelineCursor(s string) (feeds.TimelineCursor, bool) {
+	if s == "" {
+		return feeds.TimelineCursor{}, true
+	}
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 {
+		return feeds.TimelineCursor{}, false
+	}
+	ts, err1 := strconv.ParseInt(parts[0], 10, 64)
+	id, err2 := strconv.ParseInt(parts[1], 10, 64)
+	if err1 != nil || err2 != nil {
+		return feeds.TimelineCursor{}, false
+	}
+	c := feeds.TimelineCursor{ID: id}
+	if ts > 0 {
+		c.PublishedAt = time.Unix(ts, 0)
+	}
+	return c, true
+}
+
+func formatTimelineCursor(it feeds.Item) string {
+	var ts int64
+	if !it.PublishedAt.IsZero() {
+		ts = it.PublishedAt.Unix()
+	}
+	return strconv.FormatInt(ts, 10) + ":" + strconv.FormatInt(it.ID, 10)
+}
+
 func (s *Server) timeline(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	if limit <= 0 {
 		limit = 50
 	}
-	var before time.Time
-	if c := q.Get("cursor"); c != "" {
-		if t, err := time.Parse(time.RFC3339, c); err == nil {
-			before = t
-		}
+	cursor, ok := parseTimelineCursor(q.Get("cursor"))
+	if !ok {
+		http.Error(w, "bad cursor", http.StatusBadRequest)
+		return
 	}
 	unread := q.Get("unread") == "1"
 
-	items, err := s.feeds.Store.Timeline(r.Context(), before, limit, unread)
+	items, err := s.feeds.Store.Timeline(r.Context(), cursor, limit, unread)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -239,10 +273,7 @@ func (s *Server) timeline(w http.ResponseWriter, r *http.Request) {
 		out.Items[i] = d
 	}
 	if len(items) == limit {
-		last := items[len(items)-1]
-		if !last.PublishedAt.IsZero() {
-			out.NextCursor = last.PublishedAt.Format(time.RFC3339)
-		}
+		out.NextCursor = formatTimelineCursor(items[len(items)-1])
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -256,7 +287,12 @@ func (s *Server) setItemRead(w http.ResponseWriter, r *http.Request, read bool) 
 		http.Error(w, "bad id", http.StatusBadRequest)
 		return
 	}
-	if err := s.feeds.Store.MarkRead(r.Context(), id, read); err != nil {
+	err = s.feeds.Store.MarkRead(r.Context(), id, read)
+	if errors.Is(err, feeds.ErrItemNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

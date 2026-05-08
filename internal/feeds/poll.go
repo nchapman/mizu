@@ -5,11 +5,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
+	"github.com/microcosm-cc/bluemonday"
 	"github.com/mmcdole/gofeed"
 )
+
+// MaxFeedBodyBytes caps the response body of a single feed fetch. A
+// hostile or runaway feed server could otherwise stream gigabytes into
+// memory before the parser returns.
+const MaxFeedBodyBytes = 10 << 20 // 10 MB
 
 // Poller periodically fetches every subscribed feed, using conditional GET
 // (etag / last-modified) to avoid re-downloading unchanged content, and
@@ -20,6 +27,7 @@ type Poller struct {
 	userAgent string
 	parser    *gofeed.Parser
 	http      *http.Client
+	sanitizer *bluemonday.Policy
 }
 
 func NewPoller(s *Store, interval time.Duration, userAgent string) *Poller {
@@ -28,9 +36,59 @@ func NewPoller(s *Store, interval time.Duration, userAgent string) *Poller {
 		interval:  interval,
 		userAgent: userAgent,
 		parser:    gofeed.NewParser(),
-		http:      &http.Client{Timeout: 30 * time.Second},
+		http:      newSafeHTTPClient(),
+		sanitizer: bluemonday.UGCPolicy(),
 	}
 }
+
+// newSafeHTTPClient builds an HTTP client that blocks connections to
+// private/loopback/link-local addresses at dial time. This catches
+// SSRF both for the initial URL and for any redirect chain it traverses.
+//
+// Note: we resolve and check IPs at dial time, but DNS rebinding can
+// still race between this resolution and a later one inside the kernel.
+// For a single-user deployment this is acceptable; full mitigation
+// requires custom name resolution that returns a fixed IP.
+func newSafeHTTPClient() *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+			if err != nil {
+				return nil, err
+			}
+			for _, ip := range ips {
+				if isBlockedIP(ip) {
+					return nil, fmt.Errorf("blocked address %s for host %s", ip, host)
+				}
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("no addresses for %s", host)
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
+		},
+	}
+	return &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+	}
+}
+
+// isBlockedIP returns true for ranges we never want to fetch from:
+// loopback, link-local (incl. cloud metadata at 169.254.169.254),
+// private RFC-1918, ULA, and unspecified.
+func isBlockedIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	return false
+}
+
 
 // Run polls on startup, then every interval, until ctx is cancelled.
 func (p *Poller) Run(ctx context.Context) {
@@ -94,7 +152,7 @@ func (p *Poller) PollOne(ctx context.Context, f Feed) error {
 		return fmt.Errorf("http %d", resp.StatusCode)
 	}
 
-	parsed, err := p.parser.Parse(resp.Body)
+	parsed, err := p.parser.Parse(io.LimitReader(resp.Body, MaxFeedBodyBytes))
 	if err != nil {
 		return fmt.Errorf("parse: %w", err)
 	}
@@ -121,6 +179,10 @@ func (p *Poller) PollOne(ctx context.Context, f Feed) error {
 		if content == "" {
 			content = e.Description
 		}
+		// Sanitize HTML at ingest so the timeline UI can render it safely.
+		// UGCPolicy strips <script>, event handlers, javascript: URIs,
+		// and other XSS vectors while preserving common formatting.
+		content = p.sanitizer.Sanitize(content)
 		if _, err := p.store.InsertItem(ctx, &Item{
 			FeedID:      f.ID,
 			GUID:        guid,
