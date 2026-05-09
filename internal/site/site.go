@@ -189,11 +189,13 @@ func hostOf(raw string) string {
 }
 
 func (s *Server) rss(w http.ResponseWriter, r *http.Request) {
+	// Channel <managingEditor> requires an email per RSS spec; we don't
+	// have one in config, so leave Author unset and let the library omit
+	// the field rather than emit a malformed " (Name)" with no address.
 	feed := &feeds.Feed{
 		Title:       s.cfg.Site.Title,
 		Link:        &feeds.Link{Href: s.cfg.Site.BaseURL},
 		Description: s.cfg.Site.Description,
-		Author:      &feeds.Author{Name: s.cfg.Site.Author},
 		Created:     time.Now(),
 	}
 	for _, p := range s.posts.Recent(50) {
