@@ -1,5 +1,8 @@
 import { useState } from "react";
-import { shellStyle } from "./styles";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 export function Setup({ onDone }: { onDone: () => void }) {
   const [token, setToken] = useState("");
@@ -32,31 +35,53 @@ export function Setup({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <div style={shellStyle}>
-      <h1 style={{ fontSize: "1.2em" }}>Welcome to repeat</h1>
-      <p style={{ color: "#555" }}>
+    <div className="mx-auto mt-16 max-w-md px-4">
+      <h1 className="mb-2 text-lg font-semibold">Welcome to repeat</h1>
+      <p className="mb-4 text-sm text-muted-foreground">
         Set a password to lock down the admin UI. The one-time setup token was printed to your
         server log when repeat started — paste it below to prove you're the operator.
       </p>
-      <form onSubmit={submit} style={{ border: "1px solid #ddd", borderRadius: 8, padding: "1em" }}>
-        <label style={{ display: "block", marginBottom: ".5em" }}>
-          <div style={{ fontSize: ".9em", color: "#555" }}>Setup token</div>
-          <input autoFocus value={token} onChange={(e) => setToken(e.target.value)}
-            spellCheck={false} autoCapitalize="off"
-            style={{ width: "100%", padding: ".4em", fontSize: "1em", fontFamily: "monospace" }} />
-        </label>
-        <label style={{ display: "block", marginBottom: ".5em" }}>
-          <div style={{ fontSize: ".9em", color: "#555" }}>New password</div>
-          <input type="password" value={pw} onChange={(e) => setPw(e.target.value)}
-            style={{ width: "100%", padding: ".4em", fontSize: "1em" }} />
-        </label>
-        <label style={{ display: "block", marginBottom: ".5em" }}>
-          <div style={{ fontSize: ".9em", color: "#555" }}>Confirm password</div>
-          <input type="password" value={pw2} onChange={(e) => setPw2(e.target.value)}
-            style={{ width: "100%", padding: ".4em", fontSize: "1em" }} />
-        </label>
-        {err && <div style={{ color: "#b00", fontSize: ".9em", marginBottom: ".5em" }}>{err}</div>}
-        <button type="submit" disabled={busy}>{busy ? "Saving…" : "Set password"}</button>
+      <form onSubmit={submit} className="space-y-3 rounded-xl border border-border bg-card p-4 shadow-sm">
+        <div className="space-y-1.5">
+          <Label htmlFor="setup-token">Setup token</Label>
+          <Input
+            id="setup-token"
+            autoFocus
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            spellCheck={false}
+            autoCapitalize="off"
+            className="font-mono"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="setup-password">New password</Label>
+          <Input
+            id="setup-password"
+            type="password"
+            value={pw}
+            onChange={(e) => setPw(e.target.value)}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="setup-password-confirm">Confirm password</Label>
+          <Input
+            id="setup-password-confirm"
+            type="password"
+            value={pw2}
+            onChange={(e) => setPw2(e.target.value)}
+          />
+        </div>
+        {err && (
+          <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+            {err}
+          </div>
+        )}
+        <div className="flex justify-end">
+          <Button type="submit" size="sm" disabled={busy}>
+            {busy ? "Saving…" : "Set password"}
+          </Button>
+        </div>
       </form>
     </div>
   );

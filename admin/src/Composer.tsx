@@ -51,8 +51,8 @@ interface Props {
   onDraftSaved: () => void;
   onAuthLost: () => void;
   // Fires whenever the composer's editing target changes (load, reset,
-  // submit). The parent uses this to dim the row in PostList and to know
-  // which post a delete-while-editing affects.
+  // submit). Currently unused by HomeView; kept as a hook for future
+  // surfaces (e.g. dimming the corresponding stream card while editing).
   onTargetChange?: (target: EditTarget | null) => void;
   // Optional: a count + opener for the drafts drawer pill in the toolbar.
   draftsCount?: number;

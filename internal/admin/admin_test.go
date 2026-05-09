@@ -274,7 +274,7 @@ func TestAuthGate_BlocksAllProtectedRoutes(t *testing.T) {
 		{"POST", "/admin/api/posts"},
 		{"GET", "/admin/api/drafts"},
 		{"GET", "/admin/api/subscriptions"},
-		{"GET", "/admin/api/timeline"},
+		{"GET", "/admin/api/stream"},
 		{"POST", "/admin/api/media"},
 	} {
 		w := h.do(t, route.method, route.path, nil, nil)
@@ -486,61 +486,31 @@ func TestSubscriptions_RemoveMissingURLParam(t *testing.T) {
 	}
 }
 
-// --- timeline ---
+// --- feed-item read state ---
 
-func TestTimeline_CursorRoundTripAndMarkRead(t *testing.T) {
+func TestItemRead_MarkAndUnmark(t *testing.T) {
 	h := newHarness(t)
 	c := h.login(t)
 	ctx := context.Background()
 
-	// Seed a feed and items directly through the store — quicker than
-	// going through Subscribe and easier to control timestamps.
-	id, err := h.feeds.Store.UpsertFeed(ctx, &feeds.Feed{URL: "https://a/", Title: "A"})
+	feedID, err := h.feeds.Store.UpsertFeed(ctx, &feeds.Feed{URL: "https://a/", Title: "A"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 3; i++ {
-		if _, err := h.feeds.Store.InsertItem(ctx, &feeds.Item{
-			FeedID: id, GUID: string(rune('a' + i)), Title: "I" + string(rune('a'+i)),
-			FetchedAt: nowUTC(),
-		}); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := h.feeds.Store.InsertItem(ctx, &feeds.Item{
+		FeedID: feedID, GUID: "g1", Title: "T1", FetchedAt: nowUTC(),
+	}); err != nil {
+		t.Fatal(err)
 	}
-
-	w := h.do(t, "GET", "/admin/api/timeline?limit=2", nil, c)
-	var page1 timelineResponse
-	json.NewDecoder(w.Body).Decode(&page1)
-	if len(page1.Items) != 2 || page1.NextCursor == "" {
-		t.Fatalf("page1=%+v", page1)
+	items, err := h.feeds.Store.Timeline(ctx, feeds.TimelineCursor{}, 10, false)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("seed timeline: err=%v len=%d", err, len(items))
 	}
+	idStr := jsonNum(items[0].ID)
 
-	// Round-trip the cursor.
-	w = h.do(t, "GET", "/admin/api/timeline?limit=2&cursor="+page1.NextCursor, nil, c)
-	var page2 timelineResponse
-	json.NewDecoder(w.Body).Decode(&page2)
-	if len(page2.Items) != 1 {
-		t.Errorf("page2 len=%d, want 1", len(page2.Items))
-	}
-
-	// Bad cursor → 400.
-	w = h.do(t, "GET", "/admin/api/timeline?cursor=garbage", nil, c)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("bad cursor code=%d", w.Code)
-	}
-
-	// Mark item read / unread.
-	itemID := page1.Items[0].ID
-	idStr := jsonNum(itemID)
-	w = h.do(t, "POST", "/admin/api/items/"+idStr+"/read", nil, c)
+	w := h.do(t, "POST", "/admin/api/items/"+idStr+"/read", nil, c)
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("mark read code=%d body=%s", w.Code, w.Body.String())
-	}
-	w = h.do(t, "GET", "/admin/api/timeline?unread=1", nil, c)
-	var unread timelineResponse
-	json.NewDecoder(w.Body).Decode(&unread)
-	if len(unread.Items) != 2 {
-		t.Errorf("unread filter returned %d, want 2", len(unread.Items))
 	}
 	w = h.do(t, "DELETE", "/admin/api/items/"+idStr+"/read", nil, c)
 	if w.Code != http.StatusNoContent {
@@ -548,7 +518,7 @@ func TestTimeline_CursorRoundTripAndMarkRead(t *testing.T) {
 	}
 }
 
-func TestTimeline_BadItemID(t *testing.T) {
+func TestItemRead_BadID(t *testing.T) {
 	h := newHarness(t)
 	c := h.login(t)
 	w := h.do(t, "POST", "/admin/api/items/notanumber/read", nil, c)
@@ -557,30 +527,12 @@ func TestTimeline_BadItemID(t *testing.T) {
 	}
 }
 
-func TestTimeline_MarkReadMissingItem(t *testing.T) {
+func TestItemRead_MissingItem(t *testing.T) {
 	h := newHarness(t)
 	c := h.login(t)
 	w := h.do(t, "POST", "/admin/api/items/9999/read", nil, c)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("code=%d", w.Code)
-	}
-}
-
-func TestParseTimelineCursor(t *testing.T) {
-	if c, ok := parseTimelineCursor(""); !ok || !c.IsZero() {
-		t.Errorf("empty cursor: ok=%v c=%+v", ok, c)
-	}
-	if _, ok := parseTimelineCursor("xx"); ok {
-		t.Errorf("bare junk should not parse")
-	}
-	if _, ok := parseTimelineCursor("a:b"); ok {
-		t.Errorf("non-numeric should not parse")
-	}
-	if c, ok := parseTimelineCursor("100:5"); !ok || c.ID != 5 || c.PublishedAt.Unix() != 100 {
-		t.Errorf("got %+v ok=%v", c, ok)
-	}
-	if c, ok := parseTimelineCursor("0:7"); !ok || c.ID != 7 || !c.PublishedAt.IsZero() {
-		t.Errorf("zero-ts cursor: %+v", c)
 	}
 }
 

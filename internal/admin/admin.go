@@ -69,7 +69,6 @@ func (s *Server) Routes(r chi.Router) {
 			r.Post("/subscriptions", s.addSubscription)
 			r.Delete("/subscriptions", s.removeSubscription)
 
-			r.Get("/timeline", s.timeline)
 			r.Get("/stream", s.stream)
 			r.Post("/items/{id}/read", s.markItemRead)
 			r.Delete("/items/{id}/read", s.markItemUnread)
@@ -533,8 +532,11 @@ func (s *Server) removeSubscription(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// --- timeline ---
+// --- feed item read state ---
 
+// timelineItemDTO is the JSON shape used by /admin/api/stream for the
+// "feed" arm of its tagged-union response. The corresponding GET endpoint
+// was retired once the unified stream landed.
 type timelineItemDTO struct {
 	ID          int64  `json:"id"`
 	FeedID      int64  `json:"feed_id"`
@@ -545,78 +547,6 @@ type timelineItemDTO struct {
 	Content     string `json:"content,omitempty"`
 	PublishedAt string `json:"published_at,omitempty"`
 	Read        bool   `json:"read"`
-}
-
-type timelineResponse struct {
-	Items      []timelineItemDTO `json:"items"`
-	NextCursor string            `json:"next_cursor,omitempty"`
-}
-
-// Cursor format: "<unix_seconds>:<item_id>". Both halves are needed
-// because items often share a published_at; pagination by timestamp
-// alone would skip ties or repeat them across pages.
-func parseTimelineCursor(s string) (feeds.TimelineCursor, bool) {
-	if s == "" {
-		return feeds.TimelineCursor{}, true
-	}
-	parts := strings.SplitN(s, ":", 2)
-	if len(parts) != 2 {
-		return feeds.TimelineCursor{}, false
-	}
-	ts, err1 := strconv.ParseInt(parts[0], 10, 64)
-	id, err2 := strconv.ParseInt(parts[1], 10, 64)
-	if err1 != nil || err2 != nil {
-		return feeds.TimelineCursor{}, false
-	}
-	c := feeds.TimelineCursor{ID: id}
-	if ts > 0 {
-		c.PublishedAt = time.Unix(ts, 0)
-	}
-	return c, true
-}
-
-func formatTimelineCursor(it feeds.Item) string {
-	var ts int64
-	if !it.PublishedAt.IsZero() {
-		ts = it.PublishedAt.Unix()
-	}
-	return strconv.FormatInt(ts, 10) + ":" + strconv.FormatInt(it.ID, 10)
-}
-
-func (s *Server) timeline(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	if limit <= 0 {
-		limit = 50
-	}
-	cursor, ok := parseTimelineCursor(q.Get("cursor"))
-	if !ok {
-		http.Error(w, "bad cursor", http.StatusBadRequest)
-		return
-	}
-	unread := q.Get("unread") == "1"
-
-	items, err := s.feeds.Store.Timeline(r.Context(), cursor, limit, unread)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	out := timelineResponse{Items: make([]timelineItemDTO, len(items))}
-	for i, it := range items {
-		d := timelineItemDTO{
-			ID: it.ID, FeedID: it.FeedID, FeedTitle: it.FeedTitle,
-			URL: it.URL, Title: it.Title, Author: it.Author, Content: it.Content,
-			Read: it.ReadAt != nil,
-		}
-		if !it.PublishedAt.IsZero() {
-			d.PublishedAt = it.PublishedAt.Format(time.RFC3339)
-		}
-		out.Items[i] = d
-	}
-	if len(items) == limit {
-		out.NextCursor = formatTimelineCursor(items[len(items)-1])
-	}
-	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) markItemRead(w http.ResponseWriter, r *http.Request)   { s.setItemRead(w, r, true) }
