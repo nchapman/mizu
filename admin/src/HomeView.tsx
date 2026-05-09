@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Composer, type ComposerHandle } from "./Composer";
 import { PostList } from "./PostList";
 import type { EditTarget } from "./Shell";
@@ -7,53 +7,56 @@ import type { Post } from "./api";
 interface Props {
   onAuthLost: () => void;
   // One-shot edit handoff from a sibling tab (e.g. Drafts → composer).
-  // HomeView mirrors this into local state and acks via onEditConsumed.
+  // HomeView forwards into the composer's imperative load() and acks via
+  // onEditConsumed.
   editTarget: EditTarget | null;
   onEditConsumed: () => void;
 }
 
 export function HomeView({ onAuthLost, editTarget, onEditConsumed }: Props) {
-  const [target, setTarget] = useState<EditTarget | null>(null);
-  const [refreshToken, setRefreshToken] = useState(0);
   const composerRef = useRef<ComposerHandle>(null);
+  const [refreshToken, setRefreshToken] = useState(0);
+  const [editingPostId, setEditingPostId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!editTarget) return;
-    setTarget(editTarget);
+    composerRef.current?.load(editTarget);
     onEditConsumed();
   }, [editTarget, onEditConsumed]);
 
   function startEditPost(p: Post) {
-    setTarget({ kind: "post", id: p.id, title: p.title ?? "", body: p.body });
+    composerRef.current?.load({
+      kind: "post",
+      id: p.id,
+      title: p.title ?? "",
+      body: p.body,
+    });
   }
 
   function handleDeleted(id: string) {
-    // Clear target first so the composer's next render sees null labels;
-    // reset() then wipes form state and the loadedTargetRef.
-    if (target?.kind === "post" && target.id === id) {
-      setTarget(null);
-      composerRef.current?.reset();
-    }
+    if (editingPostId === id) composerRef.current?.reset();
     setRefreshToken((t) => t + 1);
   }
+
+  // Stable identity so Composer's onTargetChange effect doesn't re-fire
+  // every render of HomeView.
+  const handleTargetChange = useCallback((t: EditTarget | null) => {
+    setEditingPostId(t?.kind === "post" ? t.id : null);
+  }, []);
 
   return (
     <div>
       <Composer
         ref={composerRef}
-        target={target}
-        onSubmitted={() => {
-          setTarget(null);
-          setRefreshToken((t) => t + 1);
-        }}
+        onSubmitted={() => setRefreshToken((t) => t + 1)}
         // No refreshToken bump: saving a draft doesn't change the published list.
-        onDraftSaved={() => setTarget(null)}
-        onCancel={() => setTarget(null)}
+        onDraftSaved={() => {}}
+        onTargetChange={handleTargetChange}
         onAuthLost={onAuthLost}
       />
       <PostList
         refreshToken={refreshToken}
-        editingPostId={target?.kind === "post" ? target.id : null}
+        editingPostId={editingPostId}
         onEdit={startEditPost}
         onDeleted={handleDeleted}
         onAuthLost={onAuthLost}

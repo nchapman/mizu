@@ -23,23 +23,22 @@ import { linkBtn } from "./styles";
 type EditorMode = "rich" | "md";
 
 export interface ComposerHandle {
+  load: (target: EditTarget) => void;
   reset: () => void;
 }
 
 interface Props {
-  // When non-null, the composer loads this content into the form. The
-  // parent keeps target set throughout the edit so labels reflect what's
-  // being edited; clearing it (and calling reset()) returns the composer
-  // to "new post" mode.
-  target: EditTarget | null;
   onSubmitted: () => void;
   onDraftSaved: () => void;
-  onCancel: () => void;
   onAuthLost: () => void;
+  // Fires whenever the composer's editing target changes (load, reset,
+  // submit). The parent uses this to dim the row in PostList and to
+  // know which post a delete-while-editing affects.
+  onTargetChange?: (target: EditTarget | null) => void;
 }
 
 export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
-  { target, onSubmitted, onDraftSaved, onCancel, onAuthLost },
+  { onSubmitted, onDraftSaved, onAuthLost, onTargetChange },
   ref,
 ) {
   const [body, setBody] = useState("");
@@ -54,57 +53,58 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   // initialValue. Bumped on reset, target loads, and mode flips into
   // rich — anywhere the body changes from outside the editor's own typing.
   const [editorKey, setEditorKey] = useState(0);
+  // The composer's current editing target. Drives the submit/save-draft
+  // labels and the cancel button visibility. Mutated only via the
+  // imperative load() / reset() handle so its update lands in the same
+  // React batch as setBody and setEditorKey — if these arrived through
+  // a prop+useEffect path, the still-mounted Lexical editor would get
+  // an intermediate render where its update listener fires onChange("")
+  // and clobbers the just-set body.
+  const [target, setTarget] = useState<EditTarget | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<MarkdownEditorHandle>(null);
-  // Tracks which target id is currently loaded so the effect doesn't
-  // reload (and clobber edits) when target identity changes but the
-  // logical pointer is the same.
-  const loadedTargetRef = useRef<string | null>(null);
 
-  function clearForm() {
+  useEffect(() => {
+    onTargetChange?.(target);
+  }, [target, onTargetChange]);
+
+  const reset = useCallback(() => {
+    setTarget(null);
     setBody("");
     setTitle("");
     setShowTitle(false);
     setErr("");
     setEditorKey((k) => k + 1);
-  }
-
-  const reset = useCallback(() => {
-    loadedTargetRef.current = null;
-    clearForm();
   }, []);
-  useImperativeHandle(ref, () => ({ reset }), [reset]);
 
-  // Load the target into the form when it changes. Stays a no-op while
-  // target is null on initial mount or after an organic clear, so user
-  // typing isn't wiped. The id-vs-loadedTargetRef guard does double duty:
-  // it suppresses re-loads on a mode flip (same target id), and it also
-  // suppresses re-loads if the parent re-sets the same target while it's
-  // already loaded. The latter is only safe because PostList's edit
-  // button is disabled while that post is being edited — if that
-  // invariant ever changes, this guard would silently skip a focus/scroll
-  // the user expects.
-  useEffect(() => {
-    if (!target) {
-      loadedTargetRef.current = null;
-      return;
-    }
-    const id = `${target.kind}:${target.id}`;
-    if (id === loadedTargetRef.current) return;
-    loadedTargetRef.current = id;
-    setBody(target.body);
-    setTitle(target.title);
-    setShowTitle(!!target.title);
+  // Each load() bumps focusTick; an effect keyed on it focuses+scrolls
+  // AFTER the new editor instance has mounted. Doing this synchronously
+  // in load() (e.g. via queueMicrotask) would focus the still-mounted
+  // OLD editor, whose selection-change update listener then fires
+  // onChange("") and clobbers the body we just set.
+  const [focusTick, setFocusTick] = useState(0);
+
+  const load = useCallback((t: EditTarget) => {
+    setTarget(t);
+    setBody(t.body);
+    setTitle(t.title);
+    setShowTitle(!!t.title);
     setErr("");
     setEditorKey((k) => k + 1);
-    queueMicrotask(() => {
-      if (mode === "md") textareaRef.current?.focus();
-      else editorRef.current?.focus();
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    });
-  }, [target, mode]);
+    setFocusTick((n) => n + 1);
+  }, []);
+
+  useEffect(() => {
+    if (focusTick === 0) return;
+    if (mode === "md") textareaRef.current?.focus();
+    else editorRef.current?.focus();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusTick]);
+
+  useImperativeHandle(ref, () => ({ load, reset }), [load, reset]);
 
   // Inserts text at the textarea's caret. flushSync forces React to
   // commit the new body synchronously so we can move the caret in the
@@ -242,10 +242,8 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     }
   }
 
-  function handleCancel() {
-    reset();
-    onCancel();
-  }
+  // Cancel just clears the form; reset() also nulls target which fires
+  // onTargetChange so the dimmed PostList row brightens.
 
   const submitLabel = posting
     ? "Saving…"
@@ -328,7 +326,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
           </div>
           <div style={{ display: "flex", gap: ".5em", alignItems: "center" }}>
             {target && (
-              <button type="button" onClick={handleCancel} style={linkBtn}>
+              <button type="button" onClick={reset} style={linkBtn}>
                 cancel
               </button>
             )}
