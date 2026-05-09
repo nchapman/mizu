@@ -43,6 +43,7 @@ describe("App auth screens", () => {
     withMe(
       { configured: true, authenticated: true },
       { status: 200, body: [] }, // /admin/api/posts initial load
+      { status: 200, body: [] }, // /admin/api/drafts (drawer count)
     );
     render(<App />);
     // The brand button anchors the new top bar.
@@ -61,23 +62,33 @@ describe("App auth screens", () => {
 });
 
 describe("App route navigation", () => {
-  it("loads the Drafts view from the overflow menu", async () => {
+  it("opens the drafts drawer from the composer pill", async () => {
+    const draft = {
+      id: "d1",
+      title: "Half-finished",
+      body: "raw",
+      html: "<p>raw</p>",
+      created: "2026-05-09T00:00:00Z",
+    };
     withMe(
       { configured: true, authenticated: true },
-      { status: 200, body: [] }, // posts
-      { status: 200, body: [] }, // drafts
+      { status: 200, body: [] },          // posts
+      { status: 200, body: [draft] },     // initial drafts count
+      { status: 200, body: [draft] },     // drawer-open refetch
     );
     render(<App />);
     await screen.findByRole("button", { name: "repeat" });
-    await openMenu();
-    await userEvent.click(await screen.findByRole("menuitem", { name: /Drafts/i }));
-    expect(await screen.findByText(/No drafts\./i)).toBeInTheDocument();
+    // The pill only renders once the count fetch resolves with a non-zero list.
+    await userEvent.click(await screen.findByRole("button", { name: /Drafts ·/i }));
+    expect(await screen.findByRole("heading", { name: "Drafts" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Half-finished" })).toBeInTheDocument();
   });
 
   it("loads the Timeline view from the overflow menu", async () => {
     withMe(
       { configured: true, authenticated: true },
       { status: 200, body: [] },              // posts
+      { status: 200, body: [] },              // drafts (count)
       { status: 200, body: { items: [] } },   // timeline
     );
     render(<App />);
@@ -91,6 +102,7 @@ describe("App route navigation", () => {
     withMe(
       { configured: true, authenticated: true },
       { status: 200, body: [] },  // posts
+      { status: 200, body: [] },  // drafts (count)
       { status: 200, body: [] },  // subs
     );
     render(<App />);
@@ -104,6 +116,7 @@ describe("App route navigation", () => {
     withMe(
       { configured: true, authenticated: true },
       { status: 200, body: [] }, // posts
+      { status: 200, body: [] }, // drafts (count)
     );
     render(<App />);
     await screen.findByRole("button", { name: "repeat" });
@@ -120,6 +133,7 @@ describe("App Login", () => {
       { status: 204 },                                                       // POST /login
       { status: 200, body: { configured: true, authenticated: true } },     // re-load /me
       { status: 200, body: [] },                                              // /posts
+      { status: 200, body: [] },                                              // /drafts (count)
     ]);
     render(<App />);
     await screen.findByPlaceholderText("Password");
@@ -174,6 +188,7 @@ describe("App Setup", () => {
       { status: 204 }, // POST /setup
       { status: 200, body: { configured: true, authenticated: true } },
       { status: 200, body: [] }, // /posts
+      { status: 200, body: [] }, // /drafts (count)
     ]);
     render(<App />);
     await screen.findByRole("heading", { name: /Welcome to repeat/i });
@@ -191,7 +206,12 @@ describe("App home view", () => {
     const fn = withMe(
       { configured: true, authenticated: true },
       { status: 200, body: [] },                                              // initial /posts
+      { status: 200, body: [] },                                              // initial /drafts (count)
       { status: 201, body: { id: "p1", body: "x", html: "<p>x</p>", date: "2026-05-09T00:00:00Z", path: "/p" } },
+      // After submit, HomeView fires refreshDraftsCount synchronously and
+      // PostList re-fetches /posts on the refreshToken change. /drafts
+      // lands first because it's invoked inside the same event handler.
+      { status: 200, body: [] },                                              // post-submit /drafts refresh
       {
         status: 200,
         body: [
@@ -229,6 +249,7 @@ describe("App home view", () => {
     const fn = withMe(
       { configured: true, authenticated: true },
       { status: 200, body: [] },                                              // posts
+      { status: 200, body: [] },                                              // drafts (count)
       { status: 204 },                                                         // logout
       { status: 200, body: { configured: true, authenticated: false } },     // re-load
     );

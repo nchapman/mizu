@@ -4,13 +4,12 @@ import { useEffect, useState } from "react";
 // no history API quirks, no router dependency. The cost is a `#` in the URL,
 // which is fine for a single-user admin surface.
 
-export type Route = "home" | "subscriptions" | "settings" | "drafts" | "timeline";
+export type Route = "home" | "subscriptions" | "settings" | "timeline";
 
 const ROUTES: Record<string, Route> = {
   "": "home",
   "/": "home",
   "/home": "home",
-  "/drafts": "drafts",
   "/timeline": "timeline",
   "/subscriptions": "subscriptions",
   "/settings": "settings",

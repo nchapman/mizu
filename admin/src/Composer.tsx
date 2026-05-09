@@ -7,6 +7,17 @@ import {
   useState,
 } from "react";
 import { flushSync } from "react-dom";
+import { FileText, Heading, ImagePlus } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+
 import {
   Unauthorized,
   api,
@@ -15,10 +26,10 @@ import {
   updateDraft,
   updatePost,
   uploadMedia,
-} from "./api";
-import { MarkdownEditor, type MarkdownEditorHandle } from "./MarkdownEditor";
-import type { EditTarget } from "./Shell";
-import { linkBtn } from "./styles";
+} from "@/api";
+import { MarkdownEditor, type MarkdownEditorHandle } from "@/MarkdownEditor";
+import type { EditTarget } from "@/Shell";
+import { cn } from "@/lib/utils";
 
 type EditorMode = "rich" | "md";
 
@@ -32,13 +43,16 @@ interface Props {
   onDraftSaved: () => void;
   onAuthLost: () => void;
   // Fires whenever the composer's editing target changes (load, reset,
-  // submit). The parent uses this to dim the row in PostList and to
-  // know which post a delete-while-editing affects.
+  // submit). The parent uses this to dim the row in PostList and to know
+  // which post a delete-while-editing affects.
   onTargetChange?: (target: EditTarget | null) => void;
+  // Optional: a count + opener for the drafts drawer pill in the toolbar.
+  draftsCount?: number;
+  onOpenDrafts?: () => void;
 }
 
 export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
-  { onSubmitted, onDraftSaved, onAuthLost, onTargetChange },
+  { onSubmitted, onDraftSaved, onAuthLost, onTargetChange, draftsCount, onOpenDrafts },
   ref,
 ) {
   const [body, setBody] = useState("");
@@ -56,10 +70,10 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   // The composer's current editing target. Drives the submit/save-draft
   // labels and the cancel button visibility. Mutated only via the
   // imperative load() / reset() handle so its update lands in the same
-  // React batch as setBody and setEditorKey — if these arrived through
-  // a prop+useEffect path, the still-mounted Lexical editor would get
-  // an intermediate render where its update listener fires onChange("")
-  // and clobbers the just-set body.
+  // React batch as setBody and setEditorKey — if these arrived through a
+  // prop+useEffect path, the still-mounted Lexical editor would get an
+  // intermediate render where its update listener fires onChange("") and
+  // clobbers the just-set body.
   const [target, setTarget] = useState<EditTarget | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -106,10 +120,10 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
 
   useImperativeHandle(ref, () => ({ load, reset }), [load, reset]);
 
-  // Inserts text at the textarea's caret. flushSync forces React to
-  // commit the new body synchronously so we can move the caret in the
-  // same tick. Functional setState is critical: sequential calls in a
-  // loop must each see the latest body, not a stale snapshot.
+  // Inserts text at the textarea's caret. flushSync forces React to commit
+  // the new body synchronously so we can move the caret in the same tick.
+  // Functional setState is critical: sequential calls in a loop must each
+  // see the latest body, not a stale snapshot.
   function insertAtCaret(text: string) {
     const ta = textareaRef.current;
     let caret = -1;
@@ -181,9 +195,9 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     if (files.length > 0) void uploadFilesMd(files);
   }
 
-  // Flipping into rich means the editor has to re-init from the
-  // current (possibly md-edited) body. Flipping into md is just a
-  // render swap — body is already current.
+  // Flipping into rich means the editor has to re-init from the current
+  // (possibly md-edited) body. Flipping into md is just a render swap —
+  // body is already current.
   function setEditorMode(next: EditorMode) {
     setMode((prev) => {
       if (prev !== next && next === "rich") setEditorKey((k) => k + 1);
@@ -201,8 +215,8 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
       if (target?.kind === "post") {
         await updatePost(target.id, payload);
       } else if (target?.kind === "draft") {
-        // Capture latest edits before publishing so they aren't lost
-        // if the publish call partially fails downstream.
+        // Capture latest edits before publishing so they aren't lost if
+        // the publish call partially fails downstream.
         await updateDraft(target.id, payload);
         await publishDraft(target.id);
       } else {
@@ -218,9 +232,9 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     }
   }
 
-  // Save Draft is only meaningful when not editing a published post.
-  // When editing an existing draft it updates in place; otherwise it
-  // creates a new one.
+  // Save Draft is only meaningful when not editing a published post. When
+  // editing an existing draft it updates in place; otherwise it creates a
+  // new one.
   async function saveDraft() {
     if (!body.trim()) return;
     setPosting(true);
@@ -242,9 +256,6 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     }
   }
 
-  // Cancel just clears the form; reset() also nulls target which fires
-  // onTargetChange so the dimmed PostList row brightens.
-
   const submitLabel = posting
     ? "Saving…"
     : target?.kind === "post"
@@ -253,17 +264,20 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     ? "Publish"
     : "Post";
 
-  const draftLabel = target?.kind === "draft" ? "save draft" : "+ draft";
+  const draftLabel = target?.kind === "draft" ? "save draft" : "draft";
 
   return (
-    <>
-      <form onSubmit={submit} style={{ marginBottom: "2em", border: "1px solid #ddd", borderRadius: 8, padding: "1em" }}>
+    <TooltipProvider delayDuration={250}>
+      <form
+        onSubmit={submit}
+        className="mb-6 rounded-xl border border-border bg-card p-4 shadow-sm"
+      >
         {showTitle && (
-          <input
+          <Input
             placeholder="Title"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            style={{ width: "100%", marginBottom: ".5em", padding: ".4em", fontSize: "1em" }}
+            className="mb-3 text-base"
           />
         )}
         {mode === "rich" ? (
@@ -284,14 +298,16 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             onChange={(e) => setBody(e.target.value)}
             onPaste={onPaste}
             onDrop={onDrop}
-            onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragActive(true);
+            }}
             onDragLeave={() => setDragActive(false)}
             rows={showTitle ? 8 : 3}
-            style={{
-              width: "100%", padding: ".4em", fontSize: "1em", fontFamily: "ui-monospace, Menlo, monospace",
-              resize: "vertical",
-              outline: dragActive ? "2px dashed #4a90e2" : undefined,
-            }}
+            className={cn(
+              "w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-sm font-mono shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+              dragActive && "outline outline-2 outline-dashed outline-primary",
+            )}
           />
         )}
         <input
@@ -299,7 +315,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
           type="file"
           accept="image/*"
           multiple
-          style={{ display: "none" }}
+          className="hidden"
           onChange={(e) => {
             const files = Array.from(e.target.files ?? []);
             e.target.value = "";
@@ -307,47 +323,110 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             else void uploadFilesMd(files);
           }}
         />
-        <div style={{ display: "flex", justifyContent: "space-between", marginTop: ".5em" }}>
-          <div style={{ display: "flex", gap: ".5em", alignItems: "center" }}>
-            <button type="button" onClick={() => setShowTitle((v) => !v)} style={linkBtn}>
-              {showTitle ? "− title" : "+ title"}
-            </button>
-            <button type="button" onClick={() => fileInputRef.current?.click()} style={linkBtn} disabled={uploading}>
-              {uploading ? "uploading…" : "+ image"}
-            </button>
-            <button
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-1">
+            <ToolbarButton
+              label={showTitle ? "Hide title" : "Add title"}
+              onClick={() => setShowTitle((v) => !v)}
+              ariaName="title"
+            >
+              <Heading />
+            </ToolbarButton>
+            <ToolbarButton
+              label={uploading ? "Uploading…" : "Add image"}
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+              ariaName="image"
+            >
+              <ImagePlus />
+            </ToolbarButton>
+            <Button
               type="button"
+              variant="ghost"
+              size="sm"
               onClick={() => setEditorMode(mode === "rich" ? "md" : "rich")}
-              style={linkBtn}
               title={mode === "rich" ? "Edit raw Markdown source" : "Back to rich editor"}
+              className="text-muted-foreground"
             >
               {mode === "rich" ? "source" : "rich"}
-            </button>
+            </Button>
+            {onOpenDrafts && draftsCount !== undefined && draftsCount > 0 && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={onOpenDrafts}
+                className="text-muted-foreground"
+              >
+                <FileText />
+                Drafts · {draftsCount}
+              </Button>
+            )}
           </div>
-          <div style={{ display: "flex", gap: ".5em", alignItems: "center" }}>
+          <div className="flex items-center gap-2">
             {target && (
-              <button type="button" onClick={reset} style={linkBtn}>
+              <Button type="button" variant="ghost" size="sm" onClick={reset}>
                 cancel
-              </button>
+              </Button>
             )}
             {target?.kind !== "post" && (
-              <button
+              <Button
                 type="button"
+                variant="secondary"
+                size="sm"
                 onClick={saveDraft}
                 disabled={posting || uploading || !body.trim()}
-                style={linkBtn}
               >
                 {draftLabel}
-              </button>
+              </Button>
             )}
-            <button type="submit" disabled={posting || uploading || !body.trim()}>
+            <Button type="submit" size="sm" disabled={posting || uploading || !body.trim()}>
               {submitLabel}
-            </button>
+            </Button>
           </div>
         </div>
       </form>
 
-      {err && <div style={{ color: "#b00", fontSize: ".9em", marginBottom: "1em" }}>{err}</div>}
-    </>
+      {err && (
+        <div role="alert" className="mb-4 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          {err}
+        </div>
+      )}
+    </TooltipProvider>
   );
 });
+
+function ToolbarButton({
+  label,
+  ariaName,
+  onClick,
+  disabled,
+  children,
+}: {
+  label: string;
+  // Stable accessible name surfaced via aria-label so tests and assistive
+  // tech don't depend on the icon's tooltip.
+  ariaName: string;
+  onClick: () => void;
+  disabled?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          aria-label={ariaName}
+          onClick={onClick}
+          disabled={disabled}
+          className="h-8 w-8 text-muted-foreground"
+        >
+          {children}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  );
+}
