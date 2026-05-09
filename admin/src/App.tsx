@@ -3,7 +3,7 @@ import "./App.css";
 import { Login } from "./Login";
 import { Setup } from "./Setup";
 import { Shell } from "./Shell";
-import { shellStyle } from "./styles";
+import { Button } from "@/components/ui/button";
 
 type Me = { configured: boolean; authenticated: boolean };
 
@@ -31,9 +31,9 @@ export function App() {
 
   if (initErr) {
     return (
-      <div style={shellStyle}>
-        <p>Could not reach the server.</p>
-        <button type="button" onClick={loadMe}>Retry</button>
+      <div className="mx-auto max-w-2xl p-8">
+        <p className="mb-4 text-sm text-muted-foreground">Could not reach the server.</p>
+        <Button variant="outline" onClick={loadMe}>Retry</Button>
       </div>
     );
   }

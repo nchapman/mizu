@@ -8,8 +8,15 @@ beforeEach(() => {
   // Many flows go through window.confirm; default to true so destructive
   // tests proceed without prompting.
   vi.stubGlobal("confirm", vi.fn().mockReturnValue(true));
+  // Reset the URL hash between tests so route state from one test doesn't
+  // leak into the next (the Shell reads window.location.hash on mount).
+  window.location.hash = "";
 });
 afterEach(() => vi.unstubAllGlobals());
+
+async function openMenu() {
+  await userEvent.click(screen.getByRole("button", { name: /menu/i }));
+}
 
 // withMe shortcuts the app's initial GET /admin/api/me. Anything passed
 // after is the rest of the staged response queue.
@@ -38,57 +45,71 @@ describe("App auth screens", () => {
       { status: 200, body: [] }, // /admin/api/posts initial load
     );
     render(<App />);
-    expect(await screen.findByRole("button", { name: "Home" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Drafts" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Timeline" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Subscriptions" })).toBeInTheDocument();
+    // The brand button anchors the new top bar.
+    expect(await screen.findByRole("button", { name: "repeat" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /menu/i })).toBeInTheDocument();
   });
 
   it("shows a retry banner when /me fails", async () => {
     queueFetch([{ status: 500 }, { status: 200, body: { configured: false, authenticated: false } }]);
     render(<App />);
     expect(await screen.findByText(/Could not reach the server/i)).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await userEvent.click(screen.getByRole("button", { name: /Retry/i }));
     // After retry, the configured-false state means the Setup screen renders.
     expect(await screen.findByRole("heading", { name: /Welcome to repeat/i })).toBeInTheDocument();
   });
 });
 
-describe("App tab switching", () => {
-  it("loads the Drafts view when its tab is clicked", async () => {
+describe("App route navigation", () => {
+  it("loads the Drafts view from the overflow menu", async () => {
     withMe(
       { configured: true, authenticated: true },
       { status: 200, body: [] }, // posts
       { status: 200, body: [] }, // drafts
     );
     render(<App />);
-    await screen.findByRole("button", { name: "Home" });
-    await userEvent.click(screen.getByRole("button", { name: "Drafts" }));
+    await screen.findByRole("button", { name: "repeat" });
+    await openMenu();
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Drafts/i }));
     expect(await screen.findByText(/No drafts\./i)).toBeInTheDocument();
   });
 
-  it("loads the Timeline view when its tab is clicked", async () => {
+  it("loads the Timeline view from the overflow menu", async () => {
     withMe(
       { configured: true, authenticated: true },
       { status: 200, body: [] },              // posts
       { status: 200, body: { items: [] } },   // timeline
     );
     render(<App />);
-    await screen.findByRole("button", { name: "Home" });
-    await userEvent.click(screen.getByRole("button", { name: "Timeline" }));
+    await screen.findByRole("button", { name: "repeat" });
+    await openMenu();
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Timeline/i }));
     expect(await screen.findByText(/Nothing here yet/i)).toBeInTheDocument();
   });
 
-  it("loads the Subscriptions view when its tab is clicked", async () => {
+  it("loads the Subscriptions view from the overflow menu", async () => {
     withMe(
       { configured: true, authenticated: true },
       { status: 200, body: [] },  // posts
       { status: 200, body: [] },  // subs
     );
     render(<App />);
-    await screen.findByRole("button", { name: "Home" });
-    await userEvent.click(screen.getByRole("button", { name: "Subscriptions" }));
+    await screen.findByRole("button", { name: "repeat" });
+    await openMenu();
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Subscriptions/i }));
     expect(await screen.findByText(/No subscriptions yet\./i)).toBeInTheDocument();
+  });
+
+  it("loads the Settings placeholder from the overflow menu", async () => {
+    withMe(
+      { configured: true, authenticated: true },
+      { status: 200, body: [] }, // posts
+    );
+    render(<App />);
+    await screen.findByRole("button", { name: "repeat" });
+    await openMenu();
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Settings/i }));
+    expect(await screen.findByRole("heading", { name: /Settings/i })).toBeInTheDocument();
   });
 });
 
@@ -104,7 +125,7 @@ describe("App Login", () => {
     await screen.findByPlaceholderText("Password");
     await userEvent.type(screen.getByPlaceholderText("Password"), "hunter22pw");
     await userEvent.click(screen.getByRole("button", { name: /Sign in/i }));
-    expect(await screen.findByRole("button", { name: "Home" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "repeat" })).toBeInTheDocument();
   });
 
   it("surfaces 'Wrong password.' on 401", async () => {
@@ -161,7 +182,7 @@ describe("App Setup", () => {
     await userEvent.type(pwInputs[0], "longenough");
     await userEvent.type(pwInputs[1], "longenough");
     await userEvent.click(screen.getByRole("button", { name: /Set password/i }));
-    expect(await screen.findByRole("button", { name: "Home" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "repeat" })).toBeInTheDocument();
   });
 });
 
@@ -179,7 +200,7 @@ describe("App home view", () => {
       },
     );
     render(<App />);
-    await screen.findByRole("button", { name: "Home" });
+    await screen.findByRole("button", { name: "repeat" });
 
     // Switch to source mode so we can drive the textarea (Lexical's
     // contenteditable is unreliable under jsdom).
@@ -212,8 +233,9 @@ describe("App home view", () => {
       { status: 200, body: { configured: true, authenticated: false } },     // re-load
     );
     render(<App />);
-    await screen.findByRole("button", { name: "Home" });
-    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    await screen.findByRole("button", { name: "repeat" });
+    await openMenu();
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Sign out/i }));
     expect(await screen.findByPlaceholderText("Password")).toBeInTheDocument();
     expect(fn.mock.calls.find((c) => c[0] === "/admin/api/logout")).toBeTruthy();
   });
