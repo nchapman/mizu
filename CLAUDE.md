@@ -11,7 +11,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `make check` — full pipeline: lint (gofmt, `go vet`, staticcheck, ESLint, `tsc --noEmit`), tests, build. **Run this before committing — there is no CI yet, so this is your gate.**
 - `make build` — `go build ./...` followed by `cd admin && npm run build`. Use this instead of bare `go build` because `embed.go` requires `admin/dist/` to exist.
 - `make fmt` — `gofmt -w .` plus `eslint --fix`.
-- `make test` — `go test ./...`. For a single package: `go test ./internal/post/... -run TestNameSubstring -v`.
+- `make test` — runs `go test ./...` and then `cd admin && npm test` (vitest, single run). Both must pass.
+- `go test ./internal/post/... -run TestNameSubstring -v` — single Go package / pattern.
+- `cd admin && npm run test:watch` — vitest in watch mode for iterating on a single component test.
+- `cd admin && npm run test:coverage` — v8 coverage report for the admin SPA.
 - `cd admin && npm run dev` — Vite dev server on `:5173` proxying `/admin/api/*` to Go on `:8080`. Use this for live admin UI iteration; the Go binary serves the embedded admin in production.
 
 The `make` targets (and the canonical build order) live in `Makefile`. Do not reach for `go build` directly — see the embed gotcha below.
@@ -61,6 +64,25 @@ The system has two halves with deliberately different storage shapes. Understand
 - `//go:embed all:admin/dist` requires the directory to exist with at least one file. A committed `admin/dist/.keep` covers fresh checkouts; `npm run build` ends with `touch dist/.keep` because Vite's `emptyOutDir: true` clears the directory on every build. Both `.gitignore` files have negation rules to keep `.keep` tracked. Do not flip `emptyOutDir` to false (stale assets would accumulate).
 - `go build` from a cold clone before `npm run build` will fail with an embed error. Run `make build` instead, or just `cd admin && npm install && npm run build` once.
 - `modernc.org/sqlite` is pure Go. The Dockerfile builds with `CGO_ENABLED=0` and ships a fully static binary on Alpine.
+
+## Testing
+
+**Go tests** live next to source as `_test.go`. Conventions used across the suite:
+
+- `t.TempDir()` for every store/file path. Real SQLite, real disk, real chi router — internal collaborators are not mocked. Refactoring internals shouldn't break tests.
+- HTTP-touching services accept dependency injection so loopback `httptest` servers don't trip `safehttp`. `webmention.Service.http` and `feeds.Poller.http` are field-swappable; tests assign `http.DefaultClient`. `feeds.Service.validate` is a swappable validator field with the same intent.
+- **Cross-package test seam pattern**: `internal/feeds/testhelpers.go` exposes `Service.SetValidateForTest` and `SetPollerHTTPForTest`. The file is intentionally NOT `_test.go` — `_test.go` files aren't visible from other packages, and the `admin` tests need to drive `feeds` through its public surface. Keep the surface minimal; don't grow it to expose unrelated internals.
+- The webmention package follows the same pattern via `s.http = http.DefaultClient` directly (see `webmention_test.go:newService`).
+- `internal/media/extra_test.go` carries an inlined 64-byte WebP fixture (`minimalWebP`). Stdlib has no WebP encoder, so the bytes were generated once via `cwebp`. The test self-verifies via `http.DetectContentType` so a corrupt fixture fails loudly.
+- The watcher test exposes a `ready` channel (`Watcher.ready`) so the test can wait for fsnotify subscriptions to register before writing files. Without it, the first write races the watcher's `Add()` calls.
+
+**TS tests** live next to source as `*.test.ts(x)`. Conventions:
+
+- Vitest + React Testing Library + jsdom. Setup in `admin/src/test/setup.ts` (jest-dom matchers + RTL `cleanup` after each test).
+- **`queueFetch` helper** (`admin/src/test/fetch.ts`) is the canonical way to drive components: pass an array of `{status, body?}` replies, get back a `vi.fn()`. It stubs `globalThis.fetch`, registers its own `afterEach(() => vi.unstubAllGlobals())`, throws on overrun (so missing-stub bugs fail loudly instead of hanging), and handles the spec quirk that `Response` constructors reject empty-string bodies on 204.
+- Tests assert against visible text and ARIA roles, not DOM structure or test ids. `dangerouslySetInnerHTML` paths are verified by querying the rendered children (`container.querySelector(".post-rendered em")`) — don't re-implement the sanitizer in test fixtures.
+- **Lexical-in-jsdom limitation**: `MarkdownEditor` tests only cover mount, placeholder, hydration from initial markdown, and the imperative handle. Lexical relies on `contenteditable` + `Selection` APIs that jsdom only partially implements, so interactive typing isn't tested in unit form. The comment in `MarkdownEditor.test.tsx` documents the gap; cover those paths via browser smoke testing.
+- Stub `globalThis.confirm` directly when a flow calls it (Drafts/Subscriptions destructive actions). Pair with an `afterEach(() => vi.unstubAllGlobals())` in the same describe — `queueFetch` only owns its own cleanup.
 
 ## Style + workflow
 
