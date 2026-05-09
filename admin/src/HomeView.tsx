@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Composer, type ComposerHandle } from "@/Composer";
 import { DraftsDrawer } from "@/DraftsDrawer";
 import { StreamView } from "@/Stream";
-import type { Draft, Post } from "@/api";
+import type { Draft, Post, TimelineItem } from "@/api";
 import { Unauthorized, listDrafts } from "@/api";
 import type { EditTarget } from "@/Shell";
 
@@ -72,6 +72,15 @@ export function HomeView({ onAuthLost, editTarget, onEditConsumed }: Props) {
     });
   }
 
+  function replyTo(it: TimelineItem) {
+    // Quote the feed item's title (or a slice of the body if no title)
+    // and link back to the source. The pill keeps the provenance visible.
+    const headline = (it.title ?? "").trim() || (it.feed_title ?? "").trim() || "(untitled)";
+    const link = it.url ? `[${headline}](${it.url})` : headline;
+    const quote = `> ${link}\n> — ${it.feed_title}\n\n`;
+    composerRef.current?.prefill(quote, { feedTitle: it.feed_title });
+  }
+
   function handleDraftSaved() {
     setDraftsRefresh((n) => n + 1);
     refreshDraftsCount();
@@ -101,6 +110,7 @@ export function HomeView({ onAuthLost, editTarget, onEditConsumed }: Props) {
       <StreamView
         onAuthLost={onAuthLost}
         onEditOwn={startEditPost}
+        onReply={replyTo}
         refreshToken={streamRefresh}
         onPostsChanged={() => setStreamRefresh((n) => n + 1)}
       />

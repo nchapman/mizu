@@ -21,13 +21,16 @@ interface Props {
   // The home view passes its post-edit affordance down so own-post cards
   // can hand control back to the composer.
   onEditOwn: (p: Post) => void;
+  // Reply-with-a-post: HomeView prefills the composer with a quote and a
+  // provenance pill when the operator wants to riff on a feed item.
+  onReply: (it: TimelineItem) => void;
   // Bumping refreshToken forces a full re-fetch (e.g. after composer
   // submit, draft publish, or a deletion that originated outside Stream).
   refreshToken?: number;
   onPostsChanged?: () => void;
 }
 
-export function StreamView({ onAuthLost, onEditOwn, refreshToken = 0, onPostsChanged }: Props) {
+export function StreamView({ onAuthLost, onEditOwn, onReply, refreshToken = 0, onPostsChanged }: Props) {
   const [items, setItems] = useState<StreamItem[]>([]);
   const [cursor, setCursor] = useState<string | undefined>(undefined);
   const [done, setDone] = useState(false);
@@ -145,6 +148,7 @@ export function StreamView({ onAuthLost, onEditOwn, refreshToken = 0, onPostsCha
           item={it}
           onMarkRead={onMarkRead}
           onMarkUnread={onMarkUnread}
+          onReply={onReply}
           onEditOwn={onEditOwn}
           onDeleteOwn={onDeleteOwn}
         />

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ExternalLink, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
+import { ExternalLink, MessageSquareQuote, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -18,6 +18,7 @@ import { cn } from "@/lib/utils";
 interface FeedHandlers {
   onMarkRead: (it: TimelineItem) => void;
   onMarkUnread: (it: TimelineItem) => void;
+  onReply: (it: TimelineItem) => void;
 }
 
 interface OwnHandlers {
@@ -34,6 +35,7 @@ export function StreamCard(props: Props) {
         item={props.item.item}
         onMarkRead={props.onMarkRead}
         onMarkUnread={props.onMarkUnread}
+        onReply={props.onReply}
       />
     );
   }
@@ -50,6 +52,7 @@ function FeedCard({
   item: feed,
   onMarkRead,
   onMarkUnread,
+  onReply,
 }: { item: TimelineItem } & FeedHandlers) {
   const [expanded, setExpanded] = useState(false);
   const { leadHTML, hasMore } = expanded
@@ -87,6 +90,10 @@ function FeedCard({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
+            <DropdownMenuItem onSelect={() => onReply(feed)}>
+              <MessageSquareQuote />
+              Reply with a post
+            </DropdownMenuItem>
             {feed.url && (
               <DropdownMenuItem asChild>
                 <a href={feed.url} target="_blank" rel="noopener noreferrer">

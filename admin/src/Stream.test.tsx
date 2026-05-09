@@ -61,7 +61,7 @@ const noop = () => {};
 describe("StreamView", () => {
   it("renders an empty state when the stream has no items", async () => {
     queueFetch([{ status: 200, body: { items: [] } }]);
-    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} onReply={noop} />);
     expect(await screen.findByText(/Nothing here yet/i)).toBeInTheDocument();
   });
 
@@ -69,7 +69,7 @@ describe("StreamView", () => {
     queueFetch([
       { status: 200, body: { items: [feed({ content: "<p>safe <em>content</em></p><p>more</p>" })] } },
     ]);
-    const { container } = render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    const { container } = render(<StreamView onAuthLost={noop} onEditOwn={noop} onReply={noop} />);
     expect(await screen.findByRole("heading", { name: "An item" })).toBeInTheDocument();
     expect(screen.getByText("Test Feed")).toBeInTheDocument();
     expect(container.querySelector(".post-rendered em")?.textContent).toBe("content");
@@ -80,7 +80,7 @@ describe("StreamView", () => {
     queueFetch([
       { status: 200, body: { items: [own({ title: "Hello", html: "<p>Hello <em>world</em></p>" })] } },
     ]);
-    const { container } = render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    const { container } = render(<StreamView onAuthLost={noop} onEditOwn={noop} onReply={noop} />);
     expect(await screen.findByRole("heading", { name: "Hello" })).toBeInTheDocument();
     expect(screen.getByText("You")).toBeInTheDocument();
     expect(container.querySelector(".post-rendered em")?.textContent).toBe("world");
@@ -90,7 +90,7 @@ describe("StreamView", () => {
     queueFetch([
       { status: 200, body: { items: [feed({ content: "<p>lead</p><p>second paragraph</p>" })] } },
     ]);
-    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} onReply={noop} />);
     await screen.findByRole("heading", { name: "An item" });
     expect(screen.queryByText("second paragraph")).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: /Read more/i }));
@@ -102,7 +102,7 @@ describe("StreamView", () => {
       { status: 200, body: { items: [feed({ id: 1, title: "A" })], next_cursor: "abc" } },
       { status: 200, body: { items: [feed({ id: 2, title: "B" })] } },
     ]);
-    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} onReply={noop} />);
     await screen.findByRole("heading", { name: "A" });
     await userEvent.click(screen.getByRole("button", { name: /Load more/i }));
     await screen.findByRole("heading", { name: "B" });
@@ -114,7 +114,7 @@ describe("StreamView", () => {
       { status: 200, body: { items: [feed({ id: 1 })] } },
       { status: 200, body: { items: [feed({ id: 1 })] } },
     ]);
-    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} onReply={noop} />);
     await screen.findByRole("heading", { name: "An item" });
 
     await userEvent.click(screen.getByRole("tab", { name: "Unread" }));
@@ -128,7 +128,7 @@ describe("StreamView", () => {
       { status: 200, body: { items: [feed({ id: 1 })] } },
       { status: 200, body: { items: [own()] } },
     ]);
-    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} onReply={noop} />);
     await screen.findByRole("heading", { name: "An item" });
     await userEvent.click(screen.getByRole("tab", { name: "Yours" }));
     await waitFor(() => expect(fn).toHaveBeenCalledTimes(2));
@@ -140,7 +140,7 @@ describe("StreamView", () => {
       { status: 200, body: { items: [feed({ id: 5, read: false })] } },
       { status: 204 },
     ]);
-    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} onReply={noop} />);
     const article = (await screen.findByRole("heading", { name: "An item" })).closest("article")!;
     await openCardMenu(article);
     await userEvent.click(await screen.findByRole("menuitem", { name: "Mark read" }));
@@ -151,10 +151,21 @@ describe("StreamView", () => {
     expect((fn.mock.calls[1][1] as RequestInit).method).toBe("POST");
   });
 
+  it("invokes onReply from the feed-card menu with the source item", async () => {
+    queueFetch([{ status: 200, body: { items: [feed({ id: 7, title: "Source" })] } }]);
+    const onReply = vi.fn();
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} onReply={onReply} />);
+    const article = (await screen.findByRole("heading", { name: "Source" })).closest("article")!;
+    await openCardMenu(article);
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Reply with a post/i }));
+    expect(onReply).toHaveBeenCalledTimes(1);
+    expect(onReply.mock.calls[0][0].id).toBe(7);
+  });
+
   it("hands off own-card Edit to onEditOwn", async () => {
     queueFetch([{ status: 200, body: { items: [own({ id: "p1", title: "Hello" })] } }]);
     const onEditOwn = vi.fn();
-    render(<StreamView onAuthLost={noop} onEditOwn={onEditOwn} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={onEditOwn} onReply={noop} />);
     const article = (await screen.findByRole("heading", { name: "Hello" })).closest("article")!;
     await openCardMenu(article);
     await userEvent.click(await screen.findByRole("menuitem", { name: /Edit/i }));
@@ -167,7 +178,7 @@ describe("StreamView", () => {
       { status: 200, body: { items: [own({ id: "p1", title: "Doomed" })] } },
       { status: 204 }, // DELETE
     ]);
-    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} onReply={noop} />);
     const article = (await screen.findByRole("heading", { name: "Doomed" })).closest("article")!;
     await openCardMenu(article);
     await userEvent.click(await screen.findByRole("menuitem", { name: /Delete/i }));
@@ -179,7 +190,7 @@ describe("StreamView", () => {
   it("calls onAuthLost when initial load returns 401", async () => {
     queueFetch([{ status: 401 }]);
     const onAuthLost = vi.fn();
-    render(<StreamView onAuthLost={onAuthLost} onEditOwn={noop} />);
+    render(<StreamView onAuthLost={onAuthLost} onEditOwn={noop} onReply={noop} />);
     await waitFor(() => expect(onAuthLost).toHaveBeenCalled());
   });
 });

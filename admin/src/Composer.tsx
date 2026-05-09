@@ -7,7 +7,7 @@ import {
   useState,
 } from "react";
 import { flushSync } from "react-dom";
-import { FileText, Heading, ImagePlus } from "lucide-react";
+import { FileText, Heading, ImagePlus, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -36,6 +36,14 @@ type EditorMode = "rich" | "md";
 export interface ComposerHandle {
   load: (target: EditTarget) => void;
   reset: () => void;
+  // prefill seeds a brand-new post with body content (e.g. a quoted feed
+  // item) and optionally surfaces an "Inspired by" pill so the operator
+  // sees the provenance while writing. No edit target is set.
+  prefill: (body: string, inspiration?: Inspiration) => void;
+}
+
+export interface Inspiration {
+  feedTitle: string;
 }
 
 interface Props {
@@ -75,6 +83,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   // intermediate render where its update listener fires onChange("") and
   // clobbers the just-set body.
   const [target, setTarget] = useState<EditTarget | null>(null);
+  const [inspiration, setInspiration] = useState<Inspiration | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -90,6 +99,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     setTitle("");
     setShowTitle(false);
     setErr("");
+    setInspiration(null);
     setEditorKey((k) => k + 1);
   }, []);
 
@@ -106,6 +116,18 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     setTitle(t.title);
     setShowTitle(!!t.title);
     setErr("");
+    setInspiration(null);
+    setEditorKey((k) => k + 1);
+    setFocusTick((n) => n + 1);
+  }, []);
+
+  const prefill = useCallback((nextBody: string, source?: Inspiration) => {
+    setTarget(null);
+    setBody(nextBody);
+    setTitle("");
+    setShowTitle(false);
+    setErr("");
+    setInspiration(source ?? null);
     setEditorKey((k) => k + 1);
     setFocusTick((n) => n + 1);
   }, []);
@@ -118,7 +140,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusTick]);
 
-  useImperativeHandle(ref, () => ({ load, reset }), [load, reset]);
+  useImperativeHandle(ref, () => ({ load, reset, prefill }), [load, reset, prefill]);
 
   // Inserts text at the textarea's caret. flushSync forces React to commit
   // the new body synchronously so we can move the caret in the same tick.
@@ -272,6 +294,24 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
         onSubmit={submit}
         className="mb-6 rounded-xl border border-border bg-card p-4 shadow-sm"
       >
+        {inspiration && (
+          <div
+            role="status"
+            className="mb-3 flex items-center justify-between gap-2 rounded-md bg-accent/40 px-3 py-1.5 text-xs text-muted-foreground"
+          >
+            <span className="truncate">
+              Inspired by: <span className="font-medium text-foreground/80">{inspiration.feedTitle}</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => setInspiration(null)}
+              className="text-muted-foreground hover:text-foreground"
+              aria-label="Clear inspiration"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
         {showTitle && (
           <Input
             placeholder="Title"
