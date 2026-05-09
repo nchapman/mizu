@@ -96,7 +96,7 @@ func (p *Poller) PollOne(ctx context.Context, f Feed) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotModified {
-		return p.store.MarkFetched(ctx, f.ID, f.ETag, f.LastModified)
+		return p.store.MarkFetched(ctx, f.ID, f.ETag, f.LastModified, "", "")
 	}
 	if resp.StatusCode >= 400 {
 		// Drain a little of the body for context, then bail.
@@ -148,5 +148,5 @@ func (p *Poller) PollOne(ctx context.Context, f Feed) error {
 			return fmt.Errorf("insert item: %w", err)
 		}
 	}
-	return p.store.MarkFetched(ctx, f.ID, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"))
+	return p.store.MarkFetched(ctx, f.ID, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), parsed.Title, parsed.Link)
 }

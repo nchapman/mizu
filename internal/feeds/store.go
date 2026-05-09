@@ -147,11 +147,20 @@ FROM feeds ORDER BY title`)
 	return out, rows.Err()
 }
 
-// MarkFetched updates fetch metadata after a successful poll.
-func (s *Store) MarkFetched(ctx context.Context, feedID int64, etag, lastModified string) error {
+// MarkFetched updates fetch metadata after a successful poll. parsedTitle
+// and parsedSiteURL come from the feed body (channel <title>, channel <link>);
+// they fill in empty slots only, so an operator-supplied title/site URL stays
+// sticky — same precedence as UpsertFeed's ON CONFLICT clause.
+func (s *Store) MarkFetched(ctx context.Context, feedID int64, etag, lastModified, parsedTitle, parsedSiteURL string) error {
 	_, err := s.db.ExecContext(ctx, `
-UPDATE feeds SET etag = ?, last_modified = ?, last_fetched_at = ?, last_error = NULL
-WHERE id = ?`, etag, lastModified, time.Now().Unix(), feedID)
+UPDATE feeds SET
+  etag = ?,
+  last_modified = ?,
+  last_fetched_at = ?,
+  last_error = NULL,
+  title    = CASE WHEN COALESCE(title,'')    = '' THEN ? ELSE title    END,
+  site_url = CASE WHEN COALESCE(site_url,'') = '' THEN ? ELSE site_url END
+WHERE id = ?`, etag, lastModified, time.Now().Unix(), parsedTitle, parsedSiteURL, feedID)
 	return err
 }
 
