@@ -20,6 +20,11 @@ type Service struct {
 	opmlPath  string
 	siteTitle string
 
+	// validate is the URL validator used by Subscribe. Tests swap this
+	// out so they can subscribe to httptest servers (loopback) without
+	// tripping the SSRF guard.
+	validate func(ctx context.Context, raw string) (string, error)
+
 	// mu serializes mutation of the (DB, OPML) pair so concurrent
 	// subscribe/unsubscribe requests can't interleave OPML writes with
 	// DB updates. RLock allows concurrent reads (ListFeeds) without
@@ -28,7 +33,7 @@ type Service struct {
 }
 
 func NewService(store *Store, opmlPath, siteTitle string) *Service {
-	return &Service{Store: store, opmlPath: opmlPath, siteTitle: siteTitle}
+	return &Service{Store: store, opmlPath: opmlPath, siteTitle: siteTitle, validate: validateFeedURL}
 }
 
 // LoadFromOPML reads the on-disk OPML and upserts each subscription into
@@ -105,7 +110,7 @@ func validateFeedURL(ctx context.Context, raw string) (string, error) {
 // commits to ensure the durable source of truth is updated first; if
 // the OPML write fails, the DB stays untouched.
 func (s *Service) Subscribe(ctx context.Context, feedURL, title, siteURL, category string) (*Feed, error) {
-	feedURL, err := validateFeedURL(ctx, feedURL)
+	feedURL, err := s.validate(ctx, feedURL)
 	if err != nil {
 		return nil, err
 	}
