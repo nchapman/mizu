@@ -172,10 +172,14 @@ type postDTO struct {
 	Path  string   `json:"path"`
 }
 
-func toDTO(p *post.Post) postDTO {
+// toDTO renders the post body and packages everything the admin SPA
+// needs. Render errors propagate up: a silent empty `html` field would
+// just produce a blank list entry that's hard to diagnose. Callers
+// 500 on error.
+func toDTO(p *post.Post) (postDTO, error) {
 	html, err := p.RenderHTML()
 	if err != nil {
-		log.Printf("admin render post %s: %v", p.ID, err)
+		return postDTO{}, err
 	}
 	return postDTO{
 		ID:    p.ID,
@@ -185,14 +189,20 @@ func toDTO(p *post.Post) postDTO {
 		Body:  p.Body,
 		HTML:  html,
 		Path:  p.Path(),
-	}
+	}, nil
 }
 
-func (s *Server) listPosts(w http.ResponseWriter, r *http.Request) {
+func (s *Server) listPosts(w http.ResponseWriter, _ *http.Request) {
 	recent := s.posts.Recent(100)
 	out := make([]postDTO, len(recent))
 	for i, p := range recent {
-		out[i] = toDTO(p)
+		dto, err := toDTO(p)
+		if err != nil {
+			log.Printf("admin render post %s: %v", p.ID, err)
+			http.Error(w, "render failed", http.StatusInternalServerError)
+			return
+		}
+		out[i] = dto
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -220,8 +230,14 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.queueWebmentions(p)
-	writeJSON(w, http.StatusCreated, toDTO(p))
+	dto, err := toDTO(p)
+	if err != nil {
+		log.Printf("admin render post %s: %v", p.ID, err)
+		http.Error(w, "render failed", http.StatusInternalServerError)
+		return
+	}
+	s.queueWebmentions(p, dto.HTML)
+	writeJSON(w, http.StatusCreated, dto)
 }
 
 // queueWebmentions fires off outbound webmentions for the rendered
@@ -229,17 +245,16 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 // edit re-notifies receivers for current links and is spec-allowed.
 // Removed-link notifications (when an edit drops a link) are a known
 // gap; they require remembering the previous link set.
-func (s *Server) queueWebmentions(p *post.Post) {
-	go func(p *post.Post) {
+//
+// html is passed in (rather than re-rendered here) so a single
+// create/update doesn't render the body twice.
+func (s *Server) queueWebmentions(p *post.Post, html string) {
+	target := s.cfg.Site.BaseURL + p.Path()
+	go func() {
 		ctx, cancel := context.WithTimeout(s.bgCtx, 2*time.Minute)
 		defer cancel()
-		html, err := p.RenderHTML()
-		if err != nil {
-			log.Printf("render for webmentions: %v", err)
-			return
-		}
-		s.wm.SendForPost(ctx, s.cfg.Site.BaseURL+p.Path(), html)
-	}(p)
+		s.wm.SendForPost(ctx, target, html)
+	}()
 }
 
 func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
@@ -269,8 +284,14 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.queueWebmentions(p)
-	writeJSON(w, http.StatusOK, toDTO(p))
+	dto, err := toDTO(p)
+	if err != nil {
+		log.Printf("admin render post %s: %v", p.ID, err)
+		http.Error(w, "render failed", http.StatusInternalServerError)
+		return
+	}
+	s.queueWebmentions(p, dto.HTML)
+	writeJSON(w, http.StatusOK, dto)
 }
 
 // --- drafts ---
@@ -284,10 +305,10 @@ type draftDTO struct {
 	Created string   `json:"created"`
 }
 
-func toDraftDTO(d *post.Draft) draftDTO {
+func toDraftDTO(d *post.Draft) (draftDTO, error) {
 	html, err := d.RenderHTML()
 	if err != nil {
-		log.Printf("admin render draft %s: %v", d.ID, err)
+		return draftDTO{}, err
 	}
 	return draftDTO{
 		ID:      d.ID,
@@ -296,14 +317,20 @@ func toDraftDTO(d *post.Draft) draftDTO {
 		Body:    d.Body,
 		HTML:    html,
 		Created: d.Created.Format(time.RFC3339),
-	}
+	}, nil
 }
 
 func (s *Server) listDrafts(w http.ResponseWriter, _ *http.Request) {
 	list := s.posts.ListDrafts()
 	out := make([]draftDTO, len(list))
 	for i, d := range list {
-		out[i] = toDraftDTO(d)
+		dto, err := toDraftDTO(d)
+		if err != nil {
+			log.Printf("admin render draft %s: %v", d.ID, err)
+			http.Error(w, "render failed", http.StatusInternalServerError)
+			return
+		}
+		out[i] = dto
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -323,7 +350,13 @@ func (s *Server) createDraft(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusCreated, toDraftDTO(d))
+	dto, err := toDraftDTO(d)
+	if err != nil {
+		log.Printf("admin render draft %s: %v", d.ID, err)
+		http.Error(w, "render failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusCreated, dto)
 }
 
 func (s *Server) updateDraft(w http.ResponseWriter, r *http.Request) {
@@ -346,7 +379,13 @@ func (s *Server) updateDraft(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, toDraftDTO(d))
+	dto, err := toDraftDTO(d)
+	if err != nil {
+		log.Printf("admin render draft %s: %v", d.ID, err)
+		http.Error(w, "render failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, dto)
 }
 
 func (s *Server) deleteDraft(w http.ResponseWriter, r *http.Request) {
@@ -381,8 +420,14 @@ func (s *Server) publishDraft(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.queueWebmentions(p)
-	writeJSON(w, http.StatusOK, toDTO(p))
+	dto, err := toDTO(p)
+	if err != nil {
+		log.Printf("admin render post %s: %v", p.ID, err)
+		http.Error(w, "render failed", http.StatusInternalServerError)
+		return
+	}
+	s.queueWebmentions(p, dto.HTML)
+	writeJSON(w, http.StatusOK, dto)
 }
 
 func (s *Server) deletePost(w http.ResponseWriter, r *http.Request) {

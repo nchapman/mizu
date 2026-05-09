@@ -55,6 +55,17 @@ func (p *Post) RenderHTML() (string, error) {
 	return renderMarkdown(p.Body)
 }
 
+// renderMarkdown converts a post body to HTML using goldmark's default
+// configuration. The default explicitly does NOT enable raw HTML
+// passthrough (`html.WithUnsafe`), so `<script>`, `<iframe>`, and
+// inline event handlers in the body are dropped rather than emitted.
+//
+// The output is consumed via `dangerouslySetInnerHTML` in the admin
+// SPA and via `template.HTML` on the public site — both bypass HTML
+// escaping. Do NOT pass `html.WithUnsafe()` here, or add other raw-HTML
+// renderers, without also adding a bluemonday sanitization pass on the
+// way out. There is a regression test asserting `<script>` does not
+// survive this function; keep it green.
 func renderMarkdown(body string) (string, error) {
 	var buf bytes.Buffer
 	if err := goldmark.New().Convert([]byte(body), &buf); err != nil {

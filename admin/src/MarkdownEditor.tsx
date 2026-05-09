@@ -12,7 +12,7 @@
 // `![alt](url)` in rich mode rather than rendering inline — but it
 // roundtrips through the markdown serializer cleanly.
 
-import { forwardRef, useEffect, useImperativeHandle } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useMemo } from "react";
 import type { Ref } from "react";
 import "./MarkdownEditor.css";
 import { LexicalComposer } from "@lexical/react/LexicalComposer";
@@ -43,7 +43,12 @@ import {
 } from "lexical";
 
 export interface MarkdownEditorHandle {
-  insertMarkdown(text: string): void;
+  // insertText drops a literal string at the caret. The string is NOT
+  // re-parsed as Markdown — it lands as plain text in the rich tree.
+  // Used today for inline `![alt](url)` after image upload, which
+  // roundtrips correctly through the Markdown serializer even though
+  // it does not render as an image in rich mode.
+  insertText(text: string): void;
   focus(): void;
 }
 
@@ -148,7 +153,7 @@ function ImperativeBridge({
   useImperativeHandle(
     handleRef,
     () => ({
-      insertMarkdown(text: string) {
+      insertText(text: string) {
         editor.update(() => {
           const sel = $getSelection();
           if ($isRangeSelection(sel)) sel.insertText(text);
@@ -167,24 +172,32 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, Props>(function M
   { initialValue, onChange, onUploadImages, placeholder, minHeight },
   ref,
 ) {
-  const initialConfig = {
-    namespace: "repeat-composer",
-    theme: editorTheme,
-    nodes: [
-      HeadingNode,
-      QuoteNode,
-      ListNode,
-      ListItemNode,
-      LinkNode,
-      AutoLinkNode,
-      CodeNode,
-      CodeHighlightNode,
-    ],
-    onError(err: Error) {
-      console.error("lexical:", err);
-    },
-    editorState: () => $convertFromMarkdownString(initialValue, TRANSFORMERS),
-  };
+  // LexicalComposer reads initialConfig once on mount, so the only
+  // value that needs stable identity here is `editorState`. The parent
+  // forces a fresh mount via `key` when initialValue changes from
+  // outside, so capturing the prop in the factory closure is safe.
+  const initialConfig = useMemo(
+    () => ({
+      namespace: "repeat-composer",
+      theme: editorTheme,
+      nodes: [
+        HeadingNode,
+        QuoteNode,
+        ListNode,
+        ListItemNode,
+        LinkNode,
+        AutoLinkNode,
+        CodeNode,
+        CodeHighlightNode,
+      ],
+      onError(err: Error) {
+        console.error("lexical:", err);
+      },
+      editorState: () => $convertFromMarkdownString(initialValue, TRANSFORMERS),
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
 
   return (
     <LexicalComposer initialConfig={initialConfig}>

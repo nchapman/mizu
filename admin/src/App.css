@@ -42,5 +42,5 @@
 .post-rendered img { max-width: 100%; height: auto; border-radius: 3px; }
 .post-rendered a { color: #1a6abf; }
 
+/* Drafts list uses muted body text; link color stays from .post-rendered a. */
 .post-rendered-muted { color: #444; }
-.post-rendered-muted a { color: #1a6abf; }

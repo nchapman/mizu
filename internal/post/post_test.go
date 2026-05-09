@@ -341,3 +341,61 @@ func TestDelete_FreesSlugForRecreate(t *testing.T) {
 		t.Errorf("recreate failed: %v", err)
 	}
 }
+
+func TestRenderHTML_BasicMarkdown(t *testing.T) {
+	p := &Post{Body: "Hello **world**\n\n- one\n- two\n"}
+	got, err := p.RenderHTML()
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	for _, want := range []string{"<strong>world</strong>", "<ul>", "<li>one</li>"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q\n--- got ---\n%s", want, got)
+		}
+	}
+}
+
+// TestRenderHTML_DropsRawHTML locks the security-critical default:
+// goldmark must NOT pass <script>/<iframe> through to the rendered
+// output, because the result is consumed via dangerouslySetInnerHTML
+// in the admin SPA and template.HTML on the public site. If this test
+// fails, someone almost certainly enabled html.WithUnsafe — restore
+// the default or add a bluemonday pass before relanding.
+func TestRenderHTML_DropsRawHTML(t *testing.T) {
+	cases := []string{
+		`<script>alert(1)</script>`,
+		`<iframe src="evil"></iframe>`,
+		`<img src=x onerror=alert(1)>`,
+		`<a href="javascript:alert(1)">x</a>`,
+	}
+	for _, body := range cases {
+		p := &Post{Body: body}
+		got, err := p.RenderHTML()
+		if err != nil {
+			t.Fatalf("RenderHTML(%q): %v", body, err)
+		}
+		lower := strings.ToLower(got)
+		for _, banned := range []string{"<script", "<iframe", "onerror=", "javascript:"} {
+			if strings.Contains(lower, banned) {
+				t.Errorf("body %q produced %q — %q must not survive renderMarkdown\n", body, got, banned)
+			}
+		}
+	}
+}
+
+func TestDraftRenderHTML_MatchesPost(t *testing.T) {
+	body := "Just a draft.\n"
+	p := &Post{Body: body}
+	d := &Draft{Body: body}
+	pHTML, err := p.RenderHTML()
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	dHTML, err := d.RenderHTML()
+	if err != nil {
+		t.Fatalf("draft: %v", err)
+	}
+	if pHTML != dHTML {
+		t.Errorf("draft and post render diverged:\npost:  %q\ndraft: %q", pHTML, dHTML)
+	}
+}

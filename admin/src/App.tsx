@@ -300,7 +300,7 @@ function HomeView({
   // editor — this helper only covers the explicit "+ image" button.
   async function uploadFilesRich(files: File[]) {
     const snippets = await uploadAndCollect(files);
-    if (snippets.length > 0) editorRef.current?.insertMarkdown(snippets.join(""));
+    if (snippets.length > 0) editorRef.current?.insertText(snippets.join(""));
   }
 
   function onPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
