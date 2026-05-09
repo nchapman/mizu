@@ -52,8 +52,12 @@ func (p *Post) Path() string {
 }
 
 func (p *Post) RenderHTML() (string, error) {
+	return renderMarkdown(p.Body)
+}
+
+func renderMarkdown(body string) (string, error) {
 	var buf bytes.Buffer
-	if err := goldmark.New().Convert([]byte(p.Body), &buf); err != nil {
+	if err := goldmark.New().Convert([]byte(body), &buf); err != nil {
 		return "", err
 	}
 	return buf.String(), nil
@@ -363,6 +367,10 @@ type Draft struct {
 	Created  time.Time `yaml:"created"`
 	Body     string    `yaml:"-"`
 	Filename string    `yaml:"-"`
+}
+
+func (d *Draft) RenderHTML() (string, error) {
+	return renderMarkdown(d.Body)
 }
 
 func (s *Store) ListDrafts() []*Draft {

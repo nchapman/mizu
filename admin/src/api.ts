@@ -34,6 +34,7 @@ export type Post = {
   date: string;
   tags?: string[];
   body: string;
+  html: string;
   path: string;
 };
 
@@ -93,6 +94,7 @@ export type Draft = {
   title?: string;
   tags?: string[];
   body: string;
+  html: string;
   created: string;
 };
 

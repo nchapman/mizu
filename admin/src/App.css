@@ -1,0 +1,46 @@
+/* Typography for goldmark-rendered post bodies in the admin list. */
+
+.post-rendered { line-height: 1.5; }
+.post-rendered > :first-child { margin-top: 0; }
+.post-rendered > :last-child { margin-bottom: 0; }
+
+.post-rendered p { margin: 0 0 .6em; }
+.post-rendered h1, .post-rendered h2, .post-rendered h3, .post-rendered h4 {
+  margin: .8em 0 .3em;
+}
+.post-rendered h1 { font-size: 1.4em; }
+.post-rendered h2 { font-size: 1.2em; }
+.post-rendered h3 { font-size: 1.05em; }
+.post-rendered h4 { font-size: 1em; }
+
+.post-rendered ul, .post-rendered ol { margin: 0 0 .6em 1.4em; padding: 0; }
+.post-rendered li { margin: 0 0 .15em; }
+
+.post-rendered blockquote {
+  margin: 0 0 .6em;
+  padding-left: .8em;
+  border-left: 3px solid #ccc;
+  color: #555;
+}
+
+.post-rendered code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #f3f3f3;
+  padding: 0 .2em;
+  border-radius: 3px;
+  font-size: .95em;
+}
+.post-rendered pre {
+  background: #f6f6f6;
+  padding: .6em .8em;
+  border-radius: 4px;
+  overflow-x: auto;
+  margin: 0 0 .6em;
+}
+.post-rendered pre code { background: none; padding: 0; }
+
+.post-rendered img { max-width: 100%; height: auto; border-radius: 3px; }
+.post-rendered a { color: #1a6abf; }
+
+.post-rendered-muted { color: #444; }
+.post-rendered-muted a { color: #1a6abf; }

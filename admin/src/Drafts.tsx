@@ -83,7 +83,7 @@ export function DraftsView({
             </div>
           </div>
           {d.title && <h2 style={{ margin: ".2em 0", fontSize: "1.1em" }}>{d.title}</h2>}
-          <div style={{ whiteSpace: "pre-wrap", color: "#444" }}>{d.body}</div>
+          <div className="post-rendered post-rendered-muted" dangerouslySetInnerHTML={{ __html: d.html }} />
         </article>
       ))}
     </div>

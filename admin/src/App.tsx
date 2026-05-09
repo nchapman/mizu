@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
+import "./App.css";
 import {
   api, Post, Draft, Unauthorized, uploadMedia,
   updatePost, deletePost, createDraft, updateDraft, publishDraft,
@@ -518,7 +519,7 @@ function HomeView({
               </div>
             </div>
             {p.title && <h2 style={{ margin: ".2em 0", fontSize: "1.1em" }}>{p.title}</h2>}
-            <div style={{ whiteSpace: "pre-wrap" }}>{p.body}</div>
+            <div className="post-rendered" dangerouslySetInnerHTML={{ __html: p.html }} />
           </article>
         );
       })}

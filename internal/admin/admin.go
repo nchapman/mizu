@@ -168,16 +168,22 @@ type postDTO struct {
 	Date  string   `json:"date"`
 	Tags  []string `json:"tags,omitempty"`
 	Body  string   `json:"body"`
+	HTML  string   `json:"html"`
 	Path  string   `json:"path"`
 }
 
 func toDTO(p *post.Post) postDTO {
+	html, err := p.RenderHTML()
+	if err != nil {
+		log.Printf("admin render post %s: %v", p.ID, err)
+	}
 	return postDTO{
 		ID:    p.ID,
 		Title: p.Title,
 		Date:  p.Date.Format("2006-01-02T15:04:05Z07:00"),
 		Tags:  p.Tags,
 		Body:  p.Body,
+		HTML:  html,
 		Path:  p.Path(),
 	}
 }
@@ -274,15 +280,21 @@ type draftDTO struct {
 	Title   string   `json:"title,omitempty"`
 	Tags    []string `json:"tags,omitempty"`
 	Body    string   `json:"body"`
+	HTML    string   `json:"html"`
 	Created string   `json:"created"`
 }
 
 func toDraftDTO(d *post.Draft) draftDTO {
+	html, err := d.RenderHTML()
+	if err != nil {
+		log.Printf("admin render draft %s: %v", d.ID, err)
+	}
 	return draftDTO{
 		ID:      d.ID,
 		Title:   d.Title,
 		Tags:    d.Tags,
 		Body:    d.Body,
+		HTML:    html,
 		Created: d.Created.Format(time.RFC3339),
 	}
 }
