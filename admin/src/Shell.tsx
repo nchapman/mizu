@@ -2,8 +2,8 @@ import { useCallback, useState } from "react";
 import { DraftsView } from "./Drafts";
 import { HomeView } from "./HomeView";
 import { SettingsView } from "./Settings";
+import { StreamView } from "./Stream";
 import { SubscriptionsView } from "./Subscriptions";
-import { TimelineView } from "./Timeline";
 import { TopBar } from "./TopBar";
 import type { Draft } from "./api";
 import { useRoute } from "./lib/router";
@@ -46,7 +46,7 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
           />
         )}
         {route === "drafts" && <DraftsView onAuthLost={onLogout} onEdit={editDraft} />}
-        {route === "timeline" && <TimelineView onAuthLost={onLogout} />}
+        {route === "timeline" && <StreamView onAuthLost={onLogout} />}
         {route === "subscriptions" && <SubscriptionsView onAuthLost={onLogout} />}
         {route === "settings" && <SettingsView />}
       </main>
