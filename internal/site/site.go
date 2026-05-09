@@ -2,15 +2,18 @@ package site
 
 import (
 	"bytes"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -68,6 +71,8 @@ func activeTemplatesFS(dir string, embedded fs.FS) fs.FS {
 func (s *Server) Routes(r chi.Router) {
 	r.Get("/", s.index)
 	r.Get("/feed.xml", s.rss)
+	r.Get("/robots.txt", s.robots)
+	r.Get("/sitemap.xml", s.sitemap)
 	r.Get("/notes/{id}", s.note)
 	r.Get("/{year:[0-9]{4}}/{month:[0-9]{2}}/{day:[0-9]{2}}/{slug}", s.article)
 	r.Post("/webmention", s.webmention)
@@ -222,6 +227,59 @@ func (s *Server) rss(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
+	_, _ = buf.WriteTo(w)
+}
+
+// robots advertises the sitemap and keeps the admin SPA out of crawler
+// indexes. The admin endpoints already require auth, but discouraging
+// crawlers from hammering /admin/* avoids noisy 401/redirect traffic in
+// search consoles.
+func (s *Server) robots(w http.ResponseWriter, r *http.Request) {
+	var b strings.Builder
+	b.WriteString("User-agent: *\n")
+	b.WriteString("Disallow: /admin/\n")
+	// Sitemap is a non-group, file-level directive; convention (and some
+	// parsers) want it separated from the user-agent record by a blank line.
+	if base := strings.TrimRight(s.cfg.Site.BaseURL, "/"); base != "" {
+		fmt.Fprintf(&b, "\nSitemap: %s/sitemap.xml\n", base)
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, b.String())
+}
+
+// sitemap lists the homepage and every published post. lastmod uses the
+// post's Date — Update() doesn't currently track a separate modified
+// timestamp, and crawlers tolerate a stable Date better than a missing
+// field.
+func (s *Server) sitemap(w http.ResponseWriter, r *http.Request) {
+	base := strings.TrimRight(s.cfg.Site.BaseURL, "/")
+	all := s.posts.Recent(0)
+
+	var buf bytes.Buffer
+	buf.WriteString(xml.Header)
+	buf.WriteString(`<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">` + "\n")
+
+	writeURL := func(loc string, lastmod time.Time) {
+		buf.WriteString("  <url>\n    <loc>")
+		_ = xml.EscapeText(&buf, []byte(loc))
+		buf.WriteString("</loc>\n")
+		if !lastmod.IsZero() {
+			fmt.Fprintf(&buf, "    <lastmod>%s</lastmod>\n", lastmod.UTC().Format("2006-01-02"))
+		}
+		buf.WriteString("  </url>\n")
+	}
+
+	homeLastmod := time.Time{}
+	if len(all) > 0 {
+		homeLastmod = all[0].Date
+	}
+	writeURL(base+"/", homeLastmod)
+	for _, p := range all {
+		writeURL(base+p.Path(), p.Date)
+	}
+	buf.WriteString("</urlset>\n")
+
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	_, _ = buf.WriteTo(w)
 }
 

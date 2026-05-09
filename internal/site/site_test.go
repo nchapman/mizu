@@ -1,6 +1,7 @@
 package site
 
 import (
+	"encoding/xml"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -264,6 +265,101 @@ func TestActiveTemplatesFS_FallsBackToEmbedded(t *testing.T) {
 	emptyDir := t.TempDir() // exists but no base.html
 	if got := activeTemplatesFS(emptyDir, embedded); got != embedded {
 		t.Error("dir without base.html didn't return embedded")
+	}
+}
+
+func TestSite_RobotsTxt(t *testing.T) {
+	_, r, _, _ := newSite(t)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/robots.txt", nil))
+	if w.Code != 200 {
+		t.Fatalf("code=%d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("content-type=%q", ct)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "User-agent: *") {
+		t.Errorf("missing user-agent line: %s", body)
+	}
+	if !strings.Contains(body, "Disallow: /admin/") {
+		t.Errorf("admin not disallowed: %s", body)
+	}
+	if !strings.Contains(body, "Sitemap: https://example.test/sitemap.xml") {
+		t.Errorf("sitemap link missing: %s", body)
+	}
+}
+
+func TestSite_RobotsTxt_TrailingSlashBaseURL(t *testing.T) {
+	// A trailing slash on BaseURL must not produce "//sitemap.xml".
+	srv, router, _, _ := newSite(t)
+	srv.cfg.Site.BaseURL = "https://example.test/"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest("GET", "/robots.txt", nil))
+	if !strings.Contains(w.Body.String(), "Sitemap: https://example.test/sitemap.xml") {
+		t.Errorf("trailing slash collapsed wrong: %s", w.Body.String())
+	}
+}
+
+func TestSite_Sitemap(t *testing.T) {
+	_, r, posts, _ := newSite(t)
+	posts.Create("First", "body one", nil)
+	posts.Create("", "a note", nil) // /notes/<id>
+	posts.Create("Second", "body two", nil)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/sitemap.xml", nil))
+	if w.Code != 200 {
+		t.Fatalf("code=%d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/xml") {
+		t.Errorf("content-type=%q", ct)
+	}
+
+	type urlEntry struct {
+		Loc     string `xml:"loc"`
+		Lastmod string `xml:"lastmod"`
+	}
+	var doc struct {
+		XMLName xml.Name   `xml:"urlset"`
+		URLs    []urlEntry `xml:"url"`
+	}
+	if err := xml.Unmarshal(w.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("parse sitemap: %v\nbody: %s", err, w.Body.String())
+	}
+	if len(doc.URLs) != 4 {
+		t.Fatalf("want 4 URLs (home + 3 posts), got %d: %+v", len(doc.URLs), doc.URLs)
+	}
+	if doc.URLs[0].Loc != "https://example.test/" {
+		t.Errorf("first entry should be home, got %q", doc.URLs[0].Loc)
+	}
+	for _, u := range doc.URLs[1:] {
+		if !strings.HasPrefix(u.Loc, "https://example.test/") {
+			t.Errorf("entry %q missing base prefix", u.Loc)
+		}
+		if u.Lastmod == "" {
+			t.Errorf("entry %q missing lastmod", u.Loc)
+		}
+		if _, err := time.Parse("2006-01-02", u.Lastmod); err != nil {
+			t.Errorf("entry %q lastmod %q not W3C date: %v", u.Loc, u.Lastmod, err)
+		}
+	}
+}
+
+func TestSite_SitemapEmpty(t *testing.T) {
+	// No posts: still emit a valid <urlset> with the homepage.
+	_, r, _, _ := newSite(t)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/sitemap.xml", nil))
+	if w.Code != 200 {
+		t.Fatalf("code=%d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "<urlset") || !strings.Contains(body, "</urlset>") {
+		t.Errorf("malformed empty sitemap: %s", body)
+	}
+	if !strings.Contains(body, "<loc>https://example.test/</loc>") {
+		t.Errorf("home entry missing: %s", body)
 	}
 }
 
