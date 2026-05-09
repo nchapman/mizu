@@ -76,7 +76,7 @@ func main() {
 		wmSvc.RunVerifier(ctx)
 	}()
 
-	siteSrv, err := site.New(cfg, posts, wmSvc)
+	siteSrv, err := site.New(cfg, posts, wmSvc, templatesFS())
 	if err != nil {
 		log.Fatalf("site: %v", err)
 	}
@@ -97,7 +97,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("media: %v", err)
 	}
-	adminSrv := admin.New(ctx, cfg, posts, feedSvc, poller, authSvc, mediaStore, wmSvc)
+	adminSrv := admin.New(ctx, cfg, posts, feedSvc, poller, authSvc, mediaStore, wmSvc, adminDistFS())
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)

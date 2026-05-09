@@ -1,0 +1,26 @@
+# Build output rebuilt inside the image.
+admin/dist/
+admin/node_modules/
+
+# Local developer state.
+content/
+media/
+cache/
+state/
+*.db
+*.db-shm
+*.db-wal
+config.yml
+subscriptions.opml
+
+# VCS + editor noise.
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Other binaries from `go build` runs.
+/repeat

@@ -12,9 +12,13 @@ paths:
   media: ./media
   cache: ./cache
   state: ./state
-  admin_dist: ./admin/dist
   templates: ./templates
   subscriptions: ./subscriptions.opml
+  # admin_dist: ./admin/dist
+  # ^ Optional. Override the embedded admin SPA with a directory on
+  # disk. Useful during development (live-edit without rebuilding the
+  # binary) or for serving a custom-themed admin. Leave commented to
+  # use the version baked into the binary at build time.
 
 poller:
   interval: 1h

@@ -5,10 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"log"
 	"net/http"
 	"net/url"
-	"path/filepath"
+	"os"
 	"strconv"
 	"time"
 
@@ -30,20 +31,38 @@ type Server struct {
 // New parses each page as its own template set, with base.html shared across
 // all of them. Sharing one set would cause define-blocks (like "main") to
 // collide between pages.
-func New(cfg *config.Config, posts *post.Store, wm *webmention.Service) (*Server, error) {
-	base := filepath.Join(cfg.Paths.Templates, "base.html")
+//
+// embedded is the templates FS baked into the binary. cfg.Paths.Templates
+// can override it with a directory on disk (theme experimentation,
+// edit-without-rebuild).
+func New(cfg *config.Config, posts *post.Store, wm *webmention.Service, embedded fs.FS) (*Server, error) {
+	tplFS := activeTemplatesFS(cfg.Paths.Templates, embedded)
 	funcs := template.FuncMap{
 		"hostOf": hostOf,
 	}
 	tpls := map[string]*template.Template{}
 	for _, name := range []string{"index.html", "post.html"} {
-		t, err := template.New(name).Funcs(funcs).ParseFiles(base, filepath.Join(cfg.Paths.Templates, name))
+		t, err := template.New(name).Funcs(funcs).ParseFS(tplFS, "base.html", name)
 		if err != nil {
 			return nil, fmt.Errorf("parse %s: %w", name, err)
 		}
 		tpls[name] = t
 	}
 	return &Server{cfg: cfg, posts: posts, tpls: tpls, wm: wm}, nil
+}
+
+// activeTemplatesFS returns the on-disk override if it exists and
+// contains base.html, otherwise the embedded snapshot.
+func activeTemplatesFS(dir string, embedded fs.FS) fs.FS {
+	if dir != "" {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			diskFS := os.DirFS(dir)
+			if _, err := fs.Stat(diskFS, "base.html"); err == nil {
+				return diskFS
+			}
+		}
+	}
+	return embedded
 }
 
 func (s *Server) Routes(r chi.Router) {

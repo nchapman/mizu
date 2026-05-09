@@ -1,3 +1,6 @@
 node_modules
-dist
+dist/*
+# .keep is committed so `go build` can succeed before `npm run build`
+# runs; the embed directive needs at least one file in admin/dist.
+!dist/.keep
 *.local

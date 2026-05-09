@@ -5,7 +5,11 @@
 /media/
 /cache/
 /state/
-/admin/dist/
+/admin/dist/*
+# .keep stays committed so `go build` works on a fresh checkout that
+# hasn't run `npm run build` yet — the embed directive needs at least
+# one file in admin/dist to succeed.
+!/admin/dist/.keep
 /admin/node_modules/
 *.bak
 .DS_Store

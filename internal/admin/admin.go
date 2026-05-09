@@ -1,14 +1,16 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -31,11 +33,12 @@ type Server struct {
 	auth   *auth.Auth
 	media  *media.Store
 	wm     *webmention.Service
+	dist   fs.FS           // built admin SPA (embedded by default)
 	bgCtx  context.Context // lives for the process lifetime; used for fire-and-forget jobs
 }
 
-func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller, a *auth.Auth, m *media.Store, wm *webmention.Service) *Server {
-	return &Server{bgCtx: bgCtx, cfg: cfg, posts: posts, feeds: feedSvc, poller: poller, auth: a, media: m, wm: wm}
+func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller, a *auth.Auth, m *media.Store, wm *webmention.Service, dist fs.FS) *Server {
+	return &Server{bgCtx: bgCtx, cfg: cfg, posts: posts, feeds: feedSvc, poller: poller, auth: a, media: m, wm: wm, dist: dist}
 }
 
 func (s *Server) Routes(r chi.Router) {
@@ -616,41 +619,83 @@ func (s *Server) uploadMedia(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// serveSPA serves the built React admin from disk. Falls back to a placeholder
-// page if admin/dist doesn't exist yet (i.e. you haven't run `npm run build`).
+// serveSPA serves the built React admin out of an fs.FS. The default
+// FS is embedded into the binary at build time; cfg.Paths.AdminDist
+// can override it with a directory on disk (useful for development
+// without rebuilding the binary, or for future theme overrides).
 //
-// Path traversal: since we use http.ServeFile (not http.FileServer), we
-// must clean the URL path ourselves and verify the resolved file stays
-// inside the dist directory.
+// Unknown paths render the app shell (SPA fallback). path.Clean strips
+// any traversal attempts; an fs.FS rooted at admin/dist also can't
+// escape upward.
 func (s *Server) serveSPA(w http.ResponseWriter, r *http.Request) {
-	dist, err := filepath.Abs(s.cfg.Paths.AdminDist)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	indexPath := filepath.Join(dist, "index.html")
-	if _, err := os.Stat(indexPath); err != nil {
+	fsys := s.activeAdminFS()
+	if fsys == nil {
+		// No SPA available — neither embedded nor on disk.
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(placeholderHTML))
 		return
 	}
 
-	rel := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/admin"))
-	if rel == "/" {
-		http.ServeFile(w, r, indexPath)
-		return
+	rel := strings.TrimPrefix(path.Clean("/"+strings.TrimPrefix(r.URL.Path, "/admin")), "/")
+	if rel == "" {
+		rel = "index.html"
 	}
-	full := filepath.Join(dist, filepath.FromSlash(rel))
-	if !strings.HasPrefix(full, dist+string(os.PathSeparator)) {
-		http.NotFound(w, r)
-		return
+
+	if !serveFromFS(w, r, fsys, rel) {
+		// Either the path didn't exist or it pointed at a directory.
+		// Render the SPA shell and let client-side routing take over.
+		_ = serveFromFS(w, r, fsys, "index.html")
 	}
-	if info, err := os.Stat(full); err == nil && !info.IsDir() {
-		http.ServeFile(w, r, full)
-		return
+}
+
+// activeAdminFS returns the on-disk override if cfg.Paths.AdminDist
+// points to a directory containing index.html; otherwise falls back
+// to the embedded snapshot. Returns nil if neither is usable, which
+// triggers the placeholder.
+func (s *Server) activeAdminFS() fs.FS {
+	if dir := strings.TrimSpace(s.cfg.Paths.AdminDist); dir != "" {
+		if info, err := os.Stat(path.Join(dir, "index.html")); err == nil && !info.IsDir() {
+			return os.DirFS(dir)
+		}
 	}
-	// SPA fallback: unknown paths render the app shell.
-	http.ServeFile(w, r, indexPath)
+	if s.dist == nil {
+		return nil
+	}
+	// Embedded admin/dist may itself be empty if the binary was built
+	// without first running `npm run build` — treat that as "no SPA".
+	if _, err := fs.Stat(s.dist, "index.html"); err != nil {
+		return nil
+	}
+	return s.dist
+}
+
+// serveFromFS opens rel from fsys and writes it to w. Returns false
+// if the entry is missing, a directory, or otherwise unservable, so
+// the caller can fall back to index.html.
+func serveFromFS(w http.ResponseWriter, r *http.Request, fsys fs.FS, rel string) bool {
+	f, err := fsys.Open(rel)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.IsDir() {
+		return false
+	}
+	rs, ok := f.(io.ReadSeeker)
+	if !ok {
+		// Defensive: embedded files and *os.File both implement
+		// io.Seeker, but if a future fs.FS implementation doesn't,
+		// fall back to a buffered copy.
+		b, err := io.ReadAll(f)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return true
+		}
+		rs = bytes.NewReader(b)
+	}
+	http.ServeContent(w, r, rel, info.ModTime(), rs)
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -665,13 +710,11 @@ const placeholderHTML = `<!doctype html>
 code{background:#f3f3f3;padding:.1em .3em;border-radius:3px}</style></head>
 <body>
 <h1>repeat admin</h1>
-<p>The React admin app hasn't been built yet. From the project root:</p>
-<pre><code>cd admin
-npm install
-npm run build</code></pre>
+<p>The admin app isn't available. The binary normally embeds it at build time —
+this page only appears if the binary was built without first running
+<code>npm run build</code>, or if <code>paths.admin_dist</code> in your config
+points at a directory missing <code>index.html</code>.</p>
+<p>To rebuild from source:</p>
+<pre><code>make build</code></pre>
 <p>For development with hot reload, run <code>npm run dev</code> in <code>admin/</code> — it proxies API calls to this server.</p>
-<p>Meanwhile, you can post via the API:</p>
-<pre><code>curl -X POST http://localhost:8080/admin/api/posts \
-  -H 'content-type: application/json' \
-  -d '{"body":"hello world"}'</code></pre>
 </body></html>`
