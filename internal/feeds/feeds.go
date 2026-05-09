@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"github.com/nchapman/repeat/internal/safehttp"
 )
 
 // Service is the public face of the feeds package — it keeps the OPML file
@@ -82,7 +84,7 @@ func validateFeedURL(ctx context.Context, raw string) (string, error) {
 	host := u.Hostname()
 	// Literal IP — check directly without DNS.
 	if ip := net.ParseIP(host); ip != nil {
-		if isBlockedIP(ip) {
+		if safehttp.IsBlockedIP(ip) {
 			return "", ErrBlockedAddress
 		}
 		return raw, nil
@@ -92,7 +94,7 @@ func validateFeedURL(ctx context.Context, raw string) (string, error) {
 		return "", fmt.Errorf("resolve %s: %w", host, err)
 	}
 	for _, ip := range ips {
-		if isBlockedIP(ip) {
+		if safehttp.IsBlockedIP(ip) {
 			return "", ErrBlockedAddress
 		}
 	}

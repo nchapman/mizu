@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"time"
 
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/mmcdole/gofeed"
+
+	"github.com/nchapman/repeat/internal/safehttp"
 )
 
 // MaxFeedBodyBytes caps the response body of a single feed fetch. A
@@ -36,57 +37,9 @@ func NewPoller(s *Store, interval time.Duration, userAgent string) *Poller {
 		interval:  interval,
 		userAgent: userAgent,
 		parser:    gofeed.NewParser(),
-		http:      newSafeHTTPClient(),
+		http:      safehttp.NewClient(),
 		sanitizer: bluemonday.UGCPolicy(),
 	}
-}
-
-// newSafeHTTPClient builds an HTTP client that blocks connections to
-// private/loopback/link-local addresses at dial time. This catches
-// SSRF both for the initial URL and for any redirect chain it traverses.
-//
-// Note: we resolve and check IPs at dial time, but DNS rebinding can
-// still race between this resolution and a later one inside the kernel.
-// For a single-user deployment this is acceptable; full mitigation
-// requires custom name resolution that returns a fixed IP.
-func newSafeHTTPClient() *http.Client {
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
-			if err != nil {
-				return nil, err
-			}
-			for _, ip := range ips {
-				if isBlockedIP(ip) {
-					return nil, fmt.Errorf("blocked address %s for host %s", ip, host)
-				}
-			}
-			if len(ips) == 0 {
-				return nil, fmt.Errorf("no addresses for %s", host)
-			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
-		},
-	}
-	return &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: transport,
-	}
-}
-
-// isBlockedIP returns true for ranges we never want to fetch from:
-// loopback, link-local (incl. cloud metadata at 169.254.169.254),
-// private RFC-1918, ULA, and unspecified.
-func isBlockedIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsPrivate() || ip.IsUnspecified() || ip.IsMulticast() {
-		return true
-	}
-	return false
 }
 
 // Run polls on startup, then every interval, until ctx is cancelled.

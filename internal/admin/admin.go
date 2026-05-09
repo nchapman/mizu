@@ -20,6 +20,7 @@ import (
 	"github.com/nchapman/repeat/internal/feeds"
 	"github.com/nchapman/repeat/internal/media"
 	"github.com/nchapman/repeat/internal/post"
+	"github.com/nchapman/repeat/internal/webmention"
 )
 
 type Server struct {
@@ -29,11 +30,12 @@ type Server struct {
 	poller *feeds.Poller
 	auth   *auth.Auth
 	media  *media.Store
+	wm     *webmention.Service
 	bgCtx  context.Context // lives for the process lifetime; used for fire-and-forget jobs
 }
 
-func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller, a *auth.Auth, m *media.Store) *Server {
-	return &Server{bgCtx: bgCtx, cfg: cfg, posts: posts, feeds: feedSvc, poller: poller, auth: a, media: m}
+func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller, a *auth.Auth, m *media.Store, wm *webmention.Service) *Server {
+	return &Server{bgCtx: bgCtx, cfg: cfg, posts: posts, feeds: feedSvc, poller: poller, auth: a, media: m, wm: wm}
 }
 
 func (s *Server) Routes(r chi.Router) {
@@ -201,6 +203,19 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Fire-and-forget outbound webmentions for any links in the post.
+	// We use the rendered HTML (not the raw markdown) so we can reuse
+	// the same anchor extraction the receive side uses.
+	go func(post *post.Post) {
+		ctx, cancel := context.WithTimeout(s.bgCtx, 2*time.Minute)
+		defer cancel()
+		html, err := post.RenderHTML()
+		if err != nil {
+			log.Printf("render for webmentions: %v", err)
+			return
+		}
+		s.wm.SendForPost(ctx, s.cfg.Site.BaseURL+post.Path(), html)
+	}(p)
 	writeJSON(w, http.StatusCreated, toDTO(p))
 }
 

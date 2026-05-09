@@ -21,6 +21,7 @@ import (
 	"github.com/nchapman/repeat/internal/media"
 	"github.com/nchapman/repeat/internal/post"
 	"github.com/nchapman/repeat/internal/site"
+	"github.com/nchapman/repeat/internal/webmention"
 )
 
 func main() {
@@ -60,7 +61,22 @@ func main() {
 		poller.Run(ctx)
 	}()
 
-	siteSrv, err := site.New(cfg, posts)
+	wmStore, err := webmention.OpenStore(cfg.Paths.Cache)
+	if err != nil {
+		log.Fatalf("webmention store: %v", err)
+	}
+	wmLog, err := webmention.NewLogger(cfg.Paths.State)
+	if err != nil {
+		log.Fatalf("webmention log: %v", err)
+	}
+	wmSvc := webmention.New(wmStore, wmLog, cfg.Site.BaseURL)
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		wmSvc.RunVerifier(ctx)
+	}()
+
+	siteSrv, err := site.New(cfg, posts, wmSvc)
 	if err != nil {
 		log.Fatalf("site: %v", err)
 	}
@@ -81,7 +97,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("media: %v", err)
 	}
-	adminSrv := admin.New(ctx, cfg, posts, feedSvc, poller, authSvc, mediaStore)
+	adminSrv := admin.New(ctx, cfg, posts, feedSvc, poller, authSvc, mediaStore, wmSvc)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -112,4 +128,5 @@ func main() {
 	_ = srv.Shutdown(shutCtx)
 	bg.Wait()
 	_ = feedStore.Close()
+	_ = wmStore.Close()
 }

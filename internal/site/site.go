@@ -2,10 +2,12 @@ package site
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -15,28 +17,33 @@ import (
 
 	"github.com/nchapman/repeat/internal/config"
 	"github.com/nchapman/repeat/internal/post"
+	"github.com/nchapman/repeat/internal/webmention"
 )
 
 type Server struct {
 	cfg   *config.Config
 	posts *post.Store
 	tpls  map[string]*template.Template
+	wm    *webmention.Service
 }
 
 // New parses each page as its own template set, with base.html shared across
 // all of them. Sharing one set would cause define-blocks (like "main") to
 // collide between pages.
-func New(cfg *config.Config, posts *post.Store) (*Server, error) {
+func New(cfg *config.Config, posts *post.Store, wm *webmention.Service) (*Server, error) {
 	base := filepath.Join(cfg.Paths.Templates, "base.html")
+	funcs := template.FuncMap{
+		"hostOf": hostOf,
+	}
 	tpls := map[string]*template.Template{}
 	for _, name := range []string{"index.html", "post.html"} {
-		t, err := template.ParseFiles(base, filepath.Join(cfg.Paths.Templates, name))
+		t, err := template.New(name).Funcs(funcs).ParseFiles(base, filepath.Join(cfg.Paths.Templates, name))
 		if err != nil {
 			return nil, fmt.Errorf("parse %s: %w", name, err)
 		}
 		tpls[name] = t
 	}
-	return &Server{cfg: cfg, posts: posts, tpls: tpls}, nil
+	return &Server{cfg: cfg, posts: posts, tpls: tpls, wm: wm}, nil
 }
 
 func (s *Server) Routes(r chi.Router) {
@@ -44,6 +51,37 @@ func (s *Server) Routes(r chi.Router) {
 	r.Get("/feed.xml", s.rss)
 	r.Get("/notes/{id}", s.note)
 	r.Get("/{year:[0-9]{4}}/{month:[0-9]{2}}/{day:[0-9]{2}}/{slug}", s.article)
+	r.Post("/webmention", s.webmention)
+}
+
+// webmention is the receive endpoint. Per spec: accept form-encoded
+// source/target, return 202 Accepted on success, do verification
+// async. We synchronously validate the target is on this site so
+// off-site noise is rejected at the door.
+func (s *Server) webmention(w http.ResponseWriter, r *http.Request) {
+	// Source + target are short URLs. 4 KiB is well above any
+	// legitimate request and stops a hostile sender from forcing us
+	// to buffer megabytes of form body.
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	source := r.PostForm.Get("source")
+	target := r.PostForm.Get("target")
+	err := s.wm.Receive(r.Context(), source, target)
+	switch {
+	case errors.Is(err, webmention.ErrBadTarget):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	case errors.Is(err, webmention.ErrSameSource):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
 }
 
 type renderedPost struct {
@@ -77,7 +115,7 @@ func (s *Server) note(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.renderPost(w, p)
+	s.renderPost(w, r, p)
 }
 
 func (s *Server) article(w http.ResponseWriter, r *http.Request) {
@@ -89,14 +127,46 @@ func (s *Server) article(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	s.renderPost(w, p)
+	s.renderPost(w, r, p)
 }
 
-func (s *Server) renderPost(w http.ResponseWriter, p *post.Post) {
+type mentionView struct {
+	Source     string
+	VerifiedAt time.Time
+}
+
+func (s *Server) renderPost(w http.ResponseWriter, r *http.Request, p *post.Post) {
+	// Advertise the webmention endpoint via Link header so senders
+	// don't have to parse our HTML to discover it. Belt + braces with
+	// the in-body <link> emitted from base.html.
+	w.Header().Add("Link", `</webmention>; rel="webmention"`)
+
+	target := s.cfg.Site.BaseURL + p.Path()
+	mentions, err := s.wm.ForTarget(r.Context(), target)
+	if err != nil {
+		log.Printf("webmention list %s: %v", target, err)
+	}
+	views := make([]mentionView, len(mentions))
+	for i, m := range mentions {
+		views[i] = mentionView{Source: m.Source, VerifiedAt: m.VerifiedAt}
+	}
 	s.exec(w, "post.html", map[string]any{
-		"Site": s.cfg.Site,
-		"Post": s.render(p),
+		"Site":     s.cfg.Site,
+		"Post":     s.render(p),
+		"Mentions": views,
 	})
+}
+
+// hostOf is a template helper so post.html can render
+// "host.example.com" instead of the full URL when listing mentions.
+// Hostname() strips userinfo and port so we don't render
+// "user:pass@example.com:8080" in the public list.
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	return u.Hostname()
 }
 
 func (s *Server) rss(w http.ResponseWriter, r *http.Request) {
