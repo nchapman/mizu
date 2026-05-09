@@ -1,5 +1,9 @@
 import { useEffect, useState } from "react";
-import { api, Subscription, Unauthorized } from "./api";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { api, Subscription, Unauthorized } from "@/api";
+import { relativeTime } from "@/lib/relativeTime";
 
 export function SubscriptionsView({ onAuthLost }: { onAuthLost: () => void }) {
   const [list, setList] = useState<Subscription[]>([]);
@@ -62,57 +66,79 @@ export function SubscriptionsView({ onAuthLost }: { onAuthLost: () => void }) {
 
   return (
     <div>
-      <form onSubmit={add} style={{ marginBottom: "2em", border: "1px solid #ddd", borderRadius: 8, padding: "1em" }}>
-        <input
+      <h2 className="mb-4 text-lg font-semibold">Subscriptions</h2>
+
+      <form
+        onSubmit={add}
+        className="mb-6 space-y-2 rounded-xl border border-border bg-card p-4 shadow-sm"
+      >
+        <Input
           placeholder="Feed URL (https://example.com/feed.xml)"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          style={{ width: "100%", marginBottom: ".5em", padding: ".4em", fontSize: "1em" }}
         />
-        <div style={{ display: "flex", gap: ".5em", marginBottom: ".5em" }}>
-          <input placeholder="Title (optional)" value={title} onChange={(e) => setTitle(e.target.value)}
-            style={{ flex: 1, padding: ".4em", fontSize: "1em" }} />
-          <input placeholder="Category (optional)" value={category} onChange={(e) => setCategory(e.target.value)}
-            style={{ flex: 1, padding: ".4em", fontSize: "1em" }} />
+        <div className="flex gap-2">
+          <Input
+            placeholder="Title (optional)"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            className="flex-1"
+          />
+          <Input
+            placeholder="Category (optional)"
+            value={category}
+            onChange={(e) => setCategory(e.target.value)}
+            className="flex-1"
+          />
         </div>
-        <input
+        <Input
           placeholder="Site URL (optional)"
           value={siteUrl}
           onChange={(e) => setSiteUrl(e.target.value)}
-          style={{ width: "100%", marginBottom: ".5em", padding: ".4em", fontSize: "1em" }}
         />
-        {err && <div style={{ color: "#b00", fontSize: ".9em", marginBottom: ".5em" }}>{err}</div>}
-        <button type="submit" disabled={busy || !url.trim()}>
-          {busy ? "Subscribing…" : "Subscribe"}
-        </button>
+        {err && (
+          <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+            {err}
+          </div>
+        )}
+        <div className="flex justify-end">
+          <Button type="submit" size="sm" disabled={busy || !url.trim()}>
+            {busy ? "Subscribing…" : "Subscribe"}
+          </Button>
+        </div>
       </form>
 
       {list.length === 0 ? (
-        <p style={{ color: "#888" }}>No subscriptions yet.</p>
+        <p className="py-8 text-center text-sm text-muted-foreground">No subscriptions yet.</p>
       ) : (
-        list.map((s) => (
-          <div key={s.id} style={{ borderBottom: "1px solid #eee", padding: ".75em 0" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", gap: "1em" }}>
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <div style={{ fontWeight: 500 }}>{s.title || s.url}</div>
-                <div style={{ color: "#888", fontSize: ".85em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {s.url}
-                </div>
-                <div style={{ color: "#888", fontSize: ".8em", marginTop: ".25em" }}>
+        <ul className="divide-y divide-border">
+          {list.map((s) => (
+            <li key={s.id} className="flex items-start justify-between gap-4 py-3">
+              <div className="min-w-0 flex-1">
+                <div className="font-medium text-foreground">{s.title || s.url}</div>
+                <div className="truncate text-xs text-muted-foreground">{s.url}</div>
+                <div className="mt-1 text-xs text-muted-foreground">
                   {s.category && <span>{s.category} · </span>}
                   {s.last_fetched_at
-                    ? <>Last fetched {new Date(s.last_fetched_at).toLocaleString()}</>
+                    ? <>Last fetched {relativeTime(s.last_fetched_at)}</>
                     : <>Never fetched</>}
-                  {s.last_error && <span style={{ color: "#b00" }}> · {s.last_error}</span>}
+                  {s.last_error && (
+                    <span className="text-destructive"> · {s.last_error}</span>
+                  )}
                 </div>
               </div>
-              <button type="button" onClick={() => remove(s)}
-                style={{ background: "none", border: "none", color: "#b00", cursor: "pointer", fontSize: ".85em" }}>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => remove(s)}
+                className="text-destructive hover:text-destructive"
+              >
                 Unsubscribe
-              </button>
-            </div>
-          </div>
-        ))
+              </Button>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );
