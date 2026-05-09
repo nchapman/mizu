@@ -76,3 +76,14 @@ export async function uploadMedia(file: File): Promise<Media> {
   fd.append("file", file);
   return api<Media>("/admin/api/media", { method: "POST", body: fd });
 }
+
+export async function updatePost(id: string, body: { title: string; body: string; tags?: string[] }): Promise<Post> {
+  return api<Post>(`/admin/api/posts/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deletePost(id: string): Promise<void> {
+  await api<void>(`/admin/api/posts/${encodeURIComponent(id)}`, { method: "DELETE" });
+}

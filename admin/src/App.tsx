@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { api, Post, Unauthorized, uploadMedia } from "./api";
+import { api, Post, Unauthorized, uploadMedia, updatePost, deletePost } from "./api";
 import { TimelineView } from "./Timeline";
 import { SubscriptionsView } from "./Subscriptions";
 
@@ -99,12 +99,48 @@ function HomeView({ onAuthLost }: { onAuthLost: () => void }) {
   const [body, setBody] = useState("");
   const [title, setTitle] = useState("");
   const [showTitle, setShowTitle] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [posting, setPosting] = useState(false);
   const [err, setErr] = useState("");
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  function resetComposer() {
+    setEditingId(null);
+    setBody("");
+    setTitle("");
+    setShowTitle(false);
+  }
+
+  function startEdit(p: Post) {
+    setEditingId(p.id);
+    setTitle(p.title ?? "");
+    setBody(p.body);
+    setShowTitle(!!p.title);
+    setErr("");
+    // Bring the composer into view; users may have scrolled past it.
+    queueMicrotask(() => {
+      textareaRef.current?.focus();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  }
+
+  async function remove(p: Post) {
+    const label = p.title || p.body.slice(0, 40);
+    if (!confirm(`Delete "${label}"?`)) return;
+    setErr("");
+    try {
+      await deletePost(p.id);
+      // If we were mid-edit on this post, drop the edit state.
+      if (editingId === p.id) resetComposer();
+      await load();
+    } catch (e) {
+      if (e instanceof Unauthorized) return onAuthLost();
+      setErr((e as Error).message);
+    }
+  }
 
   // Inserts text at the textarea's caret. flushSync forces React to
   // commit the new body synchronously so we can move the caret in the
@@ -181,13 +217,13 @@ function HomeView({ onAuthLost }: { onAuthLost: () => void }) {
     setPosting(true);
     setErr("");
     try {
-      await api("/admin/api/posts", {
-        method: "POST",
-        body: JSON.stringify({ title: showTitle ? title : "", body }),
-      });
-      setBody("");
-      setTitle("");
-      setShowTitle(false);
+      const payload = { title: showTitle ? title : "", body };
+      if (editingId) {
+        await updatePost(editingId, payload);
+      } else {
+        await api("/admin/api/posts", { method: "POST", body: JSON.stringify(payload) });
+      }
+      resetComposer();
       await load();
     } catch (e) {
       if (e instanceof Unauthorized) return onAuthLost();
@@ -244,25 +280,53 @@ function HomeView({ onAuthLost }: { onAuthLost: () => void }) {
               {uploading ? "uploading…" : "+ image"}
             </button>
           </div>
-          <button type="submit" disabled={posting || uploading || !body.trim()}>
-            {posting ? "Posting…" : "Post"}
-          </button>
+          <div style={{ display: "flex", gap: ".5em", alignItems: "center" }}>
+            {editingId && (
+              <button type="button" onClick={resetComposer} style={linkBtn}>
+                cancel
+              </button>
+            )}
+            <button type="submit" disabled={posting || uploading || !body.trim()}>
+              {posting ? "Saving…" : editingId ? "Save" : "Post"}
+            </button>
+          </div>
         </div>
       </form>
 
       {err && <div style={{ color: "#b00", fontSize: ".9em", marginBottom: "1em" }}>{err}</div>}
 
-      {posts.map((p) => (
-        <article key={p.id} style={{ marginBottom: "1.5em", paddingBottom: "1em", borderBottom: "1px solid #eee" }}>
-          <div style={{ color: "#888", fontSize: ".85em" }}>
-            <a href={p.path} style={{ color: "inherit" }}>
-              {new Date(p.date).toLocaleString()}
-            </a>
-          </div>
-          {p.title && <h2 style={{ margin: ".2em 0", fontSize: "1.1em" }}>{p.title}</h2>}
-          <div style={{ whiteSpace: "pre-wrap" }}>{p.body}</div>
-        </article>
-      ))}
+      {posts.map((p) => {
+        const isEditing = editingId === p.id;
+        return (
+          <article
+            key={p.id}
+            style={{
+              marginBottom: "1.5em",
+              paddingBottom: "1em",
+              borderBottom: "1px solid #eee",
+              opacity: isEditing ? 0.5 : 1,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "1em" }}>
+              <div style={{ color: "#888", fontSize: ".85em" }}>
+                <a href={p.path} style={{ color: "inherit" }}>
+                  {new Date(p.date).toLocaleString()}
+                </a>
+              </div>
+              <div style={{ display: "flex", gap: ".5em", fontSize: ".85em" }}>
+                <button type="button" onClick={() => startEdit(p)} style={linkBtn} disabled={isEditing}>
+                  edit
+                </button>
+                <button type="button" onClick={() => remove(p)} style={{ ...linkBtn, color: "#b00" }}>
+                  delete
+                </button>
+              </div>
+            </div>
+            {p.title && <h2 style={{ margin: ".2em 0", fontSize: "1.1em" }}>{p.title}</h2>}
+            <div style={{ whiteSpace: "pre-wrap" }}>{p.body}</div>
+          </article>
+        );
+      })}
     </div>
   );
 }

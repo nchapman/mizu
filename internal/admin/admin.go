@@ -53,6 +53,8 @@ func (s *Server) Routes(r chi.Router) {
 
 			r.Get("/posts", s.listPosts)
 			r.Post("/posts", s.createPost)
+			r.Patch("/posts/{id}", s.updatePost)
+			r.Delete("/posts/{id}", s.deletePost)
 
 			r.Get("/subscriptions", s.listSubscriptions)
 			r.Post("/subscriptions", s.addSubscription)
@@ -203,20 +205,71 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// Fire-and-forget outbound webmentions for any links in the post.
-	// We use the rendered HTML (not the raw markdown) so we can reuse
-	// the same anchor extraction the receive side uses.
-	go func(post *post.Post) {
+	s.queueWebmentions(p)
+	writeJSON(w, http.StatusCreated, toDTO(p))
+}
+
+// queueWebmentions fires off outbound webmentions for the rendered
+// post HTML. Used after both create and update — re-sending after an
+// edit re-notifies receivers for current links and is spec-allowed.
+// Removed-link notifications (when an edit drops a link) are a known
+// gap; they require remembering the previous link set.
+func (s *Server) queueWebmentions(p *post.Post) {
+	go func(p *post.Post) {
 		ctx, cancel := context.WithTimeout(s.bgCtx, 2*time.Minute)
 		defer cancel()
-		html, err := post.RenderHTML()
+		html, err := p.RenderHTML()
 		if err != nil {
 			log.Printf("render for webmentions: %v", err)
 			return
 		}
-		s.wm.SendForPost(ctx, s.cfg.Site.BaseURL+post.Path(), html)
+		s.wm.SendForPost(ctx, s.cfg.Site.BaseURL+p.Path(), html)
 	}(p)
-	writeJSON(w, http.StatusCreated, toDTO(p))
+}
+
+func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var in struct {
+		Title string   `json:"title"`
+		Body  string   `json:"body"`
+		Tags  []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(in.Body) == "" {
+		http.Error(w, "body required", http.StatusBadRequest)
+		return
+	}
+	p, err := s.posts.Update(id, in.Title, in.Body, in.Tags)
+	switch {
+	case errors.Is(err, post.ErrNotFound):
+		http.NotFound(w, r)
+		return
+	case errors.Is(err, post.ErrTypeToggle):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.queueWebmentions(p)
+	writeJSON(w, http.StatusOK, toDTO(p))
+}
+
+func (s *Server) deletePost(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	err := s.posts.Delete(id)
+	switch {
+	case errors.Is(err, post.ErrNotFound):
+		http.NotFound(w, r)
+		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- subscriptions ---

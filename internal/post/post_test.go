@@ -1,0 +1,199 @@
+package post
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func newStore(t *testing.T) *Store {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "posts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestCreate_FreezesSlug(t *testing.T) {
+	s := newStore(t)
+	p, err := s.Create("Hello World", "body", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Slug != "hello-world" {
+		t.Errorf("Slug=%q want hello-world", p.Slug)
+	}
+	if !strings.HasSuffix(p.Path(), "/hello-world") {
+		t.Errorf("Path=%q want suffix /hello-world", p.Path())
+	}
+}
+
+func TestUpdate_TitleChangeKeepsSlug(t *testing.T) {
+	s := newStore(t)
+	p, err := s.Create("Hello World", "body", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalPath := p.Path()
+	originalFile := p.Filename
+
+	updated, err := s.Update(p.ID, "Goodbye World", "new body", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Title != "Goodbye World" {
+		t.Errorf("Title=%q", updated.Title)
+	}
+	if updated.Path() != originalPath {
+		t.Errorf("Path drifted: was %q, now %q", originalPath, updated.Path())
+	}
+	if updated.Filename != originalFile {
+		t.Errorf("Filename drifted: was %q, now %q", originalFile, updated.Filename)
+	}
+	// Round-trip: reload from disk and verify the slug persisted.
+	s2, err := NewStore(s.dir[:len(s.dir)-len("/posts")])
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s2.ByID(p.ID)
+	if !ok {
+		t.Fatal("post missing after reload")
+	}
+	if got.Slug != "hello-world" {
+		t.Errorf("reloaded Slug=%q want hello-world", got.Slug)
+	}
+	if got.Title != "Goodbye World" {
+		t.Errorf("reloaded Title=%q", got.Title)
+	}
+}
+
+func TestUpdate_NoteBodyChange(t *testing.T) {
+	s := newStore(t)
+	p, err := s.Create("", "first", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.Update(p.ID, "", "second", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Body != "second" {
+		t.Errorf("Body=%q", updated.Body)
+	}
+	if updated.Path() != p.Path() {
+		t.Errorf("Path drifted")
+	}
+}
+
+func TestUpdate_LegacyPostFreezesSlugFromCurrentTitle(t *testing.T) {
+	// A post written before the Slug field existed has Slug=="" on
+	// load. The first edit must capture a slug derived from the
+	// PRE-edit title so the URL stays stable, not drift to a slug
+	// derived from the new title.
+	dir := t.TempDir()
+	postsDir := filepath.Join(dir, "posts")
+	if err := os.MkdirAll(postsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `---
+id: legacy1
+title: Old Title
+date: 2024-01-15T10:00:00Z
+---
+
+original body
+`
+	if err := os.WriteFile(filepath.Join(postsDir, "2024-01-15-old-title-lega.md"), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.Update("legacy1", "Brand New Title", "edited", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Slug != "old-title" {
+		t.Errorf("Slug=%q, want old-title (frozen from pre-edit title)", updated.Slug)
+	}
+	if !strings.HasSuffix(updated.Path(), "/old-title") {
+		t.Errorf("Path=%q drifted; should still end /old-title", updated.Path())
+	}
+}
+
+func TestUpdate_NotFound(t *testing.T) {
+	s := newStore(t)
+	_, err := s.Update("nope", "x", "y", nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err=%v want ErrNotFound", err)
+	}
+}
+
+func TestUpdate_RejectsTypeChange(t *testing.T) {
+	s := newStore(t)
+	// Note → article.
+	p, err := s.Create("", "body", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Update(p.ID, "Now Has Title", "body", nil)
+	if err == nil || !strings.Contains(err.Error(), "cannot toggle") {
+		t.Errorf("err=%v want toggle rejection", err)
+	}
+}
+
+func TestDelete_RemovesFileAndIndex(t *testing.T) {
+	s := newStore(t)
+	p, err := s.Create("", "body", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(s.dir, p.Filename)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("file should exist: %v", err)
+	}
+	if err := s.Delete(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("file should be gone: err=%v", err)
+	}
+	if _, ok := s.ByID(p.ID); ok {
+		t.Error("post still in index after delete")
+	}
+	if len(s.Recent(10)) != 0 {
+		t.Error("Recent() still returns deleted post")
+	}
+}
+
+func TestDelete_NotFound(t *testing.T) {
+	s := newStore(t)
+	if err := s.Delete("nope"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("err=%v want ErrNotFound", err)
+	}
+}
+
+func TestDelete_FreesSlugForRecreate(t *testing.T) {
+	s := newStore(t)
+	p, err := s.Create("Hello", "body", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(p.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Same title, same day — without proper slug cleanup this would
+	// hit ErrSlugTaken.
+	if _, err := s.Create("Hello", "body", nil); err != nil {
+		t.Errorf("recreate failed: %v", err)
+	}
+}
