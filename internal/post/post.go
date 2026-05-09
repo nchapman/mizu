@@ -70,14 +70,20 @@ func (p *Post) Excerpt(max int) string {
 	return string(runes[:max]) + "…"
 }
 
-// Store loads, lists, and writes posts. Single-user scale: all posts live in memory.
+// Store loads, lists, and writes posts and drafts. Single-user scale:
+// everything lives in memory. Drafts and published posts are tracked
+// in separate maps because they have separate URL spaces and lifecycle
+// rules — a draft has no public URL until it's published.
 type Store struct {
-	dir string
+	dir      string // posts directory
+	draftDir string
 
-	mu     sync.RWMutex
-	byID   map[string]*Post
-	bySlug map[string]*Post // key: "YYYY/MM/DD/slug" — articles only
-	order  []*Post          // newest first
+	mu       sync.RWMutex
+	byID     map[string]*Post
+	bySlug   map[string]*Post // key: "YYYY/MM/DD/slug" — articles only
+	order    []*Post          // newest first
+	drafts   map[string]*Draft
+	draftIdx []*Draft // newest-Created first
 }
 
 func slugKey(p *Post) string {
@@ -85,7 +91,10 @@ func slugKey(p *Post) string {
 }
 
 func NewStore(contentDir string) (*Store, error) {
-	s := &Store{dir: filepath.Join(contentDir, "posts")}
+	s := &Store{
+		dir:      filepath.Join(contentDir, "posts"),
+		draftDir: filepath.Join(contentDir, "drafts"),
+	}
 	if err := s.reload(); err != nil {
 		return nil, err
 	}
@@ -116,12 +125,44 @@ func (s *Store) reload() error {
 	}
 	sort.Slice(order, func(i, j int) bool { return order[i].Date.After(order[j].Date) })
 
+	drafts, draftIdx, err := s.loadDrafts()
+	if err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	s.byID = byID
 	s.bySlug = bySlug
 	s.order = order
+	s.drafts = drafts
+	s.draftIdx = draftIdx
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *Store) loadDrafts() (map[string]*Draft, []*Draft, error) {
+	entries, err := os.ReadDir(s.draftDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string]*Draft{}, nil, nil
+		}
+		return nil, nil, err
+	}
+	byID := make(map[string]*Draft)
+	var order []*Draft
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		d, err := readDraftFile(filepath.Join(s.draftDir, e.Name()))
+		if err != nil {
+			return nil, nil, fmt.Errorf("read draft %s: %w", e.Name(), err)
+		}
+		byID[d.ID] = d
+		order = append(order, d)
+	}
+	sort.Slice(order, func(i, j int) bool { return order[i].Created.After(order[j].Created) })
+	return byID, order, nil
 }
 
 func (s *Store) Recent(limit int) []*Post {
@@ -199,6 +240,13 @@ var ErrNotFound = errors.New("post not found")
 // ErrTypeToggle is returned by Update when the edit would change a
 // post between note and article shape, which would change its URL.
 var ErrTypeToggle = errors.New("cannot toggle a post between note and article via edit")
+
+// ErrDraftOrphan is returned by Publish alongside a valid *Post when
+// the post was written successfully but the draft file could not be
+// removed afterward. The post is live; the draft is an orphan that
+// the operator can delete by hand. Callers should treat this as a
+// success result with a warning, not a failure.
+var ErrDraftOrphan = errors.New("publish succeeded but draft file remains")
 
 // Update edits an existing post in place. The slug, ID, date, and
 // filename are preserved — only title, body, and tags can change.
@@ -281,9 +329,225 @@ func (s *Store) Delete(id string) error {
 	return nil
 }
 
+// --- drafts ---
+
+// Draft is an unpublished entry. It has no public URL — date and slug
+// are decided at publish time, not draft creation, so the URL reflects
+// when the post actually went live.
+type Draft struct {
+	ID       string    `yaml:"id"`
+	Title    string    `yaml:"title,omitempty"`
+	Tags     []string  `yaml:"tags,omitempty"`
+	Created  time.Time `yaml:"created"`
+	Body     string    `yaml:"-"`
+	Filename string    `yaml:"-"`
+}
+
+func (s *Store) ListDrafts() []*Draft {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*Draft, len(s.draftIdx))
+	copy(out, s.draftIdx)
+	return out
+}
+
+func (s *Store) DraftByID(id string) (*Draft, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	d, ok := s.drafts[id]
+	return d, ok
+}
+
+func (s *Store) CreateDraft(title, body string, tags []string) (*Draft, error) {
+	d := &Draft{
+		ID:      newID(),
+		Title:   strings.TrimSpace(title),
+		Tags:    tags,
+		Created: time.Now(),
+		Body:    body,
+	}
+	d.Filename = d.ID + ".md"
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := writeDraftFile(filepath.Join(s.draftDir, d.Filename), d); err != nil {
+		return nil, err
+	}
+	s.drafts[d.ID] = d
+	s.draftIdx = append([]*Draft{d}, s.draftIdx...)
+	return d, nil
+}
+
+func (s *Store) UpdateDraft(id, title, body string, tags []string) (*Draft, error) {
+	s.mu.Lock()
+	d, ok := s.drafts[id]
+	if !ok {
+		s.mu.Unlock()
+		return nil, ErrNotFound
+	}
+	updated := *d
+	updated.Title = strings.TrimSpace(title)
+	updated.Body = body
+	updated.Tags = tags
+	filename := d.Filename
+	s.mu.Unlock()
+
+	if err := writeDraftFile(filepath.Join(s.draftDir, filename), &updated); err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.drafts[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	*current = updated
+	return current, nil
+}
+
+func (s *Store) DeleteDraft(id string) error {
+	s.mu.Lock()
+	d, ok := s.drafts[id]
+	if !ok {
+		s.mu.Unlock()
+		return ErrNotFound
+	}
+	filename := d.Filename
+	s.mu.Unlock()
+
+	if err := os.Remove(filepath.Join(s.draftDir, filename)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	s.mu.Lock()
+	delete(s.drafts, id)
+	for i, dd := range s.draftIdx {
+		if dd.ID == id {
+			s.draftIdx = append(s.draftIdx[:i], s.draftIdx[i+1:]...)
+			break
+		}
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// Publish promotes a draft into a post. Date is set to now and the
+// slug is frozen from the title (for articles). The draft file is
+// removed only after the post file is written successfully — if the
+// post write fails the draft remains intact for retry.
+func (s *Store) Publish(id string) (*Post, error) {
+	s.mu.Lock()
+	d, ok := s.drafts[id]
+	if !ok {
+		s.mu.Unlock()
+		return nil, ErrNotFound
+	}
+	p := &Post{
+		ID:    d.ID, // keep the same id so internal references survive
+		Title: d.Title,
+		Date:  time.Now(),
+		Tags:  d.Tags,
+		Body:  d.Body,
+	}
+	if !p.IsNote() {
+		p.Slug = slugify(p.Title)
+	}
+	p.Filename = filenameFor(p)
+	if !p.IsNote() {
+		if _, taken := s.bySlug[slugKey(p)]; taken {
+			s.mu.Unlock()
+			return nil, ErrSlugTaken
+		}
+	}
+	if err := writeFile(filepath.Join(s.dir, p.Filename), p); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
+
+	// Post is on disk; now reap the draft. A failure here is logged
+	// upstream — the post is still valid, the draft just becomes an
+	// orphan the operator can clean up by hand.
+	draftPath := filepath.Join(s.draftDir, d.Filename)
+	rmErr := os.Remove(draftPath)
+
+	delete(s.drafts, id)
+	for i, dd := range s.draftIdx {
+		if dd.ID == id {
+			s.draftIdx = append(s.draftIdx[:i], s.draftIdx[i+1:]...)
+			break
+		}
+	}
+	s.byID[p.ID] = p
+	if !p.IsNote() {
+		s.bySlug[slugKey(p)] = p
+	}
+	s.order = append([]*Post{p}, s.order...)
+	s.mu.Unlock()
+
+	if rmErr != nil && !os.IsNotExist(rmErr) {
+		return p, fmt.Errorf("%w: %v", ErrDraftOrphan, rmErr)
+	}
+	return p, nil
+}
+
+func readDraftFile(path string) (*Draft, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	m := frontmatterRE.FindSubmatch(b)
+	if m == nil {
+		return nil, errors.New("missing frontmatter")
+	}
+	var d Draft
+	if err := yaml.Unmarshal(m[1], &d); err != nil {
+		return nil, fmt.Errorf("yaml: %w", err)
+	}
+	d.Body = string(m[2])
+	d.Filename = filepath.Base(path)
+	if d.ID == "" {
+		return nil, errors.New("missing id")
+	}
+	return &d, nil
+}
+
+func writeDraftFile(path string, d *Draft) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	fm, err := yaml.Marshal(struct {
+		ID      string    `yaml:"id"`
+		Title   string    `yaml:"title,omitempty"`
+		Tags    []string  `yaml:"tags,omitempty"`
+		Created time.Time `yaml:"created"`
+	}{d.ID, d.Title, d.Tags, d.Created})
+	if err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	buf.WriteString("---\n")
+	buf.Write(fm)
+	buf.WriteString("---\n\n")
+	buf.WriteString(d.Body)
+	if !strings.HasSuffix(d.Body, "\n") {
+		buf.WriteByte('\n')
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 // --- file I/O ---
 
-var frontmatterRE = regexp.MustCompile(`(?s)\A---\r?\n(.*?)\r?\n---\r?\n?(.*)`)
+// frontmatterRE matches a YAML frontmatter block followed by the
+// body. After the closing `---` we consume up to two newlines: the
+// fence's own line break plus the conventional blank-line separator.
+// We deliberately don't consume more than that — extra leading blank
+// lines in a body are author intent (poems, deliberate spacing) and
+// must round-trip unchanged.
+var frontmatterRE = regexp.MustCompile(`(?s)\A---\r?\n(.*?)\r?\n---\r?\n?\r?\n?(.*)`)
 
 func readFile(path string) (*Post, error) {
 	b, err := os.ReadFile(path)

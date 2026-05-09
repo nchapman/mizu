@@ -56,6 +56,12 @@ func (s *Server) Routes(r chi.Router) {
 			r.Patch("/posts/{id}", s.updatePost)
 			r.Delete("/posts/{id}", s.deletePost)
 
+			r.Get("/drafts", s.listDrafts)
+			r.Post("/drafts", s.createDraft)
+			r.Patch("/drafts/{id}", s.updateDraft)
+			r.Delete("/drafts/{id}", s.deleteDraft)
+			r.Post("/drafts/{id}/publish", s.publishDraft)
+
 			r.Get("/subscriptions", s.listSubscriptions)
 			r.Post("/subscriptions", s.addSubscription)
 			r.Delete("/subscriptions", s.removeSubscription)
@@ -250,6 +256,112 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, post.ErrTypeToggle):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.queueWebmentions(p)
+	writeJSON(w, http.StatusOK, toDTO(p))
+}
+
+// --- drafts ---
+
+type draftDTO struct {
+	ID      string   `json:"id"`
+	Title   string   `json:"title,omitempty"`
+	Tags    []string `json:"tags,omitempty"`
+	Body    string   `json:"body"`
+	Created string   `json:"created"`
+}
+
+func toDraftDTO(d *post.Draft) draftDTO {
+	return draftDTO{
+		ID:      d.ID,
+		Title:   d.Title,
+		Tags:    d.Tags,
+		Body:    d.Body,
+		Created: d.Created.Format(time.RFC3339),
+	}
+}
+
+func (s *Server) listDrafts(w http.ResponseWriter, _ *http.Request) {
+	list := s.posts.ListDrafts()
+	out := make([]draftDTO, len(list))
+	for i, d := range list {
+		out[i] = toDraftDTO(d)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) createDraft(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Title string   `json:"title"`
+		Body  string   `json:"body"`
+		Tags  []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	d, err := s.posts.CreateDraft(in.Title, in.Body, in.Tags)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusCreated, toDraftDTO(d))
+}
+
+func (s *Server) updateDraft(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var in struct {
+		Title string   `json:"title"`
+		Body  string   `json:"body"`
+		Tags  []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	d, err := s.posts.UpdateDraft(id, in.Title, in.Body, in.Tags)
+	switch {
+	case errors.Is(err, post.ErrNotFound):
+		http.NotFound(w, r)
+		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, toDraftDTO(d))
+}
+
+func (s *Server) deleteDraft(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	err := s.posts.DeleteDraft(id)
+	switch {
+	case errors.Is(err, post.ErrNotFound):
+		http.NotFound(w, r)
+		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) publishDraft(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	p, err := s.posts.Publish(id)
+	switch {
+	case errors.Is(err, post.ErrNotFound):
+		http.NotFound(w, r)
+		return
+	case errors.Is(err, post.ErrSlugTaken):
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	case errors.Is(err, post.ErrDraftOrphan):
+		// Post is live; only the draft cleanup failed. Log the
+		// orphan and report success to the user.
+		log.Printf("publish: %v", err)
 	case err != nil:
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

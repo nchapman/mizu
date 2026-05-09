@@ -1,11 +1,22 @@
 import { useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { api, Post, Unauthorized, uploadMedia, updatePost, deletePost } from "./api";
+import {
+  api, Post, Draft, Unauthorized, uploadMedia,
+  updatePost, deletePost, createDraft, updateDraft, publishDraft,
+} from "./api";
 import { TimelineView } from "./Timeline";
 import { SubscriptionsView } from "./Subscriptions";
+import { DraftsView } from "./Drafts";
 
 type Me = { configured: boolean; authenticated: boolean };
-type Tab = "home" | "timeline" | "subs";
+type Tab = "home" | "drafts" | "timeline" | "subs";
+
+// EditTarget is the cross-tab handoff used when an action in another
+// tab (e.g. "edit this draft") needs to drop a record into the home
+// composer. The home view consumes it once and clears it.
+export type EditTarget =
+  | { kind: "post"; id: string; title: string; body: string }
+  | { kind: "draft"; id: string; title: string; body: string };
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
@@ -48,10 +59,16 @@ const shellStyle: React.CSSProperties = {
 
 function Shell({ onLogout }: { onLogout: () => void }) {
   const [tab, setTab] = useState<Tab>("home");
+  const [editTarget, setEditTarget] = useState<EditTarget | null>(null);
 
   async function logout() {
     await fetch("/admin/api/logout", { method: "POST" });
     onLogout();
+  }
+
+  function editDraft(d: Draft) {
+    setEditTarget({ kind: "draft", id: d.id, title: d.title ?? "", body: d.body });
+    setTab("home");
   }
 
   return (
@@ -62,10 +79,18 @@ function Shell({ onLogout }: { onLogout: () => void }) {
       </div>
       <nav style={{ display: "flex", gap: ".5em", borderBottom: "1px solid #ddd", marginBottom: "1.5em" }}>
         <TabBtn active={tab === "home"} onClick={() => setTab("home")}>Home</TabBtn>
+        <TabBtn active={tab === "drafts"} onClick={() => setTab("drafts")}>Drafts</TabBtn>
         <TabBtn active={tab === "timeline"} onClick={() => setTab("timeline")}>Timeline</TabBtn>
         <TabBtn active={tab === "subs"} onClick={() => setTab("subs")}>Subscriptions</TabBtn>
       </nav>
-      {tab === "home" && <HomeView onAuthLost={onLogout} />}
+      {tab === "home" && (
+        <HomeView
+          onAuthLost={onLogout}
+          editTarget={editTarget}
+          onEditConsumed={() => setEditTarget(null)}
+        />
+      )}
+      {tab === "drafts" && <DraftsView onAuthLost={onLogout} onEdit={editDraft} />}
       {tab === "timeline" && <TimelineView onAuthLost={onLogout} />}
       {tab === "subs" && <SubscriptionsView onAuthLost={onLogout} />}
     </div>
@@ -94,12 +119,21 @@ function TabBtn({ active, onClick, children }: { active: boolean; onClick: () =>
   );
 }
 
-function HomeView({ onAuthLost }: { onAuthLost: () => void }) {
+function HomeView({
+  onAuthLost,
+  editTarget,
+  onEditConsumed,
+}: {
+  onAuthLost: () => void;
+  editTarget: EditTarget | null;
+  onEditConsumed: () => void;
+}) {
   const [posts, setPosts] = useState<Post[]>([]);
   const [body, setBody] = useState("");
   const [title, setTitle] = useState("");
   const [showTitle, setShowTitle] = useState(false);
-  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingPostId, setEditingPostId] = useState<string | null>(null);
+  const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
   const [posting, setPosting] = useState(false);
   const [err, setErr] = useState("");
   const [uploading, setUploading] = useState(false);
@@ -108,24 +142,51 @@ function HomeView({ onAuthLost }: { onAuthLost: () => void }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   function resetComposer() {
-    setEditingId(null);
+    setEditingPostId(null);
+    setEditingDraftId(null);
     setBody("");
     setTitle("");
     setShowTitle(false);
   }
 
   function startEdit(p: Post) {
-    setEditingId(p.id);
+    setEditingPostId(p.id);
+    setEditingDraftId(null);
     setTitle(p.title ?? "");
     setBody(p.body);
     setShowTitle(!!p.title);
     setErr("");
-    // Bring the composer into view; users may have scrolled past it.
     queueMicrotask(() => {
       textareaRef.current?.focus();
       window.scrollTo({ top: 0, behavior: "smooth" });
     });
   }
+
+  // When a sibling tab hands us something to edit (e.g. a draft from
+  // the Drafts tab), load it into the composer and clear the handoff
+  // so a re-render or tab switch doesn't reapply it. onEditConsumed
+  // is intentionally omitted from the dep list — Shell re-creates it
+  // every render, and we only want to react to editTarget changes.
+  useEffect(() => {
+    if (!editTarget) return;
+    if (editTarget.kind === "draft") {
+      setEditingDraftId(editTarget.id);
+      setEditingPostId(null);
+    } else {
+      setEditingPostId(editTarget.id);
+      setEditingDraftId(null);
+    }
+    setTitle(editTarget.title);
+    setBody(editTarget.body);
+    setShowTitle(!!editTarget.title);
+    setErr("");
+    onEditConsumed();
+    queueMicrotask(() => {
+      textareaRef.current?.focus();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editTarget]);
 
   async function remove(p: Post) {
     const label = p.title || p.body.slice(0, 40);
@@ -133,8 +194,7 @@ function HomeView({ onAuthLost }: { onAuthLost: () => void }) {
     setErr("");
     try {
       await deletePost(p.id);
-      // If we were mid-edit on this post, drop the edit state.
-      if (editingId === p.id) resetComposer();
+      if (editingPostId === p.id) resetComposer();
       await load();
     } catch (e) {
       if (e instanceof Unauthorized) return onAuthLost();
@@ -218,13 +278,41 @@ function HomeView({ onAuthLost }: { onAuthLost: () => void }) {
     setErr("");
     try {
       const payload = { title: showTitle ? title : "", body };
-      if (editingId) {
-        await updatePost(editingId, payload);
+      if (editingPostId) {
+        await updatePost(editingPostId, payload);
+      } else if (editingDraftId) {
+        // Capture latest edits before publishing so they aren't lost
+        // if the publish call partially fails downstream.
+        await updateDraft(editingDraftId, payload);
+        await publishDraft(editingDraftId);
       } else {
         await api("/admin/api/posts", { method: "POST", body: JSON.stringify(payload) });
       }
       resetComposer();
       await load();
+    } catch (e) {
+      if (e instanceof Unauthorized) return onAuthLost();
+      setErr((e as Error).message);
+    } finally {
+      setPosting(false);
+    }
+  }
+
+  // Save Draft is only meaningful when the composer isn't editing a
+  // published post. When editing an existing draft it updates in
+  // place; otherwise it creates a new one.
+  async function saveDraft() {
+    if (!body.trim()) return;
+    setPosting(true);
+    setErr("");
+    try {
+      const payload = { title: showTitle ? title : "", body };
+      if (editingDraftId) {
+        await updateDraft(editingDraftId, payload);
+      } else {
+        await createDraft(payload);
+      }
+      resetComposer();
     } catch (e) {
       if (e instanceof Unauthorized) return onAuthLost();
       setErr((e as Error).message);
@@ -281,13 +369,29 @@ function HomeView({ onAuthLost }: { onAuthLost: () => void }) {
             </button>
           </div>
           <div style={{ display: "flex", gap: ".5em", alignItems: "center" }}>
-            {editingId && (
+            {(editingPostId || editingDraftId) && (
               <button type="button" onClick={resetComposer} style={linkBtn}>
                 cancel
               </button>
             )}
+            {!editingPostId && (
+              <button
+                type="button"
+                onClick={saveDraft}
+                disabled={posting || uploading || !body.trim()}
+                style={linkBtn}
+              >
+                {editingDraftId ? "save draft" : "+ draft"}
+              </button>
+            )}
             <button type="submit" disabled={posting || uploading || !body.trim()}>
-              {posting ? "Saving…" : editingId ? "Save" : "Post"}
+              {posting
+                ? "Saving…"
+                : editingPostId
+                ? "Save"
+                : editingDraftId
+                ? "Publish"
+                : "Post"}
             </button>
           </div>
         </div>
@@ -296,7 +400,7 @@ function HomeView({ onAuthLost }: { onAuthLost: () => void }) {
       {err && <div style={{ color: "#b00", fontSize: ".9em", marginBottom: "1em" }}>{err}</div>}
 
       {posts.map((p) => {
-        const isEditing = editingId === p.id;
+        const isEditing = editingPostId === p.id;
         return (
           <article
             key={p.id}

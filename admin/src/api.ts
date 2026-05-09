@@ -87,3 +87,34 @@ export async function updatePost(id: string, body: { title: string; body: string
 export async function deletePost(id: string): Promise<void> {
   await api<void>(`/admin/api/posts/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
+
+export type Draft = {
+  id: string;
+  title?: string;
+  tags?: string[];
+  body: string;
+  created: string;
+};
+
+export async function listDrafts(): Promise<Draft[]> {
+  return api<Draft[]>("/admin/api/drafts");
+}
+
+export async function createDraft(body: { title: string; body: string; tags?: string[] }): Promise<Draft> {
+  return api<Draft>("/admin/api/drafts", { method: "POST", body: JSON.stringify(body) });
+}
+
+export async function updateDraft(id: string, body: { title: string; body: string; tags?: string[] }): Promise<Draft> {
+  return api<Draft>(`/admin/api/drafts/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteDraft(id: string): Promise<void> {
+  await api<void>(`/admin/api/drafts/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function publishDraft(id: string): Promise<Post> {
+  return api<Post>(`/admin/api/drafts/${encodeURIComponent(id)}/publish`, { method: "POST" });
+}
