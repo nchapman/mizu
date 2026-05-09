@@ -89,7 +89,6 @@ func isBlockedIP(ip net.IP) bool {
 	return false
 }
 
-
 // Run polls on startup, then every interval, until ctx is cancelled.
 func (p *Poller) Run(ctx context.Context) {
 	p.PollAll(ctx)

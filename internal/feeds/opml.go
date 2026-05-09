@@ -11,10 +11,10 @@ import (
 // category nesting. Deeper nesting is flattened on read.
 
 type opmlDoc struct {
-	XMLName xml.Name     `xml:"opml"`
-	Version string       `xml:"version,attr"`
-	Head    opmlHead     `xml:"head"`
-	Body    opmlBody     `xml:"body"`
+	XMLName xml.Name `xml:"opml"`
+	Version string   `xml:"version,attr"`
+	Head    opmlHead `xml:"head"`
+	Body    opmlBody `xml:"body"`
 }
 
 type opmlHead struct {

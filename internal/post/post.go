@@ -62,10 +62,10 @@ func (p *Post) Excerpt(max int) string {
 type Store struct {
 	dir string
 
-	mu      sync.RWMutex
-	byID    map[string]*Post
-	bySlug  map[string]*Post // key: "YYYY/MM/DD/slug" — articles only
-	order   []*Post          // newest first
+	mu     sync.RWMutex
+	byID   map[string]*Post
+	bySlug map[string]*Post // key: "YYYY/MM/DD/slug" — articles only
+	order  []*Post          // newest first
 }
 
 func slugKey(p *Post) string {
