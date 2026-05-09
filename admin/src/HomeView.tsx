@@ -92,6 +92,13 @@ export function HomeView({ onAuthLost, editTarget, onEditConsumed }: Props) {
     refreshDraftsCount();
   }
 
+  // Drawer-driven mutations (publish, delete) can produce a new own-post in
+  // the stream or remove one. Bump both counters so neither view goes stale.
+  function handleDrawerChanged() {
+    refreshDraftsCount();
+    setStreamRefresh((n) => n + 1);
+  }
+
   function openDrafts() {
     setDraftsRefresh((n) => n + 1);
     setDraftsOpen(true);
@@ -120,7 +127,7 @@ export function HomeView({ onAuthLost, editTarget, onEditConsumed }: Props) {
         onAuthLost={onAuthLost}
         onEdit={startEditDraft}
         refreshKey={draftsRefresh}
-        onChanged={refreshDraftsCount}
+        onChanged={handleDrawerChanged}
       />
     </div>
   );
