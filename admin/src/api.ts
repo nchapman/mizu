@@ -12,10 +12,13 @@ export async function api<T = unknown>(
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
+  // Default to JSON for plain string bodies. For FormData, leave the
+  // header unset so the browser can add the multipart boundary.
+  const isForm = init.body instanceof FormData;
   const r = await fetch(path, {
     ...init,
     headers: {
-      ...(init.body ? { "content-type": "application/json" } : {}),
+      ...(init.body && !isForm ? { "content-type": "application/json" } : {}),
       ...(init.headers || {}),
     },
   });
@@ -60,3 +63,16 @@ export type Timeline = {
   items: TimelineItem[];
   next_cursor?: string;
 };
+
+export type Media = {
+  name: string;
+  url: string;
+  size: number;
+  mime: string;
+};
+
+export async function uploadMedia(file: File): Promise<Media> {
+  const fd = new FormData();
+  fd.append("file", file);
+  return api<Media>("/admin/api/media", { method: "POST", body: fd });
+}

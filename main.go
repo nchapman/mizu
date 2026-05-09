@@ -18,6 +18,7 @@ import (
 	"github.com/nchapman/repeat/internal/auth"
 	"github.com/nchapman/repeat/internal/config"
 	"github.com/nchapman/repeat/internal/feeds"
+	"github.com/nchapman/repeat/internal/media"
 	"github.com/nchapman/repeat/internal/post"
 	"github.com/nchapman/repeat/internal/site"
 )
@@ -76,13 +77,24 @@ func main() {
 		defer bg.Done()
 		authSvc.ReapSessions(ctx)
 	}()
-	adminSrv := admin.New(ctx, cfg, posts, feedSvc, poller, authSvc)
+	mediaStore, err := media.NewStore(cfg.Paths.Media)
+	if err != nil {
+		log.Fatalf("media: %v", err)
+	}
+	adminSrv := admin.New(ctx, cfg, posts, feedSvc, poller, authSvc, mediaStore)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Route("/admin", adminSrv.Routes)
-	r.Handle("/media/*", http.StripPrefix("/media/", http.FileServer(http.Dir(cfg.Paths.Media))))
+	mediaFS := http.StripPrefix("/media/", http.FileServer(http.Dir(cfg.Paths.Media)))
+	r.Handle("/media/*", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// Defense in depth: even though uploads are restricted to a small
+		// set of raster types, a stale or hand-placed file shouldn't be
+		// content-sniffed by the browser into something executable.
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		mediaFS.ServeHTTP(w, req)
+	}))
 	siteSrv.Routes(r)
 
 	srv := &http.Server{Addr: cfg.Server.Addr, Handler: r}

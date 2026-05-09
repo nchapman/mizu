@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { api, Post, Unauthorized } from "./api";
+import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
+import { api, Post, Unauthorized, uploadMedia } from "./api";
 import { TimelineView } from "./Timeline";
 import { SubscriptionsView } from "./Subscriptions";
 
@@ -100,6 +101,65 @@ function HomeView({ onAuthLost }: { onAuthLost: () => void }) {
   const [showTitle, setShowTitle] = useState(false);
   const [posting, setPosting] = useState(false);
   const [err, setErr] = useState("");
+  const [uploading, setUploading] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Inserts text at the textarea's caret. flushSync forces React to
+  // commit the new body synchronously so we can move the caret in the
+  // same tick — without it, a queueMicrotask hack would race the
+  // commit. Using the functional setState form is critical here:
+  // sequential calls in a loop must each see the latest body, not a
+  // stale snapshot from the original render.
+  function insertAtCaret(text: string) {
+    const ta = textareaRef.current;
+    let caret = -1;
+    flushSync(() => {
+      setBody((prev) => {
+        const start = ta?.selectionStart ?? prev.length;
+        const end = ta?.selectionEnd ?? prev.length;
+        caret = start + text.length;
+        return prev.slice(0, start) + text + prev.slice(end);
+      });
+    });
+    if (ta && caret >= 0) {
+      ta.focus();
+      ta.setSelectionRange(caret, caret);
+    }
+  }
+
+  async function uploadFiles(files: File[]) {
+    if (files.length === 0) return;
+    setErr("");
+    setUploading(true);
+    try {
+      for (const f of files) {
+        const m = await uploadMedia(f);
+        const alt = f.name.replace(/\.[^.]+$/, "");
+        insertAtCaret(`![${alt}](${m.url})\n`);
+      }
+    } catch (e) {
+      if (e instanceof Unauthorized) return onAuthLost();
+      setErr((e as Error).message);
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  function onPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const files = Array.from(e.clipboardData.files).filter((f) => f.type.startsWith("image/"));
+    if (files.length === 0) return;
+    e.preventDefault();
+    void uploadFiles(files);
+  }
+
+  function onDrop(e: React.DragEvent<HTMLTextAreaElement>) {
+    e.preventDefault();
+    setDragActive(false);
+    const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
+    if (files.length > 0) void uploadFiles(files);
+  }
 
   async function load() {
     try {
@@ -149,17 +209,42 @@ function HomeView({ onAuthLost }: { onAuthLost: () => void }) {
           />
         )}
         <textarea
-          placeholder="What's on your mind?"
+          ref={textareaRef}
+          placeholder="What's on your mind? (paste or drop images to upload)"
           value={body}
           onChange={(e) => setBody(e.target.value)}
+          onPaste={onPaste}
+          onDrop={onDrop}
+          onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
+          onDragLeave={() => setDragActive(false)}
           rows={showTitle ? 8 : 3}
-          style={{ width: "100%", padding: ".4em", fontSize: "1em", resize: "vertical" }}
+          style={{
+            width: "100%", padding: ".4em", fontSize: "1em", resize: "vertical",
+            outline: dragActive ? "2px dashed #4a90e2" : undefined,
+          }}
+        />
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          multiple
+          style={{ display: "none" }}
+          onChange={(e) => {
+            const files = Array.from(e.target.files ?? []);
+            e.target.value = "";
+            void uploadFiles(files);
+          }}
         />
         <div style={{ display: "flex", justifyContent: "space-between", marginTop: ".5em" }}>
-          <button type="button" onClick={() => setShowTitle((v) => !v)} style={linkBtn}>
-            {showTitle ? "− title" : "+ title"}
-          </button>
-          <button type="submit" disabled={posting || !body.trim()}>
+          <div style={{ display: "flex", gap: ".5em", alignItems: "center" }}>
+            <button type="button" onClick={() => setShowTitle((v) => !v)} style={linkBtn}>
+              {showTitle ? "− title" : "+ title"}
+            </button>
+            <button type="button" onClick={() => fileInputRef.current?.click()} style={linkBtn} disabled={uploading}>
+              {uploading ? "uploading…" : "+ image"}
+            </button>
+          </div>
+          <button type="submit" disabled={posting || uploading || !body.trim()}>
             {posting ? "Posting…" : "Post"}
           </button>
         </div>

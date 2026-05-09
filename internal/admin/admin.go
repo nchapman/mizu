@@ -18,6 +18,7 @@ import (
 	"github.com/nchapman/repeat/internal/auth"
 	"github.com/nchapman/repeat/internal/config"
 	"github.com/nchapman/repeat/internal/feeds"
+	"github.com/nchapman/repeat/internal/media"
 	"github.com/nchapman/repeat/internal/post"
 )
 
@@ -27,11 +28,12 @@ type Server struct {
 	feeds  *feeds.Service
 	poller *feeds.Poller
 	auth   *auth.Auth
+	media  *media.Store
 	bgCtx  context.Context // lives for the process lifetime; used for fire-and-forget jobs
 }
 
-func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller, a *auth.Auth) *Server {
-	return &Server{bgCtx: bgCtx, cfg: cfg, posts: posts, feeds: feedSvc, poller: poller, auth: a}
+func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller, a *auth.Auth, m *media.Store) *Server {
+	return &Server{bgCtx: bgCtx, cfg: cfg, posts: posts, feeds: feedSvc, poller: poller, auth: a, media: m}
 }
 
 func (s *Server) Routes(r chi.Router) {
@@ -57,6 +59,8 @@ func (s *Server) Routes(r chi.Router) {
 			r.Get("/timeline", s.timeline)
 			r.Post("/items/{id}/read", s.markItemRead)
 			r.Delete("/items/{id}/read", s.markItemUnread)
+
+			r.Post("/media", s.uploadMedia)
 		})
 	})
 	r.Get("/*", s.serveSPA)
@@ -393,6 +397,43 @@ func (s *Server) setItemRead(w http.ResponseWriter, r *http.Request, read bool) 
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- media ---
+
+func (s *Server) uploadMedia(w http.ResponseWriter, r *http.Request) {
+	// Cap the whole request body, not just one part — protects against
+	// a client sending many oversized parts inside one multipart envelope.
+	r.Body = http.MaxBytesReader(w, r.Body, media.MaxSize+1<<10)
+	if err := r.ParseMultipartForm(media.MaxSize + 1<<10); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	f, _, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "missing file field", http.StatusBadRequest)
+		return
+	}
+	defer f.Close()
+
+	saved, err := s.media.Save(f)
+	switch {
+	case errors.Is(err, media.ErrTooLarge):
+		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+		return
+	case errors.Is(err, media.ErrUnsupportedExt), errors.Is(err, media.ErrEmpty):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"name": saved.Name,
+		"url":  saved.URL,
+		"size": saved.Size,
+		"mime": saved.MIME,
+	})
 }
 
 // serveSPA serves the built React admin from disk. Falls back to a placeholder
