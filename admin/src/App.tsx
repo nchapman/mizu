@@ -25,7 +25,11 @@ export function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [initErr, setInitErr] = useState(false);
 
-  async function loadMe() {
+  // loadMe flows down to HomeView as onAuthLost, which is the sole
+  // dep of uploadAndCollect's useCallback. A stable identity here
+  // means the editor's PASTE/DROP command listeners don't tear down
+  // and re-register on unrelated App re-renders.
+  const loadMe = useCallback(async () => {
     try {
       setInitErr(false);
       const r = await fetch("/admin/api/me");
@@ -34,10 +38,10 @@ export function App() {
     } catch {
       setInitErr(true);
     }
-  }
+  }, []);
   useEffect(() => {
     loadMe();
-  }, []);
+  }, [loadMe]);
 
   if (initErr) {
     return (
