@@ -19,6 +19,7 @@ fmt:
 
 test:
 	go test ./...
+	cd admin && npm test
 
 build:
 	go build ./...

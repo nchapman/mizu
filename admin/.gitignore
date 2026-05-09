@@ -4,3 +4,4 @@ dist/*
 # runs; the embed directive needs at least one file in admin/dist.
 !dist/.keep
 *.local
+coverage
