@@ -101,7 +101,31 @@ func NewStore(contentDir string) (*Store, error) {
 	return s, nil
 }
 
+// Dirs returns the on-disk paths backing this store. Used by callers
+// like the filesystem watcher that need to subscribe to changes.
+func (s *Store) Dirs() (postsDir, draftsDir string) {
+	return s.dir, s.draftDir
+}
+
+// Reload re-reads all posts and drafts from disk, replacing the
+// in-memory indexes atomically. Safe for concurrent readers — they
+// may observe pre-reload pointers briefly until the swap, but they
+// won't see a torn index. Used by the filesystem watcher when the
+// operator edits markdown files outside the admin UI.
+func (s *Store) Reload() error {
+	return s.reload()
+}
+
+// reload re-reads everything from disk under the write lock. The
+// disk reads happen inside the lock so a concurrent Create/Update/
+// Publish can't write to the old maps and then have its insert
+// silently dropped when reload swaps in fresh ones. Cost: writers
+// and readers block while reload runs. Acceptable at single-user
+// scale (≤hundreds of posts → tens of milliseconds).
 func (s *Store) reload() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return err
@@ -130,13 +154,11 @@ func (s *Store) reload() error {
 		return err
 	}
 
-	s.mu.Lock()
 	s.byID = byID
 	s.bySlug = bySlug
 	s.order = order
 	s.drafts = drafts
 	s.draftIdx = draftIdx
-	s.mu.Unlock()
 	return nil
 }
 

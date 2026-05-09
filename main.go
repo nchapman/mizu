@@ -37,6 +37,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("posts: %v", err)
 	}
+	postWatcher := post.NewWatcher(posts)
 
 	feedStore, err := feeds.OpenStore(cfg.Paths.Cache)
 	if err != nil {
@@ -59,6 +60,14 @@ func main() {
 	go func() {
 		defer bg.Done()
 		poller.Run(ctx)
+	}()
+
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		if err := postWatcher.Run(ctx); err != nil {
+			log.Printf("post watcher: %v", err)
+		}
 	}()
 
 	wmStore, err := webmention.OpenStore(cfg.Paths.Cache)
