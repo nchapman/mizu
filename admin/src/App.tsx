@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import {
   api, Post, Draft, Unauthorized, uploadMedia,
@@ -7,6 +7,9 @@ import {
 import { TimelineView } from "./Timeline";
 import { SubscriptionsView } from "./Subscriptions";
 import { DraftsView } from "./Drafts";
+import { MarkdownEditor, type MarkdownEditorHandle } from "./MarkdownEditor";
+
+type ComposerMode = "rich" | "md";
 
 type Me = { configured: boolean; authenticated: boolean };
 type Tab = "home" | "drafts" | "timeline" | "subs";
@@ -138,26 +141,52 @@ function HomeView({
   const [err, setErr] = useState("");
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
+  const [mode, setMode] = useState<ComposerMode>("rich");
+  // editorKey forces the rich Lexical editor to re-init from a fresh
+  // initialValue. Bumped on resetComposer, edit-target loads, and
+  // mode flips into rich — anywhere the body changes from outside the
+  // editor's own typing.
+  const [editorKey, setEditorKey] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const editorRef = useRef<MarkdownEditorHandle>(null);
+
+  // Co-update every piece of composer state that has to move together
+  // with body. The rich editor is uncontrolled internally and only
+  // re-inits on key change, so any time body changes from outside the
+  // editor's own typing the key MUST bump in the same call. Routing
+  // every external load through here keeps that invariant in one place
+  // — direct setBody from outside this helper risks a stale rich view.
+  function loadIntoComposer(args: {
+    body: string;
+    title?: string;
+    showTitle?: boolean;
+    postId?: string | null;
+    draftId?: string | null;
+  }) {
+    setBody(args.body);
+    setTitle(args.title ?? "");
+    setShowTitle(args.showTitle ?? false);
+    setEditingPostId(args.postId ?? null);
+    setEditingDraftId(args.draftId ?? null);
+    setEditorKey((k) => k + 1);
+  }
 
   function resetComposer() {
-    setEditingPostId(null);
-    setEditingDraftId(null);
-    setBody("");
-    setTitle("");
-    setShowTitle(false);
+    loadIntoComposer({ body: "" });
   }
 
   function startEdit(p: Post) {
-    setEditingPostId(p.id);
-    setEditingDraftId(null);
-    setTitle(p.title ?? "");
-    setBody(p.body);
-    setShowTitle(!!p.title);
+    loadIntoComposer({
+      body: p.body,
+      title: p.title ?? "",
+      showTitle: !!p.title,
+      postId: p.id,
+    });
     setErr("");
     queueMicrotask(() => {
-      textareaRef.current?.focus();
+      if (mode === "md") textareaRef.current?.focus();
+      else editorRef.current?.focus();
       window.scrollTo({ top: 0, behavior: "smooth" });
     });
   }
@@ -169,20 +198,18 @@ function HomeView({
   // every render, and we only want to react to editTarget changes.
   useEffect(() => {
     if (!editTarget) return;
-    if (editTarget.kind === "draft") {
-      setEditingDraftId(editTarget.id);
-      setEditingPostId(null);
-    } else {
-      setEditingPostId(editTarget.id);
-      setEditingDraftId(null);
-    }
-    setTitle(editTarget.title);
-    setBody(editTarget.body);
-    setShowTitle(!!editTarget.title);
+    loadIntoComposer({
+      body: editTarget.body,
+      title: editTarget.title,
+      showTitle: !!editTarget.title,
+      postId: editTarget.kind === "post" ? editTarget.id : null,
+      draftId: editTarget.kind === "draft" ? editTarget.id : null,
+    });
     setErr("");
     onEditConsumed();
     queueMicrotask(() => {
-      textareaRef.current?.focus();
+      if (mode === "md") textareaRef.current?.focus();
+      else editorRef.current?.focus();
       window.scrollTo({ top: 0, behavior: "smooth" });
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -225,36 +252,74 @@ function HomeView({
     }
   }
 
-  async function uploadFiles(files: File[]) {
-    if (files.length === 0) return;
+  // Uploads a batch and returns one Markdown image-syntax snippet
+  // per file. Errors and the uploading flag are owned here; callers
+  // decide how to insert the snippets (caret in MD mode, Lexical
+  // selection in rich mode).
+  //
+  // Memoized because MarkdownEditor passes this to a useEffect dep
+  // list — without useCallback, every keystroke would tear down and
+  // re-register the editor's PASTE/DROP command listeners.
+  const uploadAndCollect = useCallback(async (files: File[]): Promise<string[]> => {
+    if (files.length === 0) return [];
     setErr("");
     setUploading(true);
     try {
+      const out: string[] = [];
       for (const f of files) {
         const m = await uploadMedia(f);
         const alt = f.name.replace(/\.[^.]+$/, "");
-        insertAtCaret(`![${alt}](${m.url})\n`);
+        out.push(`![${alt}](${m.url})\n`);
       }
+      return out;
     } catch (e) {
-      if (e instanceof Unauthorized) return onAuthLost();
+      if (e instanceof Unauthorized) {
+        onAuthLost();
+        return [];
+      }
       setErr((e as Error).message);
+      return [];
     } finally {
       setUploading(false);
     }
+  }, [onAuthLost]);
+
+  // MD-mode file picker path: upload, then insert at the textarea caret.
+  async function uploadFilesMd(files: File[]) {
+    const snippets = await uploadAndCollect(files);
+    for (const s of snippets) insertAtCaret(s);
+  }
+
+  // Rich-mode file picker path: upload, then insert at the Lexical
+  // selection. Paste/drop in rich mode is wired directly inside the
+  // editor — this helper only covers the explicit "+ image" button.
+  async function uploadFilesRich(files: File[]) {
+    const snippets = await uploadAndCollect(files);
+    if (snippets.length > 0) editorRef.current?.insertMarkdown(snippets.join(""));
   }
 
   function onPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
     const files = Array.from(e.clipboardData.files).filter((f) => f.type.startsWith("image/"));
     if (files.length === 0) return;
     e.preventDefault();
-    void uploadFiles(files);
+    void uploadFilesMd(files);
   }
 
   function onDrop(e: React.DragEvent<HTMLTextAreaElement>) {
     e.preventDefault();
     setDragActive(false);
     const files = Array.from(e.dataTransfer.files).filter((f) => f.type.startsWith("image/"));
-    if (files.length > 0) void uploadFiles(files);
+    if (files.length > 0) void uploadFilesMd(files);
+  }
+
+  // Flipping into rich means the editor has to re-init from the
+  // current (possibly md-edited) body. Flipping into md is just a
+  // render swap — body is already current.
+  function setComposerMode(next: ComposerMode) {
+    setMode((prev) => {
+      if (prev !== next && next === "rich") setEditorKey((k) => k + 1);
+      return next;
+    });
   }
 
   async function load() {
@@ -332,21 +397,34 @@ function HomeView({
             style={{ width: "100%", marginBottom: ".5em", padding: ".4em", fontSize: "1em" }}
           />
         )}
-        <textarea
-          ref={textareaRef}
-          placeholder="What's on your mind? (paste or drop images to upload)"
-          value={body}
-          onChange={(e) => setBody(e.target.value)}
-          onPaste={onPaste}
-          onDrop={onDrop}
-          onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
-          onDragLeave={() => setDragActive(false)}
-          rows={showTitle ? 8 : 3}
-          style={{
-            width: "100%", padding: ".4em", fontSize: "1em", resize: "vertical",
-            outline: dragActive ? "2px dashed #4a90e2" : undefined,
-          }}
-        />
+        {mode === "rich" ? (
+          <MarkdownEditor
+            key={editorKey}
+            ref={editorRef}
+            initialValue={body}
+            onChange={setBody}
+            onUploadImages={uploadAndCollect}
+            placeholder="What's on your mind? (paste or drop images to upload)"
+            minHeight={showTitle ? "12em" : "5em"}
+          />
+        ) : (
+          <textarea
+            ref={textareaRef}
+            placeholder="What's on your mind? (paste or drop images to upload)"
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            onPaste={onPaste}
+            onDrop={onDrop}
+            onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
+            onDragLeave={() => setDragActive(false)}
+            rows={showTitle ? 8 : 3}
+            style={{
+              width: "100%", padding: ".4em", fontSize: "1em", fontFamily: "ui-monospace, Menlo, monospace",
+              resize: "vertical",
+              outline: dragActive ? "2px dashed #4a90e2" : undefined,
+            }}
+          />
+        )}
         <input
           ref={fileInputRef}
           type="file"
@@ -356,7 +434,8 @@ function HomeView({
           onChange={(e) => {
             const files = Array.from(e.target.files ?? []);
             e.target.value = "";
-            void uploadFiles(files);
+            if (mode === "rich") void uploadFilesRich(files);
+            else void uploadFilesMd(files);
           }}
         />
         <div style={{ display: "flex", justifyContent: "space-between", marginTop: ".5em" }}>
@@ -366,6 +445,14 @@ function HomeView({
             </button>
             <button type="button" onClick={() => fileInputRef.current?.click()} style={linkBtn} disabled={uploading}>
               {uploading ? "uploading…" : "+ image"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setComposerMode(mode === "rich" ? "md" : "rich")}
+              style={linkBtn}
+              title={mode === "rich" ? "Edit raw Markdown source" : "Back to rich editor"}
+            >
+              {mode === "rich" ? "source" : "rich"}
             </button>
           </div>
           <div style={{ display: "flex", gap: ".5em", alignItems: "center" }}>
