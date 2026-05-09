@@ -65,6 +65,17 @@ export type Timeline = {
   next_cursor?: string;
 };
 
+// Stream is the unified feed: the operator's own posts intermixed with
+// feed items. The kind discriminator picks which sub-record is populated.
+export type StreamItem =
+  | { kind: "feed"; item: TimelineItem }
+  | { kind: "own"; post: Post };
+
+export type Stream = {
+  items: StreamItem[];
+  next_cursor?: string;
+};
+
 export type Media = {
   name: string;
   url: string;

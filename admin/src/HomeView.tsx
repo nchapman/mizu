@@ -2,15 +2,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Composer, type ComposerHandle } from "@/Composer";
 import { DraftsDrawer } from "@/DraftsDrawer";
-import { PostList } from "@/PostList";
+import { StreamView } from "@/Stream";
 import type { Draft, Post } from "@/api";
 import { Unauthorized, listDrafts } from "@/api";
 import type { EditTarget } from "@/Shell";
 
 interface Props {
   onAuthLost: () => void;
-  // One-shot edit handoff from a sibling view (e.g. Drafts → composer).
-  // HomeView forwards into the composer's imperative load() and acks via
+  // One-shot edit handoff (e.g. drafts drawer → composer). HomeView
+  // forwards into the composer's imperative load() and acks via
   // onEditConsumed.
   editTarget: EditTarget | null;
   onEditConsumed: () => void;
@@ -18,22 +18,17 @@ interface Props {
 
 export function HomeView({ onAuthLost, editTarget, onEditConsumed }: Props) {
   const composerRef = useRef<ComposerHandle>(null);
-  const [refreshToken, setRefreshToken] = useState(0);
-  const [editingPostId, setEditingPostId] = useState<string | null>(null);
+  const [streamRefresh, setStreamRefresh] = useState(0);
   const [draftsOpen, setDraftsOpen] = useState(false);
   const [draftsCount, setDraftsCount] = useState(0);
-  // Bumped on draft mutations and drawer open so DraftsView refetches.
   const [draftsRefresh, setDraftsRefresh] = useState(0);
 
-  // Lightweight count fetch so the toolbar pill can render even when the
-  // drawer is closed. The drawer's own list reload uses draftsRefresh.
   const refreshDraftsCount = useCallback(async () => {
     try {
       const drafts = await listDrafts();
       setDraftsCount(drafts.length);
     } catch (e) {
       if (e instanceof Unauthorized) onAuthLost();
-      // Otherwise silent — the count is non-critical chrome.
     }
   }, [onAuthLost]);
 
@@ -77,25 +72,14 @@ export function HomeView({ onAuthLost, editTarget, onEditConsumed }: Props) {
     });
   }
 
-  function handleDeleted(id: string) {
-    if (editingPostId === id) composerRef.current?.reset();
-    setRefreshToken((t) => t + 1);
-  }
-
-  // Stable identity so Composer's onTargetChange effect doesn't re-fire
-  // every render of HomeView.
-  const handleTargetChange = useCallback((t: EditTarget | null) => {
-    setEditingPostId(t?.kind === "post" ? t.id : null);
-  }, []);
-
   function handleDraftSaved() {
     setDraftsRefresh((n) => n + 1);
     refreshDraftsCount();
   }
 
   function handleSubmitted() {
-    setRefreshToken((t) => t + 1);
-    // Publishing a draft removes it; refresh the count.
+    // Force the stream to reload so a new/updated post shows up immediately.
+    setStreamRefresh((n) => n + 1);
     refreshDraftsCount();
   }
 
@@ -110,17 +94,15 @@ export function HomeView({ onAuthLost, editTarget, onEditConsumed }: Props) {
         ref={composerRef}
         onSubmitted={handleSubmitted}
         onDraftSaved={handleDraftSaved}
-        onTargetChange={handleTargetChange}
         onAuthLost={onAuthLost}
         draftsCount={draftsCount}
         onOpenDrafts={openDrafts}
       />
-      <PostList
-        refreshToken={refreshToken}
-        editingPostId={editingPostId}
-        onEdit={startEditPost}
-        onDeleted={handleDeleted}
+      <StreamView
         onAuthLost={onAuthLost}
+        onEditOwn={startEditPost}
+        refreshToken={streamRefresh}
+        onPostsChanged={() => setStreamRefresh((n) => n + 1)}
       />
       <DraftsDrawer
         open={draftsOpen}

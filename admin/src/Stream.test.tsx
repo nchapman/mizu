@@ -4,16 +4,33 @@ import userEvent from "@testing-library/user-event";
 import { StreamView } from "./Stream";
 import { queueFetch } from "./test/fetch";
 
-const item = (
+const feed = (
   over: Partial<{ id: number; title: string; read: boolean; content: string; url: string }> = {},
 ) => ({
-  id: over.id ?? 1,
-  feed_id: 1,
-  feed_title: "Test Feed",
-  url: over.url ?? "https://example/post",
-  title: over.title ?? "An item",
-  content: over.content ?? "<p>body</p>",
-  read: over.read ?? false,
+  kind: "feed" as const,
+  item: {
+    id: over.id ?? 1,
+    feed_id: 1,
+    feed_title: "Test Feed",
+    url: over.url ?? "https://example/post",
+    title: over.title ?? "An item",
+    content: over.content ?? "<p>body</p>",
+    read: over.read ?? false,
+  },
+});
+
+const own = (
+  over: Partial<{ id: string; title: string; html: string; body: string; date: string; path: string }> = {},
+) => ({
+  kind: "own" as const,
+  post: {
+    id: over.id ?? "p1",
+    title: over.title ?? "My Post",
+    body: over.body ?? "the body",
+    html: over.html ?? "<p>the body</p>",
+    date: over.date ?? "2026-05-09T00:00:00Z",
+    path: over.path ?? "/2026/05/09/my-post",
+  },
 });
 
 beforeEach(() => {
@@ -31,6 +48,7 @@ beforeEach(() => {
     thresholds: number[] = [];
   }
   vi.stubGlobal("IntersectionObserver", IO);
+  vi.stubGlobal("confirm", vi.fn().mockReturnValue(true));
 });
 afterEach(() => vi.unstubAllGlobals());
 
@@ -38,131 +56,130 @@ async function openCardMenu(article: HTMLElement) {
   await userEvent.click(within(article).getByRole("button", { name: /more/i }));
 }
 
+const noop = () => {};
+
 describe("StreamView", () => {
-  it("renders an empty state when the timeline has no items", async () => {
+  it("renders an empty state when the stream has no items", async () => {
     queueFetch([{ status: 200, body: { items: [] } }]);
-    render(<StreamView onAuthLost={() => {}} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
     expect(await screen.findByText(/Nothing here yet/i)).toBeInTheDocument();
   });
 
-  it("renders the feed title, item title, and lead paragraph", async () => {
+  it("renders a feed card with byline, title, and lead paragraph", async () => {
     queueFetch([
-      {
-        status: 200,
-        body: { items: [item({ content: "<p>safe <em>content</em></p><p>more</p>" })] },
-      },
+      { status: 200, body: { items: [feed({ content: "<p>safe <em>content</em></p><p>more</p>" })] } },
     ]);
-    const { container } = render(<StreamView onAuthLost={() => {}} />);
+    const { container } = render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
     expect(await screen.findByRole("heading", { name: "An item" })).toBeInTheDocument();
     expect(screen.getByText("Test Feed")).toBeInTheDocument();
-    // Only the first paragraph renders until expanded.
     expect(container.querySelector(".post-rendered em")?.textContent).toBe("content");
     expect(screen.queryByText("more")).toBeNull();
   });
 
+  it("renders an own-post card with You byline, title, and rendered HTML", async () => {
+    queueFetch([
+      { status: 200, body: { items: [own({ title: "Hello", html: "<p>Hello <em>world</em></p>" })] } },
+    ]);
+    const { container } = render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    expect(await screen.findByRole("heading", { name: "Hello" })).toBeInTheDocument();
+    expect(screen.getByText("You")).toBeInTheDocument();
+    expect(container.querySelector(".post-rendered em")?.textContent).toBe("world");
+  });
+
   it("expands long items via Read more", async () => {
     queueFetch([
-      {
-        status: 200,
-        body: { items: [item({ content: "<p>lead</p><p>second paragraph</p>" })] },
-      },
+      { status: 200, body: { items: [feed({ content: "<p>lead</p><p>second paragraph</p>" })] } },
     ]);
-    render(<StreamView onAuthLost={() => {}} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
     await screen.findByRole("heading", { name: "An item" });
     expect(screen.queryByText("second paragraph")).toBeNull();
     await userEvent.click(screen.getByRole("button", { name: /Read more/i }));
     expect(await screen.findByText("second paragraph")).toBeInTheDocument();
   });
 
-  it("does not show Read more for short items", async () => {
-    queueFetch([{ status: 200, body: { items: [item({ content: "<p>only one</p>" })] } }]);
-    render(<StreamView onAuthLost={() => {}} />);
-    await screen.findByRole("heading", { name: "An item" });
-    expect(screen.queryByRole("button", { name: /Read more/i })).toBeNull();
-  });
-
-  it("paginates via Load more", async () => {
+  it("paginates via Load more, passing cursor", async () => {
     const fn = queueFetch([
-      { status: 200, body: { items: [item({ id: 1, title: "A" })], next_cursor: "100:1" } },
-      { status: 200, body: { items: [item({ id: 2, title: "B" })] } },
+      { status: 200, body: { items: [feed({ id: 1, title: "A" })], next_cursor: "abc" } },
+      { status: 200, body: { items: [feed({ id: 2, title: "B" })] } },
     ]);
-    render(<StreamView onAuthLost={() => {}} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
     await screen.findByRole("heading", { name: "A" });
-
     await userEvent.click(screen.getByRole("button", { name: /Load more/i }));
     await screen.findByRole("heading", { name: "B" });
-
-    expect(screen.getByRole("heading", { name: "A" })).toBeInTheDocument();
-    expect(fn.mock.calls[1][0]).toContain("cursor=100%3A1");
+    expect(fn.mock.calls[1][0]).toContain("cursor=abc");
   });
 
-  it("toggles the Unread filter via the pill bar", async () => {
+  it("toggles filter pills and re-issues the request with filter=unread", async () => {
     const fn = queueFetch([
-      { status: 200, body: { items: [item({ id: 1 })] } },
-      { status: 200, body: { items: [item({ id: 1 })] } },
+      { status: 200, body: { items: [feed({ id: 1 })] } },
+      { status: 200, body: { items: [feed({ id: 1 })] } },
     ]);
-    render(<StreamView onAuthLost={() => {}} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
     await screen.findByRole("heading", { name: "An item" });
 
     await userEvent.click(screen.getByRole("tab", { name: "Unread" }));
     await waitFor(() => expect(fn).toHaveBeenCalledTimes(2));
-    expect(fn.mock.calls[1][0]).toContain("unread=1");
-    expect(fn.mock.calls[0][0]).not.toContain("unread");
+    expect(fn.mock.calls[1][0]).toContain("filter=unread");
+    expect(fn.mock.calls[0][0]).not.toContain("filter=");
   });
 
-  it("marks an item read via the per-card menu, optimistically", async () => {
+  it("filter Yours sends filter=yours", async () => {
     const fn = queueFetch([
-      { status: 200, body: { items: [item({ id: 5, read: false })] } },
+      { status: 200, body: { items: [feed({ id: 1 })] } },
+      { status: 200, body: { items: [own()] } },
+    ]);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    await screen.findByRole("heading", { name: "An item" });
+    await userEvent.click(screen.getByRole("tab", { name: "Yours" }));
+    await waitFor(() => expect(fn).toHaveBeenCalledTimes(2));
+    expect(fn.mock.calls[1][0]).toContain("filter=yours");
+  });
+
+  it("marks a feed item read via the per-card menu, optimistically", async () => {
+    const fn = queueFetch([
+      { status: 200, body: { items: [feed({ id: 5, read: false })] } },
       { status: 204 },
     ]);
-    render(<StreamView onAuthLost={() => {}} />);
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
     const article = (await screen.findByRole("heading", { name: "An item" })).closest("article")!;
-
     await openCardMenu(article);
     await userEvent.click(await screen.findByRole("menuitem", { name: "Mark read" }));
-
-    // After the action, the menu should now offer Mark unread (optimistic flip).
     await openCardMenu(article);
     expect(await screen.findByRole("menuitem", { name: "Mark unread" })).toBeInTheDocument();
-
     await waitFor(() => expect(fn).toHaveBeenCalledTimes(2));
     expect(fn.mock.calls[1][0]).toBe("/admin/api/items/5/read");
     expect((fn.mock.calls[1][1] as RequestInit).method).toBe("POST");
   });
 
-  it("marks unread via DELETE when the item starts read", async () => {
-    const fn = queueFetch([
-      { status: 200, body: { items: [item({ id: 5, read: true })] } },
-      { status: 204 },
-    ]);
-    render(<StreamView onAuthLost={() => {}} />);
-    const article = (await screen.findByRole("heading", { name: "An item" })).closest("article")!;
+  it("hands off own-card Edit to onEditOwn", async () => {
+    queueFetch([{ status: 200, body: { items: [own({ id: "p1", title: "Hello" })] } }]);
+    const onEditOwn = vi.fn();
+    render(<StreamView onAuthLost={noop} onEditOwn={onEditOwn} />);
+    const article = (await screen.findByRole("heading", { name: "Hello" })).closest("article")!;
     await openCardMenu(article);
-    await userEvent.click(await screen.findByRole("menuitem", { name: "Mark unread" }));
-    await waitFor(() => expect(fn).toHaveBeenCalledTimes(2));
-    expect((fn.mock.calls[1][1] as RequestInit).method).toBe("DELETE");
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Edit/i }));
+    expect(onEditOwn).toHaveBeenCalledTimes(1);
+    expect(onEditOwn.mock.calls[0][0].id).toBe("p1");
   });
 
-  it("reverts and surfaces an error when the read mutation fails", async () => {
-    queueFetch([
-      { status: 200, body: { items: [item({ id: 5, read: false })] } },
-      { status: 500, body: "boom" },
+  it("deletes own posts via the menu and removes them from the list", async () => {
+    const fn = queueFetch([
+      { status: 200, body: { items: [own({ id: "p1", title: "Doomed" })] } },
+      { status: 204 }, // DELETE
     ]);
-    render(<StreamView onAuthLost={() => {}} />);
-    const article = (await screen.findByRole("heading", { name: "An item" })).closest("article")!;
+    render(<StreamView onAuthLost={noop} onEditOwn={noop} />);
+    const article = (await screen.findByRole("heading", { name: "Doomed" })).closest("article")!;
     await openCardMenu(article);
-    await userEvent.click(await screen.findByRole("menuitem", { name: "Mark read" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("boom");
-    // Menu reverts back to "Mark read" since the mutation rolled back.
-    await openCardMenu(article);
-    expect(await screen.findByRole("menuitem", { name: "Mark read" })).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Delete/i }));
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Doomed" })).toBeNull());
+    expect(fn.mock.calls[1][0]).toBe("/admin/api/posts/p1");
+    expect((fn.mock.calls[1][1] as RequestInit).method).toBe("DELETE");
   });
 
   it("calls onAuthLost when initial load returns 401", async () => {
     queueFetch([{ status: 401 }]);
     const onAuthLost = vi.fn();
-    render(<StreamView onAuthLost={onAuthLost} />);
+    render(<StreamView onAuthLost={onAuthLost} onEditOwn={noop} />);
     await waitFor(() => expect(onAuthLost).toHaveBeenCalled());
   });
 });

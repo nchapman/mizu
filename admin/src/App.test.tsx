@@ -42,8 +42,8 @@ describe("App auth screens", () => {
   it("renders the Shell when authenticated", async () => {
     withMe(
       { configured: true, authenticated: true },
-      { status: 200, body: [] }, // /admin/api/posts initial load
-      { status: 200, body: [] }, // /admin/api/drafts (drawer count)
+      { status: 200, body: { items: [] } }, // /admin/api/stream initial load
+      { status: 200, body: [] },             // /admin/api/drafts (drawer count)
     );
     render(<App />);
     // The brand button anchors the new top bar.
@@ -72,9 +72,9 @@ describe("App route navigation", () => {
     };
     withMe(
       { configured: true, authenticated: true },
-      { status: 200, body: [] },          // posts
-      { status: 200, body: [draft] },     // initial drafts count
-      { status: 200, body: [draft] },     // drawer-open refetch
+      { status: 200, body: { items: [] } }, // /stream
+      { status: 200, body: [draft] },       // initial drafts count
+      { status: 200, body: [draft] },       // drawer-open refetch
     );
     render(<App />);
     await screen.findByRole("button", { name: "repeat" });
@@ -84,26 +84,12 @@ describe("App route navigation", () => {
     expect(await screen.findByRole("heading", { name: "Half-finished" })).toBeInTheDocument();
   });
 
-  it("loads the Timeline view from the overflow menu", async () => {
-    withMe(
-      { configured: true, authenticated: true },
-      { status: 200, body: [] },              // posts
-      { status: 200, body: [] },              // drafts (count)
-      { status: 200, body: { items: [] } },   // timeline
-    );
-    render(<App />);
-    await screen.findByRole("button", { name: "repeat" });
-    await openMenu();
-    await userEvent.click(await screen.findByRole("menuitem", { name: /Timeline/i }));
-    expect(await screen.findByText(/Nothing here yet/i)).toBeInTheDocument();
-  });
-
   it("loads the Subscriptions view from the overflow menu", async () => {
     withMe(
       { configured: true, authenticated: true },
-      { status: 200, body: [] },  // posts
-      { status: 200, body: [] },  // drafts (count)
-      { status: 200, body: [] },  // subs
+      { status: 200, body: { items: [] } }, // /stream
+      { status: 200, body: [] },             // drafts (count)
+      { status: 200, body: [] },             // subs
     );
     render(<App />);
     await screen.findByRole("button", { name: "repeat" });
@@ -115,8 +101,8 @@ describe("App route navigation", () => {
   it("loads the Settings placeholder from the overflow menu", async () => {
     withMe(
       { configured: true, authenticated: true },
-      { status: 200, body: [] }, // posts
-      { status: 200, body: [] }, // drafts (count)
+      { status: 200, body: { items: [] } }, // /stream
+      { status: 200, body: [] },             // drafts (count)
     );
     render(<App />);
     await screen.findByRole("button", { name: "repeat" });
@@ -132,7 +118,7 @@ describe("App Login", () => {
       { status: 200, body: { configured: true, authenticated: false } },
       { status: 204 },                                                       // POST /login
       { status: 200, body: { configured: true, authenticated: true } },     // re-load /me
-      { status: 200, body: [] },                                              // /posts
+      { status: 200, body: { items: [] } },                                   // /stream
       { status: 200, body: [] },                                              // /drafts (count)
     ]);
     render(<App />);
@@ -187,7 +173,7 @@ describe("App Setup", () => {
       { status: 200, body: { configured: false, authenticated: false } },
       { status: 204 }, // POST /setup
       { status: 200, body: { configured: true, authenticated: true } },
-      { status: 200, body: [] }, // /posts
+      { status: 200, body: { items: [] } }, // /stream
       { status: 200, body: [] }, // /drafts (count)
     ]);
     render(<App />);
@@ -205,18 +191,29 @@ describe("App home view", () => {
   it("posts a new note and refetches the list", async () => {
     const fn = withMe(
       { configured: true, authenticated: true },
-      { status: 200, body: [] },                                              // initial /posts
+      { status: 200, body: { items: [] } },                                   // initial /stream
       { status: 200, body: [] },                                              // initial /drafts (count)
       { status: 201, body: { id: "p1", body: "x", html: "<p>x</p>", date: "2026-05-09T00:00:00Z", path: "/p" } },
       // After submit, HomeView fires refreshDraftsCount synchronously and
-      // PostList re-fetches /posts on the refreshToken change. /drafts
-      // lands first because it's invoked inside the same event handler.
+      // bumps streamRefresh. /drafts lands first because it's invoked
+      // inside the same event handler; /stream re-fetches after commit.
       { status: 200, body: [] },                                              // post-submit /drafts refresh
       {
         status: 200,
-        body: [
-          { id: "p1", body: "hello world", html: "<p>hello world</p>", date: "2026-05-09T00:00:00Z", path: "/p" },
-        ],
+        body: {
+          items: [
+            {
+              kind: "own",
+              post: {
+                id: "p1",
+                body: "hello world",
+                html: "<p>hello world</p>",
+                date: "2026-05-09T00:00:00Z",
+                path: "/p",
+              },
+            },
+          ],
+        },
       },
     );
     render(<App />);
@@ -229,7 +226,7 @@ describe("App home view", () => {
     await userEvent.type(ta, "hello world");
     await userEvent.click(screen.getByRole("button", { name: "Post" }));
 
-    // The published post appears in the list.
+    // The published post appears in the stream.
     await waitFor(() =>
       expect(screen.getByText("hello world")).toBeInTheDocument(),
     );
@@ -248,7 +245,7 @@ describe("App home view", () => {
   it("logs out via Sign out and triggers a /me reload", async () => {
     const fn = withMe(
       { configured: true, authenticated: true },
-      { status: 200, body: [] },                                              // posts
+      { status: 200, body: { items: [] } },                                   // /stream
       { status: 200, body: [] },                                              // drafts (count)
       { status: 204 },                                                         // logout
       { status: 200, body: { configured: true, authenticated: false } },     // re-load

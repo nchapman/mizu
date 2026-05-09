@@ -1,29 +1,56 @@
 import { useState } from "react";
-import { ExternalLink, MoreHorizontal } from "lucide-react";
+import { ExternalLink, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { TimelineItem } from "@/api";
+import type { Post, StreamItem, TimelineItem } from "@/api";
 import { useAutoMarkRead } from "@/hooks/useAutoMarkRead";
 import { extractLead } from "@/lib/lead";
 import { relativeTime } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
 
-export type StreamItem = { kind: "feed"; item: TimelineItem };
-
-interface Props {
-  item: StreamItem;
+interface FeedHandlers {
   onMarkRead: (it: TimelineItem) => void;
   onMarkUnread: (it: TimelineItem) => void;
 }
 
-export function StreamCard({ item, onMarkRead, onMarkUnread }: Props) {
-  const feed = item.item;
+interface OwnHandlers {
+  onEditOwn: (p: Post) => void;
+  onDeleteOwn: (p: Post) => void;
+}
+
+type Props = { item: StreamItem } & FeedHandlers & OwnHandlers;
+
+export function StreamCard(props: Props) {
+  if (props.item.kind === "feed") {
+    return (
+      <FeedCard
+        item={props.item.item}
+        onMarkRead={props.onMarkRead}
+        onMarkUnread={props.onMarkUnread}
+      />
+    );
+  }
+  return (
+    <OwnCard
+      post={props.item.post}
+      onEditOwn={props.onEditOwn}
+      onDeleteOwn={props.onDeleteOwn}
+    />
+  );
+}
+
+function FeedCard({
+  item: feed,
+  onMarkRead,
+  onMarkUnread,
+}: { item: TimelineItem } & FeedHandlers) {
   const [expanded, setExpanded] = useState(false);
   const { leadHTML, hasMore } = expanded
     ? { leadHTML: feed.content ?? "", hasMore: false }
@@ -100,6 +127,90 @@ export function StreamCard({ item, onMarkRead, onMarkUnread }: Props) {
           dangerouslySetInnerHTML={{ __html: leadHTML }}
         />
       )}
+
+      {hasMore && !expanded && (
+        <button
+          type="button"
+          onClick={() => setExpanded(true)}
+          className="mt-1 text-xs font-medium text-foreground/70 hover:text-foreground hover:underline"
+        >
+          Read more
+        </button>
+      )}
+    </article>
+  );
+}
+
+function OwnCard({
+  post,
+  onEditOwn,
+  onDeleteOwn,
+}: { post: Post } & OwnHandlers) {
+  const [expanded, setExpanded] = useState(false);
+  const { leadHTML, hasMore } = expanded
+    ? { leadHTML: post.html, hasMore: false }
+    : extractLead(post.html);
+
+  return (
+    <article className="border-b border-border bg-accent/20 px-1 py-4">
+      <header className="mb-2 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+        <div className="min-w-0 truncate">
+          <span className="font-medium text-foreground/80">You</span>
+          {post.date && <span> · {relativeTime(post.date)}</span>}
+        </div>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 text-muted-foreground"
+              aria-label="More"
+            >
+              <MoreHorizontal />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onSelect={() => onEditOwn(post)}>
+              <Pencil />
+              Edit
+            </DropdownMenuItem>
+            {post.path && (
+              <DropdownMenuItem asChild>
+                <a href={post.path} target="_blank" rel="noopener noreferrer">
+                  <ExternalLink />
+                  View on site
+                </a>
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onSelect={() => onDeleteOwn(post)}
+              className="text-destructive focus:text-destructive"
+            >
+              <Trash2 />
+              Delete
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </header>
+
+      {post.title && (
+        <h2 className="mb-1 text-base font-semibold leading-snug">
+          <a
+            href={post.path}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-foreground hover:underline"
+          >
+            {post.title}
+          </a>
+        </h2>
+      )}
+
+      <div
+        className="post-rendered text-sm"
+        dangerouslySetInnerHTML={{ __html: leadHTML }}
+      />
 
       {hasMore && !expanded && (
         <button

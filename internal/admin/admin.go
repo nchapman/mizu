@@ -70,6 +70,7 @@ func (s *Server) Routes(r chi.Router) {
 			r.Delete("/subscriptions", s.removeSubscription)
 
 			r.Get("/timeline", s.timeline)
+			r.Get("/stream", s.stream)
 			r.Post("/items/{id}/read", s.markItemRead)
 			r.Delete("/items/{id}/read", s.markItemUnread)
 

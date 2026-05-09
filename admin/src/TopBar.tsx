@@ -1,4 +1,4 @@
-import { LogOut, MoreHorizontal, Newspaper, Rss, Settings as SettingsIcon } from "lucide-react";
+import { LogOut, MoreHorizontal, Rss, Settings as SettingsIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -34,12 +34,6 @@ export function TopBar({ onNavigate, onLogout }: Props) {
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-48">
-            {/* Timeline lives here during the migration; step 5 folds it */}
-            {/* into the unified stream on the home route. */}
-            <DropdownMenuItem onSelect={() => onNavigate("timeline")}>
-              <Newspaper />
-              Timeline
-            </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => onNavigate("subscriptions")}>
               <Rss />
               Subscriptions

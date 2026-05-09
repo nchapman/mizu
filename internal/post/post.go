@@ -213,6 +213,29 @@ func (s *Store) Recent(limit int) []*Post {
 	return out
 }
 
+// Before returns up to limit posts strictly older than `t`, in the same
+// reverse-chronological order as Recent. Pass the zero time to start from
+// the newest post (equivalent to Recent for the first page). Used by the
+// unified stream handler to paginate own posts alongside feed items.
+func (s *Store) Before(t time.Time, limit int) []*Post {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 {
+		return nil
+	}
+	out := make([]*Post, 0, limit)
+	for _, p := range s.order {
+		if !t.IsZero() && !p.Date.Before(t) {
+			continue
+		}
+		out = append(out, p)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
 func (s *Store) ByID(id string) (*Post, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
