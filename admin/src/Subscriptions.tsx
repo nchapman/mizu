@@ -9,6 +9,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { EmptyState } from "@/components/EmptyState";
 import { api, Subscription, Unauthorized } from "@/api";
 import { relativeTime } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
@@ -140,9 +141,11 @@ export function SubscriptionsView({ onAuthLost }: { onAuthLost: () => void }) {
       </form>
 
       {!loaded ? null : list.length === 0 ? (
-        <p className="py-12 text-center text-sm text-muted-foreground">
-          No subscriptions yet.
-        </p>
+        <EmptyState
+          icon={Rss}
+          title="No subscriptions yet"
+          description="Paste a feed URL above to start following a site. New posts will land in your stream."
+        />
       ) : (
         <ul className="divide-y divide-border">
           {list.map((s) => (

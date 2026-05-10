@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
+import { CheckCircle2, Inbox, PenLine } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { EmptyState } from "@/components/EmptyState";
 import { StreamCard } from "@/StreamCard";
 import {
   api,
@@ -128,11 +130,7 @@ export function StreamView({ onAuthLost, onEditOwn, onReply, refreshToken = 0, o
         </div>
       )}
 
-      {items.length === 0 && !loading && (
-        <p className="py-8 text-center text-sm text-muted-foreground">
-          Nothing here yet. Subscribe to a feed or compose a post to see it here.
-        </p>
-      )}
+      {items.length === 0 && !loading && <StreamEmpty filter={filter} />}
 
       {items.length === 0 && loading && (
         <div className="space-y-4 py-2">
@@ -162,6 +160,34 @@ export function StreamView({ onAuthLost, onEditOwn, onReply, refreshToken = 0, o
         </div>
       )}
     </div>
+  );
+}
+
+function StreamEmpty({ filter }: { filter: Filter }) {
+  if (filter === "unread") {
+    return (
+      <EmptyState
+        icon={CheckCircle2}
+        title="Inbox zero"
+        description="No unread items in the stream right now. Switch to All to revisit what you've read."
+      />
+    );
+  }
+  if (filter === "yours") {
+    return (
+      <EmptyState
+        icon={PenLine}
+        title="No posts yet"
+        description="Anything you publish will show up here alongside the feeds you follow."
+      />
+    );
+  }
+  return (
+    <EmptyState
+      icon={Inbox}
+      title="Your stream is empty"
+      description="Subscribe to a feed or publish your first post to start filling this up."
+    />
   );
 }
 

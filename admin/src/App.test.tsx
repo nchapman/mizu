@@ -95,7 +95,7 @@ describe("App route navigation", () => {
     await screen.findByRole("button", { name: "repeat" });
     await openMenu();
     await userEvent.click(await screen.findByRole("menuitem", { name: /Subscriptions/i }));
-    expect(await screen.findByText(/No subscriptions yet\./i)).toBeInTheDocument();
+    expect(await screen.findByText(/No subscriptions yet/i)).toBeInTheDocument();
   });
 
   it("loads the Settings placeholder from the overflow menu", async () => {

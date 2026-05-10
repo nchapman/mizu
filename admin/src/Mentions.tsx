@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AtSign, ExternalLink } from "lucide-react";
 
+import { EmptyState } from "@/components/EmptyState";
 import { listMentions, Mention, Unauthorized } from "@/api";
 import { relativeTime } from "@/lib/relativeTime";
 
@@ -46,9 +47,11 @@ export function MentionsView({ onAuthLost }: { onAuthLost: () => void }) {
       )}
 
       {!loaded ? null : list.length === 0 ? (
-        <p className="py-12 text-center text-sm text-muted-foreground">
-          No mentions yet.
-        </p>
+        <EmptyState
+          icon={AtSign}
+          title="No mentions yet"
+          description="When other sites link to one of your posts, the verified mention will appear here."
+        />
       ) : (
         <ul className="divide-y divide-border">
           {list.map((m) => (

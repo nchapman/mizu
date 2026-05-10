@@ -62,7 +62,7 @@ describe("StreamView", () => {
   it("renders an empty state when the stream has no items", async () => {
     queueFetch([{ status: 200, body: { items: [] } }]);
     render(<StreamView onAuthLost={noop} onEditOwn={noop} onReply={noop} />);
-    expect(await screen.findByText(/Nothing here yet/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Your stream is empty/i)).toBeInTheDocument();
   });
 
   it("renders a feed card with byline, title, and lead paragraph", async () => {

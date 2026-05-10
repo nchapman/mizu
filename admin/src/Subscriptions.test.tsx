@@ -23,7 +23,7 @@ describe("SubscriptionsView", () => {
   it("renders an empty-state message when there are no subscriptions", async () => {
     queueFetch([{ status: 200, body: [] }]);
     render(<SubscriptionsView onAuthLost={() => {}} />);
-    expect(await screen.findByText(/No subscriptions yet\./i)).toBeInTheDocument();
+    expect(await screen.findByText(/No subscriptions yet/i)).toBeInTheDocument();
   });
 
   it("lists subscriptions with title, feed URL, and category", async () => {
@@ -43,7 +43,7 @@ describe("SubscriptionsView", () => {
   it("optional title/category/site URL inputs are hidden until disclosed", async () => {
     queueFetch([{ status: 200, body: [] }]);
     render(<SubscriptionsView onAuthLost={() => {}} />);
-    await screen.findByText(/No subscriptions yet\./);
+    await screen.findByText(/No subscriptions yet/);
     expect(screen.queryByPlaceholderText(/Title \(optional\)/i)).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Add title, category, or site URL/i }));
     expect(screen.getByPlaceholderText(/Title \(optional\)/i)).toBeInTheDocument();
@@ -56,7 +56,7 @@ describe("SubscriptionsView", () => {
       { status: 200, body: [sub({ id: 7, url: "https://b.test/feed", title: "B" })] },
     ]);
     render(<SubscriptionsView onAuthLost={() => {}} />);
-    await screen.findByText(/No subscriptions yet\./);
+    await screen.findByText(/No subscriptions yet/);
 
     await userEvent.type(screen.getByPlaceholderText(/Feed URL/i), "https://b.test/feed");
     await userEvent.click(screen.getByRole("button", { name: "Subscribe" }));
@@ -73,7 +73,7 @@ describe("SubscriptionsView", () => {
   it("does not submit when URL is blank", async () => {
     const fn = queueFetch([{ status: 200, body: [] }]);
     render(<SubscriptionsView onAuthLost={() => {}} />);
-    await screen.findByText(/No subscriptions yet\./);
+    await screen.findByText(/No subscriptions yet/);
     const btn = screen.getByRole("button", { name: "Subscribe" });
     expect(btn).toBeDisabled();
     expect(fn).toHaveBeenCalledTimes(1);
@@ -85,7 +85,7 @@ describe("SubscriptionsView", () => {
       { status: 400, body: "invalid feed url" },
     ]);
     render(<SubscriptionsView onAuthLost={() => {}} />);
-    await screen.findByText(/No subscriptions yet\./);
+    await screen.findByText(/No subscriptions yet/);
     await userEvent.type(screen.getByPlaceholderText(/Feed URL/i), "bogus");
     await userEvent.click(screen.getByRole("button", { name: "Subscribe" }));
     expect(await screen.findByText("invalid feed url")).toBeInTheDocument();
@@ -101,7 +101,7 @@ describe("SubscriptionsView", () => {
     await screen.findByText("Alpha Feed");
     await userEvent.click(screen.getByRole("button", { name: /Manage/i }));
     await userEvent.click(await screen.findByRole("menuitem", { name: /Unsubscribe/i }));
-    await waitFor(() => expect(screen.getByText(/No subscriptions yet\./)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/No subscriptions yet/)).toBeInTheDocument());
     expect(fn.mock.calls[1][0]).toBe("/admin/api/subscriptions?url=https%3A%2F%2Fa.test%2Ffeed");
     expect((fn.mock.calls[1][1] as RequestInit).method).toBe("DELETE");
   });

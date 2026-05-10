@@ -29,7 +29,7 @@ describe("MentionsView", () => {
   it("renders an empty-state when there are no mentions", async () => {
     queueFetch([{ status: 200, body: [] }]);
     render(<MentionsView onAuthLost={() => {}} />);
-    expect(await screen.findByText(/No mentions yet\./i)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /No mentions yet/i })).toBeInTheDocument();
   });
 
   it("renders the actor, the post title, and the source URL", async () => {
