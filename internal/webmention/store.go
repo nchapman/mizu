@@ -163,6 +163,19 @@ func (s *Store) Recent(ctx context.Context, limit int) ([]Mention, error) {
 	return out, rows.Err()
 }
 
+// CountPending returns the number of (source, target) pairs in the
+// pending state. Used to bound queue depth at the receive endpoint
+// so a flood of novel pairs can't grow the mentions table or the
+// verifier backlog without limit.
+func (s *Store) CountPending(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM mentions WHERE status = ?`,
+		string(StatusPending),
+	).Scan(&n)
+	return n, err
+}
+
 // PendingPair is a (source, target) row that's waiting for verification.
 type PendingPair struct {
 	Source string

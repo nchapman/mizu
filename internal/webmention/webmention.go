@@ -59,6 +59,19 @@ var ErrBadTarget = errors.New("target is not on this site")
 // which would let an attacker amplify their own content through us.
 var ErrSameSource = errors.New("source and target must differ")
 
+// ErrQueueFull is returned when the pending mention table has hit
+// MaxPendingMentions. The caller should respond with 503; legitimate
+// senders will retry per spec.
+var ErrQueueFull = errors.New("webmention queue is full")
+
+// MaxPendingMentions caps the number of pending (source, target) rows
+// the receiver will accept before rejecting new ones. Without it a
+// hostile sender (or an outage of the verifier) could grow the
+// mentions table and verifier backlog without bound. The cap is
+// generous enough that legitimate bursts (a popular post being
+// linked widely) sail through.
+const MaxPendingMentions = 1000
+
 // Receive validates a (source, target) pair and queues it for
 // verification. Returns synchronously; verification runs in the
 // background worker.
@@ -79,6 +92,18 @@ func (s *Service) Receive(ctx context.Context, source, target string) error {
 	}
 	if !s.targetOnSite(target) {
 		return ErrBadTarget
+	}
+
+	// Cap pending depth before any write so a flood of novel pairs
+	// can't grow the table or the verifier backlog. The (source,
+	// target) UNIQUE constraint already dedupes resends, so this only
+	// gates net-new pairs.
+	pending, err := s.store.CountPending(ctx)
+	if err != nil {
+		return fmt.Errorf("count pending: %w", err)
+	}
+	if pending >= MaxPendingMentions {
+		return ErrQueueFull
 	}
 
 	m := Mention{

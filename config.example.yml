@@ -6,6 +6,26 @@ site:
 
 server:
   addr: ":8080"
+  # tls:
+  #   enabled: true
+  #   domains: [mizu.fyi]
+  #   email: ops@mizu.fyi
+  #   addr: ":443"
+  #   http_addr: ":80"
+  #   staging: false
+  # ^ Optional. When enabled, mizu obtains certificates from
+  # Let's Encrypt automatically (via CertMagic), serves HTTPS on `addr`,
+  # and runs an HTTP listener on `http_addr` that solves ACME
+  # challenges and redirects everything else to HTTPS. Set staging:
+  # true to test against the LE staging endpoint (issues untrusted
+  # certs but has friendlier rate limits) before going live.
+  #
+  # Heads-up: when TLS is on, mizu emits HSTS with includeSubdomains
+  # for one year. If you ever serve a sibling subdomain over plain
+  # HTTP after a visitor hits this site, their browser will refuse to
+  # reach it for the rest of that year. Either keep every subdomain
+  # on HTTPS or take HSTS off the table by leaving TLS handled by a
+  # different process.
 
 paths:
   content: ./content
@@ -14,6 +34,11 @@ paths:
   state: ./state
   templates: ./templates
   subscriptions: ./subscriptions.opml
+  # certs: ./state/certs
+  # ^ Where CertMagic stores issued certificates and ACME account
+  # keys. Defaults to <state>/certs. Treat this as durable: deleting
+  # it forces re-issuance, which counts against Let's Encrypt's
+  # production rate limits (5 issuances per domain per week).
   # admin_dist: ./admin/dist
   # ^ Optional. Override the embedded admin SPA with a directory on
   # disk. Useful during development (live-edit without rebuilding the
@@ -23,3 +48,25 @@ paths:
 poller:
   interval: 1h
   user_agent: mizu/0.1 (+https://github.com/nchapman/mizu)
+
+# Defense-in-depth knobs. The defaults are safe for a single-user
+# appliance facing the open internet; tune only if you hit a wall.
+limits:
+  read_header_timeout: 10s   # cuts off slow-header (slowloris) clients
+  read_timeout: 30s          # whole-request read budget
+  write_timeout: 60s         # whole-response write budget
+  idle_timeout: 120s         # keep-alive idle close
+  max_header_bytes: 1048576  # 1 MiB
+
+  body:
+    login: 1024              # 1 KiB
+    setup: 1024
+    post: 262144             # 256 KiB; covers any reasonable markdown body
+    webmention: 4096
+
+  rate:
+    # Per-IP request budgets. requests counts allowed within `per`.
+    login:      { requests: 10,  per: 1m }
+    setup:      { requests: 5,   per: 1h }
+    webmention: { requests: 30,  per: 1m }
+    global:     { requests: 600, per: 1m }   # safety-net cap on every request

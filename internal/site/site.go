@@ -21,6 +21,7 @@ import (
 
 	"github.com/nchapman/mizu/internal/config"
 	"github.com/nchapman/mizu/internal/post"
+	mizuserver "github.com/nchapman/mizu/internal/server"
 	"github.com/nchapman/mizu/internal/webmention"
 )
 
@@ -75,7 +76,7 @@ func (s *Server) Routes(r chi.Router) {
 	r.Get("/sitemap.xml", s.sitemap)
 	r.Get("/notes/{id}", s.note)
 	r.Get("/{year:[0-9]{4}}/{month:[0-9]{2}}/{day:[0-9]{2}}/{slug}", s.article)
-	r.Post("/webmention", s.webmention)
+	r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Webmention)).Post("/webmention", s.webmention)
 }
 
 // webmention is the receive endpoint. Per spec: accept form-encoded
@@ -83,11 +84,16 @@ func (s *Server) Routes(r chi.Router) {
 // async. We synchronously validate the target is on this site so
 // off-site noise is rejected at the door.
 func (s *Server) webmention(w http.ResponseWriter, r *http.Request) {
-	// Source + target are short URLs. 4 KiB is well above any
-	// legitimate request and stops a hostile sender from forcing us
-	// to buffer megabytes of form body.
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	// Source + target are short URLs. The configured cap (a few KiB by
+	// default) is well above any legitimate request and stops a hostile
+	// sender from forcing us to buffer megabytes of form body.
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.Limits.Body.Webmention)
 	if err := r.ParseForm(); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -100,6 +106,10 @@ func (s *Server) webmention(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, webmention.ErrSameSource):
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	case errors.Is(err, webmention.ErrQueueFull):
+		w.Header().Set("Retry-After", "300")
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	case err != nil:
 		http.Error(w, err.Error(), http.StatusBadRequest)

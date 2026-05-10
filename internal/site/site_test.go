@@ -75,6 +75,7 @@ func newSite(t *testing.T) (*Server, http.Handler, *post.Store, *webmention.Serv
 		},
 		Paths: config.Paths{Templates: tplDir},
 	}
+	cfg.ApplyDefaults()
 	srv, err := New(cfg, posts, wm, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -236,6 +237,44 @@ func TestSite_WebmentionMissingFields(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != 400 {
 		t.Errorf("missing fields code=%d, want 400", w.Code)
+	}
+}
+
+func TestSite_WebmentionOversizeBodyRejected(t *testing.T) {
+	srv, r, _, _ := newSite(t)
+	cap := srv.cfg.Limits.Body.Webmention
+	pad := strings.Repeat("a", int(cap)+1)
+	form := url.Values{"source": {"https://other/x"}, "target": {"https://example.test/x"}, "pad": {pad}}
+	req := httptest.NewRequest("POST", "/webmention", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("code=%d, want 413", w.Code)
+	}
+}
+
+func TestSite_WebmentionRateLimit(t *testing.T) {
+	srv, r, posts, _ := newSite(t)
+	p, _ := posts.Create("M", "body", nil)
+	target := "https://example.test" + p.Path()
+	form := url.Values{"source": {"https://other/x"}, "target": {target}}.Encode()
+	limit := srv.cfg.Limits.Rate.Webmention.Requests
+	for i := 0; i < limit; i++ {
+		req := httptest.NewRequest("POST", "/webmention", strings.NewReader(form))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("hit 429 too early at request %d", i)
+		}
+	}
+	req := httptest.NewRequest("POST", "/webmention", strings.NewReader(form))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("code=%d, want 429 after %d", w.Code, limit)
 	}
 }
 

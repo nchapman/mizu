@@ -20,6 +20,7 @@ import (
 	"github.com/nchapman/mizu/internal/feeds"
 	"github.com/nchapman/mizu/internal/media"
 	"github.com/nchapman/mizu/internal/post"
+	mizuserver "github.com/nchapman/mizu/internal/server"
 	"github.com/nchapman/mizu/internal/site"
 	"github.com/nchapman/mizu/internal/webmention"
 )
@@ -109,8 +110,19 @@ func main() {
 	adminSrv := admin.New(ctx, cfg, posts, feedSvc, poller, authSvc, mediaStore, wmSvc, adminDistFS())
 
 	r := chi.NewRouter()
+	// Deliberately NOT using middleware.RealIP. mizu binds the public
+	// listener directly and there is no trusted reverse proxy, so any
+	// X-Forwarded-For header is attacker-controlled and would let a
+	// caller spoof the client IP — completely defeating the per-IP
+	// rate limit. Trust r.RemoteAddr instead. Restore RealIP only when
+	// you put mizu behind a proxy whose XFF you trust.
+	r.Use(middleware.RequestID)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
+	r.Use(middleware.Compress(5))
+	r.Use(mizuserver.SecureHeaders(cfg.Server.TLS))
+	r.Use(mizuserver.RateLimit(cfg.Limits.Rate.Global))
+
 	r.Route("/admin", adminSrv.Routes)
 	mediaFS := http.StripPrefix("/media/", http.FileServer(http.Dir(cfg.Paths.Media)))
 	r.Handle("/media/*", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -122,19 +134,50 @@ func main() {
 	}))
 	siteSrv.Routes(r)
 
-	srv := &http.Server{Addr: cfg.Server.Addr, Handler: r}
-	go func() {
-		log.Printf("mizu listening on %s", cfg.Server.Addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal(err)
+	srv := &http.Server{
+		Handler:           r,
+		ReadHeaderTimeout: cfg.Limits.ReadHeaderTimeout,
+		ReadTimeout:       cfg.Limits.ReadTimeout,
+		WriteTimeout:      cfg.Limits.WriteTimeout,
+		IdleTimeout:       cfg.Limits.IdleTimeout,
+		MaxHeaderBytes:    cfg.Limits.MaxHeaderBytes,
+	}
+
+	var tlsRunner *mizuserver.TLSRunner
+	if cfg.Server.TLS.Enabled {
+		tlsRunner, err = mizuserver.StartTLS(ctx, srv, cfg, &bg)
+		if err != nil {
+			log.Fatalf("tls: %v", err)
 		}
-	}()
+	} else {
+		srv.Addr = cfg.Server.Addr
+		bg.Add(1)
+		go func() {
+			defer bg.Done()
+			log.Printf("mizu listening on %s", cfg.Server.Addr)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("http server: %v", err)
+			}
+		}()
+	}
 
 	<-ctx.Done()
 	log.Print("shutting down")
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()
-	_ = srv.Shutdown(shutCtx)
+	// Drain both servers concurrently so each gets the full deadline
+	// rather than whatever's left after the other finishes draining.
+	var shutWG sync.WaitGroup
+	shutWG.Add(2)
+	go func() {
+		defer shutWG.Done()
+		_ = srv.Shutdown(shutCtx)
+	}()
+	go func() {
+		defer shutWG.Done()
+		tlsRunner.Shutdown(shutCtx)
+	}()
+	shutWG.Wait()
 	bg.Wait()
 	_ = feedStore.Close()
 	_ = wmStore.Close()

@@ -94,6 +94,65 @@ paths:
 	if c.Paths.Subscriptions != "./subscriptions.opml" {
 		t.Errorf("default subscriptions=%q", c.Paths.Subscriptions)
 	}
+	if c.Paths.Certs != filepath.Join(dir, "state", "certs") {
+		t.Errorf("default certs=%q", c.Paths.Certs)
+	}
+	if c.Server.TLS.Addr != ":443" || c.Server.TLS.HTTPAddr != ":80" {
+		t.Errorf("default tls addrs: %q / %q", c.Server.TLS.Addr, c.Server.TLS.HTTPAddr)
+	}
+	if c.Limits.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("default read_header_timeout=%v", c.Limits.ReadHeaderTimeout)
+	}
+	if c.Limits.Body.Login != 1<<10 || c.Limits.Body.Webmention != 4<<10 {
+		t.Errorf("default body limits: login=%d webmention=%d", c.Limits.Body.Login, c.Limits.Body.Webmention)
+	}
+	if c.Limits.Rate.Login.Requests != 10 || c.Limits.Rate.Login.Per != time.Minute {
+		t.Errorf("default login rate: %+v", c.Limits.Rate.Login)
+	}
+}
+
+func TestLoad_TLSValidation(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	base := `
+paths:
+  content: ` + filepath.Join(dir, "content") + `
+  media: ` + filepath.Join(dir, "media") + `
+  cache: ` + filepath.Join(dir, "cache") + `
+  state: ` + filepath.Join(dir, "state") + `
+`
+	// Enabled but missing domains and email.
+	writeFile(t, cfgPath, base+`
+server:
+  tls:
+    enabled: true
+`)
+	if _, err := Load(cfgPath); err == nil {
+		t.Fatal("expected validation error for tls.enabled without domains/email")
+	}
+
+	// Domains set but email missing.
+	writeFile(t, cfgPath, base+`
+server:
+  tls:
+    enabled: true
+    domains: [example.com]
+`)
+	if _, err := Load(cfgPath); err == nil {
+		t.Fatal("expected validation error for tls.enabled without email")
+	}
+
+	// Both set: ok.
+	writeFile(t, cfgPath, base+`
+server:
+  tls:
+    enabled: true
+    domains: [example.com]
+    email: ops@example.com
+`)
+	if _, err := Load(cfgPath); err != nil {
+		t.Fatalf("expected ok, got %v", err)
+	}
 }
 
 func TestLoad_MissingFile(t *testing.T) {

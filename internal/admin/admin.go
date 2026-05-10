@@ -23,6 +23,7 @@ import (
 	"github.com/nchapman/mizu/internal/feeds"
 	"github.com/nchapman/mizu/internal/media"
 	"github.com/nchapman/mizu/internal/post"
+	mizuserver "github.com/nchapman/mizu/internal/server"
 	"github.com/nchapman/mizu/internal/webmention"
 )
 
@@ -45,10 +46,12 @@ func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *
 func (s *Server) Routes(r chi.Router) {
 	r.Route("/api", func(r chi.Router) {
 		// Public endpoints — used by the SPA before login to decide
-		// whether to render setup, login, or the app shell.
+		// whether to render setup, login, or the app shell. Rate-limited
+		// per IP so an attacker can't brute-force the password or
+		// the one-time setup token.
 		r.Get("/me", s.me)
-		r.Post("/setup", s.setup)
-		r.Post("/login", s.login)
+		r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Setup)).Post("/setup", s.setup)
+		r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Login)).Post("/login", s.login)
 		r.Post("/logout", s.logout)
 
 		// Everything else requires a valid session.
@@ -102,8 +105,7 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 		Token    string `json:"token"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Setup, &in) {
 		return
 	}
 	err := s.auth.SetPassword(in.Password, in.Token)
@@ -129,7 +131,7 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	auth.SetCookie(w, token)
+	auth.SetCookie(w, token, s.cfg.Server.TLS.Enabled)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -141,11 +143,20 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Login, &in) {
 		return
 	}
-	if !s.auth.Verify(in.Password) {
+	ok, lockedUntil := s.auth.LoginAttempt(in.Password)
+	if !ok {
+		if !lockedUntil.IsZero() {
+			retry := int(time.Until(lockedUntil).Seconds())
+			if retry < 1 {
+				retry = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(retry))
+			http.Error(w, "too many failed attempts; try again later", http.StatusTooManyRequests)
+			return
+		}
 		http.Error(w, "invalid password", http.StatusUnauthorized)
 		return
 	}
@@ -154,7 +165,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	auth.SetCookie(w, token)
+	auth.SetCookie(w, token, s.cfg.Server.TLS.Enabled)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -162,7 +173,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(auth.CookieName); err == nil {
 		s.auth.DestroySession(c.Value)
 	}
-	auth.ClearCookie(w)
+	auth.ClearCookie(w, s.cfg.Server.TLS.Enabled)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -217,8 +228,7 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 		Body  string   `json:"body"`
 		Tags  []string `json:"tags"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Post, &in) {
 		return
 	}
 	if strings.TrimSpace(in.Body) == "" {
@@ -268,8 +278,7 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 		Body  string   `json:"body"`
 		Tags  []string `json:"tags"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Post, &in) {
 		return
 	}
 	if strings.TrimSpace(in.Body) == "" {
@@ -345,8 +354,7 @@ func (s *Server) createDraft(w http.ResponseWriter, r *http.Request) {
 		Body  string   `json:"body"`
 		Tags  []string `json:"tags"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Post, &in) {
 		return
 	}
 	d, err := s.posts.CreateDraft(in.Title, in.Body, in.Tags)
@@ -370,8 +378,7 @@ func (s *Server) updateDraft(w http.ResponseWriter, r *http.Request) {
 		Body  string   `json:"body"`
 		Tags  []string `json:"tags"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Post, &in) {
 		return
 	}
 	d, err := s.posts.UpdateDraft(id, in.Title, in.Body, in.Tags)
@@ -491,8 +498,10 @@ func (s *Server) addSubscription(w http.ResponseWriter, r *http.Request) {
 		SiteURL  string `json:"site_url"`
 		Category string `json:"category"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
+	// Subscriptions are URLs + a short title; reuse the login cap as a
+	// generic small-payload bound rather than threading a fifth body
+	// limit through config.
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Login, &in) {
 		return
 	}
 	f, err := s.feeds.Subscribe(r.Context(), in.URL, in.Title, in.SiteURL, in.Category)
@@ -779,6 +788,24 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// decodeJSON reads up to n bytes from r.Body and decodes them into
+// dst. Oversize bodies become 413; malformed JSON becomes 400. The
+// caller checks the bool and returns immediately on false. Centralizing
+// the limit + decode keeps every endpoint consistent.
+func decodeJSON(w http.ResponseWriter, r *http.Request, n int64, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, n)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return false
+		}
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return false
+	}
+	return true
 }
 
 const placeholderHTML = `<!doctype html>

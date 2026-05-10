@@ -106,6 +106,7 @@ func newHarness(t *testing.T) *harness {
 		Site:  config.Site{Title: "Test", BaseURL: "https://example.test"},
 		Paths: config.Paths{},
 	}
+	cfg.ApplyDefaults()
 	dist := fstest.MapFS{
 		"index.html":    &fstest.MapFile{Data: []byte(fixtureIndexHTML)},
 		"assets/app.js": &fstest.MapFile{Data: []byte("console.log('hi')")},
@@ -253,6 +254,57 @@ func TestLogin_HappyPath(t *testing.T) {
 	}
 	if len(w.Result().Cookies()) == 0 {
 		t.Error("login did not set cookie")
+	}
+}
+
+func TestLogin_OversizeBodyRejected(t *testing.T) {
+	h := newHarness(t)
+	h.login(t)
+	// Structurally valid JSON whose total size blows past the cap, so
+	// the decoder hits MaxBytesReader rather than failing on the first
+	// stray byte.
+	pad := strings.Repeat("a", int(h.cfg.Limits.Body.Login)+1)
+	big := `{"password":"` + pad + `"}`
+	w := h.do(t, "POST", "/admin/api/login", big, nil)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("code=%d, want 413", w.Code)
+	}
+}
+
+func TestLogin_RateLimit(t *testing.T) {
+	h := newHarness(t)
+	h.login(t)
+	// Use the correct password so each call succeeds; we want to
+	// observe the per-IP rate limit independently of the auth-layer
+	// lockout (which also returns 429 but for failed-attempt reasons).
+	limit := h.cfg.Limits.Rate.Login.Requests
+	for i := 0; i < limit; i++ {
+		w := h.do(t, "POST", "/admin/api/login", map[string]string{"password": "hunter22pw"}, nil)
+		if w.Code == http.StatusTooManyRequests {
+			t.Fatalf("hit 429 too early at request %d", i)
+		}
+	}
+	w := h.do(t, "POST", "/admin/api/login", map[string]string{"password": "hunter22pw"}, nil)
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("code=%d, want 429 after %d requests", w.Code, limit)
+	}
+}
+
+func TestLogin_LockoutAfterFailures(t *testing.T) {
+	h := newHarness(t)
+	h.login(t)
+	// Five wrong-password attempts trip the auth-layer lockout.
+	const max = 5
+	for i := 0; i < max; i++ {
+		h.do(t, "POST", "/admin/api/login", map[string]string{"password": "wrong"}, nil)
+	}
+	// Even the correct password is rejected while locked.
+	w := h.do(t, "POST", "/admin/api/login", map[string]string{"password": "hunter22pw"}, nil)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d, want 429 (locked)", w.Code)
+	}
+	if w.Result().Header.Get("Retry-After") == "" {
+		t.Error("missing Retry-After header on lockout")
 	}
 }
 

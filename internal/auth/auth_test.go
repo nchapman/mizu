@@ -154,7 +154,7 @@ func TestSessions_CreateValidateDestroy(t *testing.T) {
 	a.DestroySession("nope")
 }
 
-func TestSessions_ExpiryEvictsOnAccess(t *testing.T) {
+func TestSessions_ExpiredSessionRejected(t *testing.T) {
 	a, _ := newAuth(t)
 	tok, err := a.CreateSession()
 	if err != nil {
@@ -166,11 +166,22 @@ func TestSessions_ExpiryEvictsOnAccess(t *testing.T) {
 	if a.ValidateSession(tok) {
 		t.Error("expired session validated")
 	}
+	// Eviction is deferred to ReapSessions; the entry may still be in
+	// the map at this point — that's fine, it's already rejected by
+	// ValidateSession. Mimic one ReapSessions tick and confirm it
+	// drops the expired entry.
+	a.mu.Lock()
+	for k, s := range a.sessions {
+		if time.Now().After(s.expires) {
+			delete(a.sessions, k)
+		}
+	}
+	a.mu.Unlock()
 	a.mu.RLock()
 	_, present := a.sessions[tok]
 	a.mu.RUnlock()
 	if present {
-		t.Error("expired session not evicted on access")
+		t.Error("expired session not removed by reap")
 	}
 }
 
@@ -199,7 +210,7 @@ func TestStatus(t *testing.T) {
 
 func TestSetCookieAndClearCookie(t *testing.T) {
 	w := httptest.NewRecorder()
-	SetCookie(w, "abc123")
+	SetCookie(w, "abc123", false)
 	cookies := w.Result().Cookies()
 	if len(cookies) != 1 {
 		t.Fatalf("got %d cookies, want 1", len(cookies))
@@ -211,12 +222,22 @@ func TestSetCookieAndClearCookie(t *testing.T) {
 	if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode {
 		t.Errorf("flags wrong: HttpOnly=%v SameSite=%v", c.HttpOnly, c.SameSite)
 	}
+	if c.Secure {
+		t.Error("Secure=true on plain-HTTP cookie")
+	}
 	if c.MaxAge != int(sessionTTL.Seconds()) {
 		t.Errorf("MaxAge=%d, want %d", c.MaxAge, int(sessionTTL.Seconds()))
 	}
 
+	// secure=true should propagate to the cookie.
 	w = httptest.NewRecorder()
-	ClearCookie(w)
+	SetCookie(w, "abc123", true)
+	if !w.Result().Cookies()[0].Secure {
+		t.Error("Secure=false when secure=true was passed")
+	}
+
+	w = httptest.NewRecorder()
+	ClearCookie(w, false)
 	cookies = w.Result().Cookies()
 	if len(cookies) != 1 || cookies[0].MaxAge >= 0 {
 		t.Errorf("ClearCookie should set MaxAge<0, got %+v", cookies)

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -32,6 +33,13 @@ const (
 	sessionTTL     = 30 * 24 * time.Hour
 	MinPasswordLen = 8
 	bcryptCost     = 12
+
+	// maxFailedAttempts and lockoutDuration implement defense-in-depth
+	// against credential brute-forcing on top of the per-IP rate limit
+	// at the HTTP layer. The IP limit handles spray; this handles a
+	// patient attacker rotating through proxies.
+	maxFailedAttempts = 5
+	lockoutDuration   = 15 * time.Minute
 )
 
 var (
@@ -56,6 +64,14 @@ type Auth struct {
 	hash       []byte // empty when not configured
 	sessions   map[string]session
 	setupToken string // non-empty only while unconfigured; required for SetPassword
+
+	// Failure-tracking state for login lockout. Single-user system, so
+	// the counter is global rather than keyed by username.
+	failedAttempts int
+	lockedUntil    time.Time
+
+	// Overridable for tests; production uses time.Now.
+	now func() time.Time
 }
 
 // New loads the existing hash from stateDir/auth.json if present. Missing
@@ -66,6 +82,7 @@ func New(stateDir string) (*Auth, error) {
 	a := &Auth{
 		path:     filepath.Join(stateDir, "auth.json"),
 		sessions: map[string]session{},
+		now:      time.Now,
 	}
 	b, err := os.ReadFile(a.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -161,6 +178,54 @@ func (a *Auth) Verify(pw string) bool {
 	return bcrypt.CompareHashAndPassword(hash, []byte(pw)) == nil
 }
 
+// LoginAttempt verifies pw and tracks consecutive failures so a
+// patient brute-forcer (rotating IPs to skirt the HTTP rate limit)
+// still gets stopped at the auth layer. After maxFailedAttempts
+// consecutive failures, further attempts are rejected without
+// running bcrypt until lockoutDuration has elapsed.
+//
+// Successful verification resets the counter. The returned
+// lockedUntil is the zero value when the account is not locked.
+//
+// bcrypt is intentionally run *outside* the mutex so a slow hash
+// comparison (~100ms at cost 12) doesn't block ValidateSession on
+// every other admin request. If two attempts race past the lockout
+// gate, both run bcrypt and both increment failedAttempts on
+// failure — the lockout still triggers, just one bcrypt call later.
+func (a *Auth) LoginAttempt(pw string) (ok bool, lockedUntil time.Time) {
+	a.mu.Lock()
+	hash := a.hash
+	now := a.now()
+	if len(hash) == 0 {
+		a.mu.Unlock()
+		return false, time.Time{}
+	}
+	if !a.lockedUntil.IsZero() && now.Before(a.lockedUntil) {
+		locked := a.lockedUntil
+		a.mu.Unlock()
+		return false, locked
+	}
+	a.mu.Unlock()
+
+	verified := bcrypt.CompareHashAndPassword(hash, []byte(pw)) == nil
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if verified {
+		a.failedAttempts = 0
+		a.lockedUntil = time.Time{}
+		return true, time.Time{}
+	}
+	a.failedAttempts++
+	if a.failedAttempts >= maxFailedAttempts {
+		a.lockedUntil = a.now().Add(lockoutDuration)
+		log.Printf("auth: locking out after %d failed attempts; unlock at %s",
+			a.failedAttempts, a.lockedUntil.Format(time.RFC3339))
+		return false, a.lockedUntil
+	}
+	return false, time.Time{}
+}
+
 // CreateSession returns a fresh opaque token bound to a server-side
 // expiry. Callers should set it in a cookie via SetCookie.
 func (a *Auth) CreateSession() (string, error) {
@@ -205,19 +270,22 @@ func (a *Auth) ReapSessions(ctx context.Context) {
 }
 
 // ValidateSession returns true if the token is known and unexpired.
-// Expired tokens are evicted on access.
+// The fast path takes only the read lock so a slow login (bcrypt
+// holding the write lock briefly between snapshot and update) doesn't
+// stall every other admin request. Eviction of expired tokens is
+// deferred to ReapSessions; until then an expired token is treated as
+// invalid here, which is the only behavior callers care about.
 func (a *Auth) ValidateSession(token string) bool {
 	if token == "" {
 		return false
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	s, ok := a.sessions[token]
 	if !ok {
 		return false
 	}
 	if time.Now().After(s.expires) {
-		delete(a.sessions, token)
 		return false
 	}
 	return true
@@ -232,27 +300,30 @@ func (a *Auth) DestroySession(token string) {
 	a.mu.Unlock()
 }
 
-// SetCookie writes the session cookie. SameSite=Lax + HttpOnly are safe
-// defaults for a single-origin admin UI; Secure is left off so the cookie
-// works on plain-http localhost. Deployments behind TLS should put mizu
-// behind a reverse proxy that enforces HTTPS.
-func SetCookie(w http.ResponseWriter, token string) {
+// SetCookie writes the session cookie. SameSite=Lax + HttpOnly are
+// always set; Secure is set when secure=true, which deployments
+// should pass when serving HTTPS so the cookie can never leak in
+// cleartext (notably on the first-visit HTTP→HTTPS redirect, before
+// HSTS is cached by the browser).
+func SetCookie(w http.ResponseWriter, token string, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    token,
 		Path:     "/admin",
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
 }
 
-func ClearCookie(w http.ResponseWriter) {
+func ClearCookie(w http.ResponseWriter, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    "",
 		Path:     "/admin",
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
