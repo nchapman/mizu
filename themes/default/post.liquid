@@ -1,6 +1,6 @@
-<article>
+<article class="single">
   <time datetime="{{ post.Date | iso8601 | escape }}">{{ post.Date | date: "%b %-d, %Y"}}</time>
-  {% if post.Title %}<h2>{{ post.Title | escape }}</h2>{% endif %}
+  {% if post.Title != "" %}<h2>{{ post.Title | escape }}</h2>{% endif %}
   <div class="body">{{ post.HTML }}</div>
 </article>
 {% if mentions %}
