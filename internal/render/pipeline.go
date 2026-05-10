@@ -21,6 +21,32 @@ import (
 // safe. Use Run to start the background worker that drains Enqueue
 // requests; Build is exposed for synchronous use in tests and for the
 // admin "rebuild now" path.
+//
+// Caching invariant — read this before adding any cache to render/:
+//
+//	A cache's key MUST be a hash of every input the cached value
+//	depends on. No closures over un-keyed state. If the value's
+//	compute function captures something, that something is part of
+//	the key — full stop. Violating this rule is what caused the
+//	stale-cachebuster bug; templateSet.resolver is now a settable
+//	field per build rather than a parse-time closure so the rule
+//	holds structurally rather than by patch.
+//
+// The render layer carries three caches at three different layers of
+// the compute graph, each obeying the rule above:
+//
+//   - mdCache (in-mem, cross-build memo): post ID + body hash → rendered
+//     markdown HTML. Memoizes goldmark renders so the same post body
+//     isn't re-converted when only an unrelated post changed. The body
+//     hash IS the complete input fingerprint.
+//   - tplCache (in-mem, cross-build memo): hash of the three .liquid
+//     files → parsed templateSet. Per-build asset resolver is bound
+//     after parse via templateSet.resolver, not captured in the closure,
+//     so the cache key only hashes the file bytes.
+//   - HashState (on-disk ledger, state/build.json): output path →
+//     {output bytes hash, stage-defined input hash}. Skip-write when
+//     output bytes are already on disk; skip-stage when stage-declared
+//     inputs are unchanged (currently used by ImageVariantStage).
 type Pipeline struct {
 	sources   *SnapshotSources
 	stages    []Stage
@@ -33,17 +59,7 @@ type Pipeline struct {
 	mu      sync.Mutex // serializes Build calls; one builder at a time
 	pending chan struct{}
 
-	// mdCache memoizes goldmark renders across builds keyed by post
-	// ID + body hash. With this in place a "edit one post" rebuild
-	// runs goldmark exactly once instead of once per post — at 500
-	// posts that's the difference between ~500 ms of markdown work
-	// and a few ms of body hashing.
-	mdCache map[string]mdCacheEntry
-
-	// tplCache memoizes parsed Liquid templates across builds keyed
-	// by the concatenated hash of the three theme template files.
-	// Theme parsing isn't a bottleneck at 1× per build but it's
-	// pointless redundant work when the theme hasn't changed.
+	mdCache  map[string]mdCacheEntry
 	tplCache *tplCacheEntry
 
 	// LastBuild and LastError are populated after each build for the
@@ -340,38 +356,36 @@ func (p *Pipeline) fillCaches(snap *Snapshot) error {
 		}
 	}
 
-	// Templates. Hash the three template file bytes AND the asset
-	// manifest; if both match the prior build's, reuse the parse.
-	//
-	// The asset manifest is load-bearing for correctness: loadTemplates
-	// registers an `asset_url` Liquid filter whose closure captures
-	// snap.Assets at parse time. If we reused the parsed templateSet
-	// across an asset change, every HTML page would embed the previous
-	// build's ?v=<hash> cachebusters and operators would silently
-	// serve stale CSS until they edited a .liquid file.
-	tplKey, err := templateCacheKey(snap.Theme.FS, snap.Assets)
+	// Templates. Cache key is just the hash of the three template file
+	// bytes — the templateSet's identity is a pure function of those
+	// bytes. Per-build inputs like the asset hash table are wired in via
+	// the templateSet's resolver field below, not captured at parse time,
+	// so the cache key never has to chase what loadTemplates closed over.
+	tplKey, err := templateCacheKey(snap.Theme.FS)
 	if err != nil {
 		return fmt.Errorf("hash theme templates: %w", err)
 	}
 	if p.tplCache != nil && p.tplCache.hash == tplKey {
 		snap.Templates = p.tplCache.set
 	} else {
-		set, err := loadTemplates(snap.Theme.FS, themeAssetURL(snap))
+		set, err := loadTemplates(snap.Theme.FS)
 		if err != nil {
 			return fmt.Errorf("load templates: %w", err)
 		}
 		snap.Templates = set
 		p.tplCache = &tplCacheEntry{hash: tplKey, set: set}
 	}
+	// Bind the per-build asset resolver. Safe to mutate because Build
+	// holds p.mu and stages within a build run sequentially.
+	snap.Templates.resolver = themeAssetURL(snap)
 	return nil
 }
 
-// templateCacheKey returns a hash that changes whenever any input
-// to a parsed templateSet changes — the three template file bytes
-// and the asset manifest (name + content hash). The asset manifest
-// is included because loadTemplates' `asset_url` filter captures
-// the asset hash table at parse time.
-func templateCacheKey(themeFS fs.FS, assets map[string]AssetEntry) (string, error) {
+// templateCacheKey returns a hash of the three template file bytes.
+// The parsed templateSet is a pure function of those bytes; the
+// per-build asset resolver is bound on the returned set after parsing
+// (see fillCaches), so nothing else needs to enter this key.
+func templateCacheKey(themeFS fs.FS) (string, error) {
 	h := sha256.New()
 	for _, name := range []string{"base.liquid", "index.liquid", "post.liquid"} {
 		body, err := fs.ReadFile(themeFS, name)
@@ -381,20 +395,6 @@ func templateCacheKey(themeFS fs.FS, assets map[string]AssetEntry) (string, erro
 		h.Write([]byte(name))
 		h.Write([]byte{0})
 		h.Write(body)
-		h.Write([]byte{0})
-	}
-	// Sort asset names so the digest is stable across map-iteration
-	// orderings.
-	names := make([]string, 0, len(assets))
-	for name := range assets {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	h.Write([]byte("\x00assets\x00"))
-	for _, name := range names {
-		h.Write([]byte(name))
-		h.Write([]byte{0})
-		h.Write([]byte(assets[name].Hash))
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

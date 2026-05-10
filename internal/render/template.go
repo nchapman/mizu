@@ -13,18 +13,23 @@ import (
 
 // templateSet bundles a parsed Liquid template per page name plus the
 // shared environment that resolves partials against the active theme's
-// FS. One templateSet is created per pipeline build; theme reloads
-// recreate it.
+// FS. The asset URL resolver is a per-build *field*, not a parse-time
+// closure: callers reassign ts.resolver before each render pass. This
+// keeps the templateSet's identity a pure function of the .liquid file
+// bytes, so the template cache key only has to hash those files —
+// nothing else can leak in via an unkeyed closure.
 type templateSet struct {
-	pages map[string]*liquid.Template
-	env   *liquid.Environment
+	pages    map[string]*liquid.Template
+	env      *liquid.Environment
+	resolver func(string) string // mutable; consulted by the asset_url filter
 }
 
-// loadTemplates parses base/index/post from the layered theme FS.
-// AssetURL is the resolved URL for an asset path (closure over the
-// theme's hashed asset map) — passed in rather than computed inline so
-// the templateSet has no knowledge of how the hash is produced.
-func loadTemplates(themeFS fs.FS, assetURL func(string) string) (*templateSet, error) {
+// loadTemplates parses base/index/post from the layered theme FS. The
+// returned set has no resolver wired up; callers must assign
+// set.resolver before rendering (otherwise asset_url falls back to an
+// unhashed /assets/<name> path).
+func loadTemplates(themeFS fs.FS) (*templateSet, error) {
+	ts := &templateSet{}
 	env := liquid.NewEnvironment()
 	env.RegisterFilter("host_of", func(input any, _ ...any) any {
 		s, _ := input.(string)
@@ -35,10 +40,10 @@ func loadTemplates(themeFS fs.FS, assetURL func(string) string) (*templateSet, e
 		if !ok {
 			return ""
 		}
-		if assetURL == nil {
+		if ts.resolver == nil {
 			return "/assets/" + strings.TrimPrefix(s, "/")
 		}
-		return assetURL(s)
+		return ts.resolver(s)
 	})
 	env.RegisterFilter("iso8601", func(input any, _ ...any) any {
 		if t, ok := input.(time.Time); ok {
@@ -68,7 +73,9 @@ func loadTemplates(themeFS fs.FS, assetURL func(string) string) (*templateSet, e
 		}
 		pages[name] = t.WithName(name)
 	}
-	return &templateSet{pages: pages, env: env}, nil
+	ts.pages = pages
+	ts.env = env
+	return ts, nil
 }
 
 // renderPage executes the named page template and composes the result
