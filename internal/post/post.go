@@ -55,20 +55,24 @@ func (p *Post) RenderHTML() (string, error) {
 	return renderMarkdown(p.Body)
 }
 
-// renderMarkdown converts a post body to HTML using goldmark's default
-// configuration. The default explicitly does NOT enable raw HTML
-// passthrough (`html.WithUnsafe`), so `<script>`, `<iframe>`, and
-// inline event handlers in the body are dropped rather than emitted.
+// defaultMD is the shared goldmark instance every RenderHTML call goes
+// through. Constructing a new goldmark.Markdown for each render
+// allocates the parser and renderer rule set from scratch — a
+// non-trivial cost when the public-site pipeline renders hundreds of
+// posts per build. goldmark.Markdown.Convert is documented as
+// concurrent-safe (v1.5+; we're on v1.7+), so the package-level
+// instance is safe to share.
 //
-// The output is consumed via `dangerouslySetInnerHTML` in the admin
-// SPA and via `template.HTML` on the public site — both bypass HTML
-// escaping. Do NOT pass `html.WithUnsafe()` here, or add other raw-HTML
-// renderers, without also adding a bluemonday sanitization pass on the
-// way out. There is a regression test asserting `<script>` does not
-// survive this function; keep it green.
+// Do NOT pass `html.WithUnsafe()` or other raw-HTML renderers without
+// also adding a bluemonday sanitization pass on the way out — the
+// output is consumed via `dangerouslySetInnerHTML` and `template.HTML`,
+// both of which bypass escaping. The default goldmark config drops
+// raw HTML; there's a regression test pinning that.
+var defaultMD = goldmark.New()
+
 func renderMarkdown(body string) (string, error) {
 	var buf bytes.Buffer
-	if err := goldmark.New().Convert([]byte(body), &buf); err != nil {
+	if err := defaultMD.Convert([]byte(body), &buf); err != nil {
 		return "", err
 	}
 	return buf.String(), nil

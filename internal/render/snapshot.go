@@ -20,9 +20,18 @@ import (
 // MediaFile is a single original under media/orig that the
 // ImageVariantStage will derive a display variant from.
 type MediaFile struct {
-	Name string // basename, e.g. "2026-05-08-ab12cd34.png"
-	Path string // absolute path on disk
-	Size int64
+	Name    string // basename, e.g. "2026-05-08-ab12cd34.png"
+	Path    string // absolute path on disk
+	Size    int64
+	ModTime int64 // unix seconds; combined with Size to fingerprint the source
+}
+
+// AssetEntry holds the bytes and content hash of a theme asset.
+// hashThemeAssets reads each file once and stages reuse both the bytes
+// and the hash without re-reading.
+type AssetEntry struct {
+	Body []byte
+	Hash string // first 8 hex chars of sha256
 }
 
 // MentionView is the post-page-friendly shape of a verified mention.
@@ -45,11 +54,11 @@ type Snapshot struct {
 	Media     []MediaFile
 	DraftSalt []byte
 
-	// AssetHashes maps a path under the active theme's assets/ subtree
-	// to its 8-char content hash. Built once per snapshot so every
-	// stage that resolves asset_url (post pages, index, drafts) and
-	// ThemeAssetStage itself share the same precomputed table.
-	AssetHashes map[string]string
+	// Assets maps a path under the active theme's assets/ subtree to
+	// its bytes + 8-char content hash. The walk reads each file once;
+	// ThemeAssetStage reuses the bytes for emit, the HTML stages use
+	// the hash for `asset_url` cachebusting via themeAssetURL().
+	Assets map[string]AssetEntry
 
 	// Templates is the parsed Liquid template set for the active
 	// theme. Compiled once per snapshot so the three HTML stages
@@ -60,6 +69,18 @@ type Snapshot struct {
 	// ThemeData is the {name, version, settings} view templates see
 	// as `theme`. Built once so the HTML stages share one map.
 	ThemeData map[string]any
+
+	// PostHTML is the goldmark-rendered HTML for each post, keyed by
+	// post.ID. Pre-rendered once per snapshot so PostPageStage,
+	// IndexStage, and FeedStage don't each re-run goldmark on the
+	// same post body.
+	PostHTML map[string]string
+
+	// PrevInputs is the previous build's stage-defined input
+	// fingerprints, keyed by output path. Stages that can be
+	// expensive (e.g. ImageVariantStage's decode/resize) consult
+	// this to skip work entirely when the source hasn't changed.
+	PrevInputs map[string]string
 }
 
 // SnapshotSources holds the live sources a Pipeline reads to build a
@@ -136,21 +157,32 @@ func (s *SnapshotSources) Build(ctx context.Context) (*Snapshot, error) {
 
 	baseURL := strings.TrimRight(cfg.Site.BaseURL, "/")
 
-	assetHashes, err := hashThemeAssets(activeTheme.FS)
+	assets, err := walkThemeAssets(activeTheme.FS)
 	if err != nil {
-		return nil, fmt.Errorf("hash theme assets: %w", err)
+		return nil, fmt.Errorf("walk theme assets: %w", err)
+	}
+
+	posts := s.Posts.Recent(0)
+	postHTML := make(map[string]string, len(posts))
+	for _, p := range posts {
+		html, err := p.RenderHTML()
+		if err != nil {
+			return nil, fmt.Errorf("render markdown %s: %w", p.ID, err)
+		}
+		postHTML[p.ID] = html
 	}
 
 	snap := &Snapshot{
-		Site:        cfg.Site,
-		BaseURL:     baseURL,
-		Theme:       activeTheme,
-		Posts:       s.Posts.Recent(0),
-		Drafts:      s.Posts.ListDrafts(),
-		Mentions:    mentions,
-		Media:       media,
-		DraftSalt:   s.DraftSalt,
-		AssetHashes: assetHashes,
+		Site:      cfg.Site,
+		BaseURL:   baseURL,
+		Theme:     activeTheme,
+		Posts:     posts,
+		Drafts:    s.Posts.ListDrafts(),
+		Mentions:  mentions,
+		Media:     media,
+		DraftSalt: s.DraftSalt,
+		Assets:    assets,
+		PostHTML:  postHTML,
 		ThemeData: map[string]any{
 			"name":     activeTheme.Name,
 			"version":  activeTheme.Version,
@@ -165,15 +197,17 @@ func (s *SnapshotSources) Build(ctx context.Context) (*Snapshot, error) {
 	return snap, nil
 }
 
-// hashThemeAssets walks the active theme's assets/ subtree and returns
-// a path → 8-char content hash map. Called once per snapshot so every
-// stage that resolves asset_url sees the same table.
-func hashThemeAssets(themeFS fs.FS) (map[string]string, error) {
+// walkThemeAssets reads every asset under the active theme's assets/
+// subtree once and returns a path → AssetEntry map. Both the bytes
+// and the content hash are cached on the snapshot so ThemeAssetStage
+// can emit without re-reading and the HTML stages can resolve
+// asset_url() without recomputing.
+func walkThemeAssets(themeFS fs.FS) (map[string]AssetEntry, error) {
 	sub, err := fs.Sub(themeFS, "assets")
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]string{}
+	out := map[string]AssetEntry{}
 	err = fs.WalkDir(sub, ".", func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -186,7 +220,7 @@ func hashThemeAssets(themeFS fs.FS) (map[string]string, error) {
 			return err
 		}
 		sum := sha256.Sum256(body)
-		out[p] = hex.EncodeToString(sum[:])[:8]
+		out[p] = AssetEntry{Body: body, Hash: hex.EncodeToString(sum[:])[:8]}
 		return nil
 	})
 	if err != nil {
@@ -226,9 +260,10 @@ func listMedia(origDir string) ([]MediaFile, error) {
 			continue
 		}
 		out = append(out, MediaFile{
-			Name: name,
-			Path: filepath.Join(origDir, name),
-			Size: info.Size(),
+			Name:    name,
+			Path:    filepath.Join(origDir, name),
+			Size:    info.Size(),
+			ModTime: info.ModTime().Unix(),
 		})
 	}
 	return out, nil

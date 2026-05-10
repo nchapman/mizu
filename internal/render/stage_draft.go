@@ -54,6 +54,8 @@ func (s DraftStage) Build(_ context.Context, snap *Snapshot) ([]Output, error) {
 }
 
 func (DraftStage) renderOne(tpl *templateSet, themeData map[string]any, snap *Snapshot, d *post.Draft) ([]byte, error) {
+	// Drafts aren't in Snapshot.PostHTML (different ID space), but they
+	// still benefit from the shared goldmark instance via RenderHTML.
 	html, err := d.RenderHTML()
 	if err != nil {
 		return nil, fmt.Errorf("render draft markdown %s: %w", d.ID, err)

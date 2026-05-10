@@ -39,6 +39,18 @@ func (s ImageVariantStage) Build(_ context.Context, snap *Snapshot) ([]Output, e
 	out := make([]Output, 0, len(snap.Media))
 	var firstErr error
 	for _, m := range snap.Media {
+		// Short-circuit when nothing about the source has changed
+		// since the previous build. Image decode + CatmullRom resize
+		// are by far the most expensive things this pipeline does
+		// (tens to hundreds of ms per image); skipping them when no
+		// edit happened pays for the entire input-fingerprint
+		// machinery on its own.
+		fingerprint := mediaFingerprint(m)
+		path := "media/" + displayName(m)
+		if prev, ok := snap.PrevInputs[path]; ok && prev == fingerprint {
+			out = append(out, Output{Path: path, InputHash: fingerprint})
+			continue
+		}
 		body, name, err := s.makeVariant(m)
 		if err != nil {
 			if firstErr == nil {
@@ -46,9 +58,35 @@ func (s ImageVariantStage) Build(_ context.Context, snap *Snapshot) ([]Output, e
 			}
 			continue
 		}
-		out = append(out, Output{Path: "media/" + name, Body: body})
+		out = append(out, Output{Path: "media/" + name, Body: body, InputHash: fingerprint})
 	}
 	return out, firstErr
+}
+
+// mediaFingerprint is the per-source input hash. mtime+size is enough
+// to detect any edit short of an explicit overwrite-with-mtime-preserved,
+// which doesn't happen in practice for media originals (uploads always
+// generate a fresh filename; manual replacement inevitably changes
+// either the size or the mtime).
+func mediaFingerprint(m MediaFile) string {
+	return fmt.Sprintf("%d_%d", m.ModTime, m.Size)
+}
+
+// displayName predicts the output filename without re-decoding. Mirrors
+// the (orig-ext → display-ext) logic in makeVariant: WebP transcodes to
+// JPEG; everything else keeps its source extension.
+func displayName(m MediaFile) string {
+	base := strings.TrimSuffix(m.Name, filepath.Ext(m.Name))
+	switch strings.ToLower(filepath.Ext(m.Name)) {
+	case ".png":
+		return base + ".png"
+	case ".gif":
+		return base + ".gif"
+	case ".webp":
+		return base + ".jpg"
+	default: // .jpg, .jpeg, anything else
+		return base + ".jpg"
+	}
 }
 
 func (ImageVariantStage) makeVariant(m MediaFile) (body []byte, displayName string, err error) {

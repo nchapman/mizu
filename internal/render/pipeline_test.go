@@ -1,12 +1,17 @@
 package render
 
 import (
+	"bytes"
 	"context"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/nchapman/mizu/internal/config"
 	"github.com/nchapman/mizu/internal/post"
@@ -332,6 +337,157 @@ func TestPipeline_ThemeFSReloadsEveryBuild(t *testing.T) {
 	idx, _ = os.ReadFile(filepath.Join(publicDir, "index.html"))
 	if !strings.Contains(string(idx), "themed-marker-banner") {
 		t.Errorf("theme edit not reflected after rebuild: %s", idx)
+	}
+}
+
+func TestPipeline_PostHTMLPrerenderedOnce(t *testing.T) {
+	// snap.PostHTML must be populated and used by the HTML stages —
+	// each post body should hit goldmark exactly once per build,
+	// regardless of how many stages reference it.
+	p, posts, _ := newTestPipeline(t)
+	posts.Create("Hello", "body **bold**", nil)
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Indirect assertion: confirm the snapshot fixture is actually
+	// being consumed by examining the rendered HTML — bold survives
+	// goldmark, so its presence proves the prerender ran. Direct
+	// counting would require touching internals; this is the
+	// behavior we care about.
+	snap, err := p.sources.Build(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	posts.Reload()
+	all := posts.Recent(0)
+	if len(all) != 1 {
+		t.Fatalf("expected 1 post, got %d", len(all))
+	}
+	if got, ok := snap.PostHTML[all[0].ID]; !ok || !strings.Contains(got, "<strong>bold</strong>") {
+		t.Errorf("PostHTML[%s]=%q (ok=%v); want pre-rendered HTML containing <strong>bold</strong>", all[0].ID, got, ok)
+	}
+}
+
+func TestPipeline_ImageVariantSkipsDecodeWhenSourceUnchanged(t *testing.T) {
+	// After the first build records an input fingerprint for an
+	// image, a second build must NOT rewrite the output (mtime
+	// preserved) and must keep the same on-disk variant. Touching
+	// the source file with a fresh mtime forces a re-render.
+	tmp := t.TempDir()
+	contentDir := filepath.Join(tmp, "content")
+	if err := os.MkdirAll(filepath.Join(contentDir, "posts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mediaDir := filepath.Join(tmp, "media", "orig")
+	if err := os.MkdirAll(mediaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Real PNG bytes via image/png.Encode — a hand-rolled header here
+	// would silently diverge from the production sniff path, and an
+	// invalid IDAT chunk would fail decode in the stage.
+	img := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 4; x++ {
+			img.Set(x, y, color.RGBA{255, 0, 0, 255})
+		}
+	}
+	var pngBuf bytes.Buffer
+	if err := png.Encode(&pngBuf, img); err != nil {
+		t.Fatal(err)
+	}
+	imgPath := filepath.Join(mediaDir, "img.png")
+	if err := os.WriteFile(imgPath, pngBuf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	posts, err := post.NewStore(contentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	if _, err := theme.Load("default", fakeThemeFS(), nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Site: config.Site{Title: "Test", BaseURL: "https://example.test"}}
+	cfg.ApplyDefaults()
+	publicDir := filepath.Join(tmp, "public")
+	p, err := NewPipeline(Options{
+		Sources: &SnapshotSources{
+			BootCfg:   cfg,
+			ThemesFS:  fakeThemeFS(),
+			Posts:     posts,
+			MediaDir:  filepath.Join(tmp, "media"),
+			DraftSalt: []byte("salt-salt-salt-salt-salt-salt-aa"),
+		},
+		PublicDir: publicDir,
+		HashPath:  filepath.Join(tmp, "build.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	variant := filepath.Join(publicDir, "media", "img.png")
+	st1, err := os.Stat(variant)
+	if err != nil {
+		t.Fatalf("variant not produced: %v", err)
+	}
+
+	// Second build with no source change — variant must not be rewritten.
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	st2, err := os.Stat(variant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st1.ModTime().Equal(st2.ModTime()) {
+		t.Errorf("variant was rewritten with no source change: %v -> %v", st1.ModTime(), st2.ModTime())
+	}
+
+	// Replace the image with different content (blue) and bump the
+	// mtime. The new render must produce different bytes than the
+	// red original, forcing the write.
+	img2 := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 4; x++ {
+			img2.Set(x, y, color.RGBA{0, 0, 255, 255})
+		}
+	}
+	var pngBuf2 bytes.Buffer
+	if err := png.Encode(&pngBuf2, img2); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(imgPath, pngBuf2.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	future := st1.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(imgPath, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	st3, err := os.Stat(variant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st3.ModTime().Equal(st2.ModTime()) {
+		t.Errorf("variant was NOT rewritten after source content change")
+	}
+	// And the on-disk variant must now reflect the new (blue) source.
+	got, err := os.ReadFile(variant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := png.Decode(bytes.NewReader(got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, g, b, _ := decoded.At(0, 0).RGBA()
+	if r > 0x4000 || g > 0x4000 || b < 0xa000 {
+		t.Errorf("variant pixel = (%x, %x, %x), expected mostly blue", r>>8, g>>8, b>>8)
 	}
 }
 

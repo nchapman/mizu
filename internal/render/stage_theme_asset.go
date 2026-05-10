@@ -2,8 +2,6 @@ package render
 
 import (
 	"context"
-	"fmt"
-	"io/fs"
 	"sort"
 	"strings"
 )
@@ -23,27 +21,21 @@ type ThemeAssetStage struct{}
 func (ThemeAssetStage) Name() string { return "theme_asset" }
 
 func (ThemeAssetStage) Build(_ context.Context, snap *Snapshot) ([]Output, error) {
-	sub, err := fs.Sub(snap.Theme.FS, "assets")
-	if err != nil {
-		return nil, fmt.Errorf("theme assets sub: %w", err)
-	}
 	resolve := themeAssetURL(snap)
 
-	// Iterate the snapshot's precomputed hash table so every stage
-	// (this one + the HTML stages that resolve asset_url) sees the
-	// same file set.
-	files := make([]string, 0, len(snap.AssetHashes))
-	for name := range snap.AssetHashes {
+	// Iterate the snapshot's precomputed table so every stage (this
+	// one + the HTML stages that resolve asset_url) sees the same
+	// file set. Bytes were read once during snapshot build; reuse
+	// them rather than re-opening the FS.
+	files := make([]string, 0, len(snap.Assets))
+	for name := range snap.Assets {
 		files = append(files, name)
 	}
 	sort.Strings(files)
 
 	out := make([]Output, 0, len(files))
 	for _, name := range files {
-		body, err := fs.ReadFile(sub, name)
-		if err != nil {
-			return out, fmt.Errorf("read asset %s: %w", name, err)
-		}
+		body := snap.Assets[name].Body
 		if strings.HasSuffix(name, ".css") {
 			body = rewriteCSS(body, resolve)
 		}

@@ -47,9 +47,17 @@ func (s PostPageStage) Build(_ context.Context, snap *Snapshot) ([]Output, error
 }
 
 func (PostPageStage) renderOne(tpl *templateSet, themeData map[string]any, snap *Snapshot, p *post.Post) ([]byte, error) {
-	html, err := p.RenderHTML()
-	if err != nil {
-		return nil, fmt.Errorf("render markdown for %s: %w", p.ID, err)
+	// Markdown is pre-rendered into snap.PostHTML at snapshot build
+	// time so the same post body isn't re-converted in PostPageStage,
+	// IndexStage, and FeedStage. Falling back to RenderHTML keeps
+	// the stage usable in tests that build a Snapshot by hand.
+	html, ok := snap.PostHTML[p.ID]
+	if !ok {
+		var err error
+		html, err = p.RenderHTML()
+		if err != nil {
+			return nil, fmt.Errorf("render markdown for %s: %w", p.ID, err)
+		}
 	}
 	target := snap.BaseURL + p.Path()
 	mentions := snap.Mentions[target]
@@ -88,16 +96,16 @@ func postOutputPath(p *post.Post) string {
 
 // themeAssetURL returns the closure templates use to resolve
 // `{{ "style.css" | asset_url }}` to the content-addressed URL. Reads
-// from snap.AssetHashes — populated once per snapshot so this is a
-// pure map lookup.
+// from snap.Assets — populated once per snapshot so this is a pure
+// map lookup.
 func themeAssetURL(snap *Snapshot) func(string) string {
 	return func(path string) string {
 		clean := strings.TrimPrefix(path, "/")
 		if clean == "" {
 			return "/assets/"
 		}
-		if v, ok := snap.AssetHashes[clean]; ok && v != "" {
-			return "/assets/" + clean + "?v=" + v
+		if entry, ok := snap.Assets[clean]; ok && entry.Hash != "" {
+			return "/assets/" + clean + "?v=" + entry.Hash
 		}
 		return "/assets/" + clean
 	}

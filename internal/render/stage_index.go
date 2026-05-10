@@ -53,9 +53,13 @@ func (IndexStage) renderPage(tpl *templateSet, themeData map[string]any, snap *S
 
 	rendered := make([]renderedPost, len(slice))
 	for i, p := range slice {
-		html, err := p.RenderHTML()
-		if err != nil {
-			return nil, fmt.Errorf("render %s: %w", p.ID, err)
+		html, ok := snap.PostHTML[p.ID]
+		if !ok {
+			var err error
+			html, err = p.RenderHTML()
+			if err != nil {
+				return nil, fmt.Errorf("render %s: %w", p.ID, err)
+			}
 		}
 		rendered[i] = renderedPost{Post: p, HTML: html}
 	}

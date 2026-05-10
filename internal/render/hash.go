@@ -12,18 +12,22 @@ import (
 )
 
 // HashState is the persisted index of last-written-output content
-// hashes. Loading it on startup lets a clean restart skip every file
-// whose intended bytes match what's already on disk.
+// hashes plus the stage-defined input fingerprints used by stages
+// that can skip expensive renders entirely. Loading it on startup
+// lets a clean restart skip every file whose intended bytes match
+// what's already on disk and lets stages like ImageVariantStage
+// avoid decoding sources that haven't changed.
 type HashState struct {
 	path    string
 	Hashes  map[string]string `json:"hashes"`
+	Inputs  map[string]string `json:"inputs,omitempty"`
 	Version int               `json:"version"`
 }
 
 // loadHashState reads state/build.json. A missing file is not an error;
 // it just yields an empty state, which forces a full first build.
 func loadHashState(path string) (*HashState, error) {
-	s := &HashState{path: path, Hashes: map[string]string{}, Version: 1}
+	s := &HashState{path: path, Hashes: map[string]string{}, Inputs: map[string]string{}, Version: 1}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -38,10 +42,14 @@ func loadHashState(path string) (*HashState, error) {
 		// Corrupt hash file means the next build rewrites everything;
 		// log and recover rather than refusing to run.
 		s.Hashes = map[string]string{}
+		s.Inputs = map[string]string{}
 		return s, nil
 	}
 	if s.Hashes == nil {
 		s.Hashes = map[string]string{}
+	}
+	if s.Inputs == nil {
+		s.Inputs = map[string]string{}
 	}
 	s.path = path
 	return s, nil
@@ -51,23 +59,11 @@ func (s *HashState) save() error {
 	if s.path == "" {
 		return nil
 	}
-	// Sort keys so the file is stable across builds — easier diffs.
-	type entry struct {
-		K, V string
-	}
-	entries := make([]entry, 0, len(s.Hashes))
-	for k, v := range s.Hashes {
-		entries = append(entries, entry{k, v})
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].K < entries[j].K })
-	sorted := make(map[string]string, len(entries))
-	for _, e := range entries {
-		sorted[e.K] = e.V
-	}
 	b, err := json.MarshalIndent(struct {
 		Version int               `json:"version"`
 		Hashes  map[string]string `json:"hashes"`
-	}{s.Version, sorted}, "", "  ")
+		Inputs  map[string]string `json:"inputs,omitempty"`
+	}{s.Version, sortMap(s.Hashes), sortMap(s.Inputs)}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -83,4 +79,24 @@ func (s *HashState) save() error {
 func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// sortMap returns a copy of m with keys iterated in sorted order. JSON
+// marshaling of map[string]string is stable in Go, but we route through
+// a sorted intermediate so the file diffs cleanly across builds even
+// if the upstream behavior ever changes.
+func sortMap(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return m
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string]string, len(m))
+	for _, k := range keys {
+		out[k] = m[k]
+	}
+	return out
 }

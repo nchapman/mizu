@@ -10,9 +10,18 @@ import (
 
 // Output is a single file the pipeline will emit under PublicDir.
 // Path is forward-slash, relative to PublicDir (no leading slash).
+//
+// A stage that wants to skip an expensive render (e.g. image
+// decode/resize) can set Body to nil and InputHash to a fingerprint of
+// the inputs. The pipeline will leave the existing on-disk file
+// untouched if the previous build's InputHash for this Path matches —
+// effectively a "stage knows nothing changed, don't bother me."
+// If the file is missing or no previous record exists, the stage's
+// claim is treated as a stage error (logged, GC suppressed).
 type Output struct {
-	Path string
-	Body []byte
+	Path      string
+	Body      []byte
+	InputHash string
 }
 
 // atomicWrite writes body to absPath via temp+rename so a reader can

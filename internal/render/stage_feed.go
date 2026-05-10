@@ -35,9 +35,13 @@ func (FeedStage) Build(_ context.Context, snap *Snapshot) ([]Output, error) {
 		limit = FeedLimit
 	}
 	for _, p := range snap.Posts[:limit] {
-		html, err := p.RenderHTML()
-		if err != nil {
-			return nil, fmt.Errorf("render %s: %w", p.ID, err)
+		html, ok := snap.PostHTML[p.ID]
+		if !ok {
+			var err error
+			html, err = p.RenderHTML()
+			if err != nil {
+				return nil, fmt.Errorf("render %s: %w", p.ID, err)
+			}
 		}
 		title := p.Title
 		if title == "" {

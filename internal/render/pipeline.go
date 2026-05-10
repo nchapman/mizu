@@ -162,6 +162,10 @@ func (p *Pipeline) Build(ctx context.Context) error {
 		p.recordStatus(err)
 		return err
 	}
+	// Hand stages the previous build's input fingerprints so a stage
+	// like ImageVariantStage can short-circuit when its source hasn't
+	// changed.
+	snap.PrevInputs = p.hashes.Inputs
 
 	type stagedOut struct {
 		stage string
@@ -185,6 +189,7 @@ func (p *Pipeline) Build(ctx context.Context) error {
 	// are logged and skipped.
 	intended := map[string]string{} // path → stage that owns it
 	newHashes := map[string]string{}
+	newInputs := map[string]string{}
 	for _, so := range produced {
 		if owner, dup := intended[so.out.Path]; dup {
 			log.Printf("render: %s wants to write %s, already owned by %s — skipping",
@@ -192,8 +197,30 @@ func (p *Pipeline) Build(ctx context.Context) error {
 			continue
 		}
 		intended[so.out.Path] = so.stage
-		hash := sha256Hex(so.out.Body)
 		abs := filepath.Join(p.publicDir, so.out.Path)
+
+		// Body == nil signals "stage decided nothing changed; reuse
+		// the existing file." Honor it only when the file is on disk
+		// AND we have a hash record for it (otherwise we'd silently
+		// retain a missing or unverified output).
+		if so.out.Body == nil {
+			prevHash, hasHash := p.hashes.Hashes[so.out.Path]
+			if !hasHash {
+				stageErrs = append(stageErrs, fmt.Errorf("%s claimed %s unchanged but no prior hash exists", so.stage, so.out.Path))
+				continue
+			}
+			if _, statErr := os.Stat(abs); statErr != nil {
+				stageErrs = append(stageErrs, fmt.Errorf("%s claimed %s unchanged but file is missing", so.stage, so.out.Path))
+				continue
+			}
+			newHashes[so.out.Path] = prevHash
+			if so.out.InputHash != "" {
+				newInputs[so.out.Path] = so.out.InputHash
+			}
+			continue
+		}
+
+		hash := sha256Hex(so.out.Body)
 		if prev, ok := p.hashes.Hashes[so.out.Path]; ok && prev == hash {
 			// Already on disk with these bytes — but if the file was
 			// deleted out from under us we still need to write. Treat
@@ -201,6 +228,9 @@ func (p *Pipeline) Build(ctx context.Context) error {
 			// hash-skip would otherwise hide a deleted output forever.
 			if _, statErr := os.Stat(abs); statErr == nil {
 				newHashes[so.out.Path] = hash
+				if so.out.InputHash != "" {
+					newInputs[so.out.Path] = so.out.InputHash
+				}
 				continue
 			}
 		}
@@ -213,6 +243,9 @@ func (p *Pipeline) Build(ctx context.Context) error {
 			continue
 		}
 		newHashes[so.out.Path] = hash
+		if so.out.InputHash != "" {
+			newInputs[so.out.Path] = so.out.InputHash
+		}
 	}
 
 	// GC orphan files. Skipped if any stage errored — we don't know
@@ -225,6 +258,7 @@ func (p *Pipeline) Build(ctx context.Context) error {
 	}
 
 	p.hashes.Hashes = newHashes
+	p.hashes.Inputs = newInputs
 	if err := p.hashes.save(); err != nil {
 		log.Printf("render: save hashes: %v", err)
 	}
