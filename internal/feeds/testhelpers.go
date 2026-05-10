@@ -3,7 +3,12 @@ package feeds
 import (
 	"context"
 	"net/http"
+	"time"
 )
+
+// SetNowForTest overrides the Store's clock. Tests use this to make
+// timestamp assertions deterministic without sleeping.
+func (s *Store) SetNowForTest(fn func() time.Time) { s.now = fn }
 
 // SetValidateForTest replaces the URL validator on the Service. Tests
 // outside this package use it to bypass the SSRF gate so httptest

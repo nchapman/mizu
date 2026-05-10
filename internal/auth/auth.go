@@ -560,6 +560,22 @@ func (s *Service) ReapSessions(ctx context.Context) {
 			if _, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at < ?`, now); err != nil {
 				log.Printf("auth: reap sessions: %v", err)
 			}
+			// Drop stale login_attempts rows. Without this, an attacker
+			// spraying novel emails (which never trip per-email lockout
+			// because each is a first attempt) grows the table one row
+			// per probe. Aging out at 2x the lockout window keeps real
+			// lockouts intact — checkLock clears its own counter on the
+			// first attempt after the window, so any row older than
+			// 2*window is guaranteed dead state.
+			cutoff := now - int64(2*lockoutDuration.Seconds())
+			if _, err := s.db.ExecContext(ctx,
+				`DELETE FROM login_attempts
+				 WHERE last_failed_at < ?
+				   AND (locked_until IS NULL OR locked_until < ?)`,
+				cutoff, now,
+			); err != nil {
+				log.Printf("auth: reap login_attempts: %v", err)
+			}
 		}
 	}
 }

@@ -48,11 +48,12 @@ type Item struct {
 // Schema is managed centrally by internal/db; we don't own the
 // connection here, so Close is a no-op.
 type Store struct {
-	db *sql.DB
+	db  *sql.DB
+	now func() time.Time
 }
 
 // NewStore wires a Store onto an already-open, already-migrated DB.
-func NewStore(db *sql.DB) *Store { return &Store{db: db} }
+func NewStore(db *sql.DB) *Store { return &Store{db: db, now: time.Now} }
 
 // UpsertFeed inserts or updates a feed by URL, preserving fetch metadata
 // (etag, last_modified) on conflict so an OPML re-import doesn't force a
@@ -114,14 +115,14 @@ UPDATE feeds SET
   last_error = '',
   title    = CASE WHEN title    = '' THEN ? ELSE title    END,
   site_url = CASE WHEN site_url = '' THEN ? ELSE site_url END
-WHERE id = ?`, etag, lastModified, time.Now().Unix(), parsedTitle, parsedSiteURL, feedID)
+WHERE id = ?`, etag, lastModified, s.now().Unix(), parsedTitle, parsedSiteURL, feedID)
 	return err
 }
 
 func (s *Store) MarkFetchError(ctx context.Context, feedID int64, msg string) error {
 	_, err := s.db.ExecContext(ctx, `
 UPDATE feeds SET last_fetched_at = ?, last_error = ? WHERE id = ?`,
-		time.Now().Unix(), msg, feedID)
+		s.now().Unix(), msg, feedID)
 	return err
 }
 
@@ -216,7 +217,7 @@ func (s *Store) MarkRead(ctx context.Context, itemID int64, read bool) error {
 	var res sql.Result
 	var err error
 	if read {
-		res, err = s.db.ExecContext(ctx, `UPDATE items SET read_at = ? WHERE id = ?`, time.Now().Unix(), itemID)
+		res, err = s.db.ExecContext(ctx, `UPDATE items SET read_at = ? WHERE id = ?`, s.now().Unix(), itemID)
 	} else {
 		res, err = s.db.ExecContext(ctx, `UPDATE items SET read_at = NULL WHERE id = ?`, itemID)
 	}

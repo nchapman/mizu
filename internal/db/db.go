@@ -36,7 +36,11 @@ func Open(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("db path is empty")
 	}
 	// `file:` prefix lets SQLite parse the path itself; `?_pragma=` is
-	// modernc's way to set PRAGMAs at open time.
+	// modernc's way to set PRAGMAs at open time. We leave synchronous
+	// at WAL's default of NORMAL: every commit fsyncs the WAL, and the
+	// only data loss window is an OS crash or power cut between commit
+	// and the next checkpoint. FULL would double-fsync on every write
+	// for a microblog's traffic — not the right tradeoff here.
 	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {

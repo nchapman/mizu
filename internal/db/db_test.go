@@ -13,12 +13,17 @@ func TestOpen_AppliesV1Schema(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 
+	// Open applies every embedded migration, so the recorded version
+	// tracks the latest file in migrations/. We assert "at least 1"
+	// rather than a specific number so adding migrations doesn't churn
+	// this test — the per-table assertions below cover what we actually
+	// care about (the v1 schema is fully present).
 	v, err := readVersion(conn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 1 {
-		t.Fatalf("schema_version=%d, want 1", v)
+	if v < 1 {
+		t.Fatalf("schema_version=%d, want >= 1", v)
 	}
 
 	// schema_version row is in app_meta, not PRAGMA user_version, so
@@ -27,8 +32,8 @@ func TestOpen_AppliesV1Schema(t *testing.T) {
 	if err := conn.QueryRow(`SELECT value FROM app_meta WHERE key='schema_version'`).Scan(&stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored != "1" {
-		t.Errorf("app_meta schema_version=%q, want '1'", stored)
+	if stored == "" {
+		t.Errorf("app_meta schema_version is empty")
 	}
 
 	// Every table from 0001_init must be present.
