@@ -1,210 +1,460 @@
 package auth
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/nchapman/mizu/internal/db"
 )
 
-func newAuth(t *testing.T) (*Auth, string) {
+func newSvc(t *testing.T) (*Service, *sql.DB) {
 	t.Helper()
-	dir := t.TempDir()
-	a, err := New(dir)
+	conn, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return a, dir
+	t.Cleanup(func() { _ = conn.Close() })
+	s, err := New(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, conn
 }
 
 func TestNew_FirstRunGeneratesSetupToken(t *testing.T) {
-	a, _ := newAuth(t)
-	if a.Configured() {
-		t.Error("Configured()=true, want false on fresh state")
+	s, _ := newSvc(t)
+	ok, err := s.Configured(context.Background())
+	if err != nil || ok {
+		t.Errorf("Configured=(%v,%v), want (false,nil)", ok, err)
 	}
-	if a.SetupToken() == "" {
+	if s.SetupToken() == "" {
 		t.Error("SetupToken empty on first run")
 	}
 }
 
-func TestSetPassword_RequiresToken(t *testing.T) {
-	a, _ := newAuth(t)
-	if err := a.SetPassword("hunter22pw", "wrong-token"); !errors.Is(err, ErrBadSetupToken) {
-		t.Errorf("SetPassword wrong token err=%v, want ErrBadSetupToken", err)
+func TestSetup_RequiresToken(t *testing.T) {
+	s, _ := newSvc(t)
+	_, err := s.Setup(context.Background(), "wrong-token", "a@b.com", "hunter22pw", "Alice")
+	if !errors.Is(err, ErrBadSetupToken) {
+		t.Errorf("err=%v, want ErrBadSetupToken", err)
 	}
 }
 
-func TestSetPassword_RejectsShort(t *testing.T) {
-	a, _ := newAuth(t)
-	if err := a.SetPassword("short", a.SetupToken()); !errors.Is(err, ErrPasswordTooShort) {
+func TestSetup_RejectsShortPassword(t *testing.T) {
+	s, _ := newSvc(t)
+	_, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "short", "Alice")
+	if !errors.Is(err, ErrPasswordTooShort) {
 		t.Errorf("err=%v, want ErrPasswordTooShort", err)
 	}
 }
 
-func TestSetPassword_HappyPathThenLocked(t *testing.T) {
-	a, _ := newAuth(t)
-	tok := a.SetupToken()
-	if err := a.SetPassword("hunter22pw", tok); err != nil {
-		t.Fatalf("SetPassword: %v", err)
-	}
-	if !a.Configured() {
-		t.Error("Configured()=false after SetPassword")
-	}
-	if a.SetupToken() != "" {
-		t.Error("SetupToken should clear after configuration")
-	}
-	// Second call must refuse, and refuse using the original token.
-	if err := a.SetPassword("another22pw", tok); !errors.Is(err, ErrAlreadyConfigured) {
-		t.Errorf("second SetPassword err=%v, want ErrAlreadyConfigured", err)
+func TestSetup_RejectsInvalidEmail(t *testing.T) {
+	s, _ := newSvc(t)
+	_, err := s.Setup(context.Background(), s.SetupToken(), "not an email", "hunter22pw", "")
+	if !errors.Is(err, ErrInvalidEmail) {
+		t.Errorf("err=%v, want ErrInvalidEmail", err)
 	}
 }
 
-func TestVerify(t *testing.T) {
-	a, _ := newAuth(t)
-	if a.Verify("anything") {
-		t.Error("Verify on unconfigured returned true")
+func TestSetup_HappyPathThenLocked(t *testing.T) {
+	s, _ := newSvc(t)
+	tok := s.SetupToken()
+	u, err := s.Setup(context.Background(), tok, "Alice@example.COM", "hunter22pw", "Alice")
+	if err != nil {
+		t.Fatalf("Setup: %v", err)
 	}
-	if err := a.SetPassword("hunter22pw", a.SetupToken()); err != nil {
-		t.Fatal(err)
+	if u.Email != "alice@example.com" {
+		t.Errorf("email not normalized: %q", u.Email)
 	}
-	if !a.Verify("hunter22pw") {
-		t.Error("Verify(correct)=false")
+	if u.DisplayName != "Alice" {
+		t.Errorf("display name=%q", u.DisplayName)
 	}
-	if a.Verify("wrong-password") {
-		t.Error("Verify(wrong)=true")
+	if s.SetupToken() != "" {
+		t.Error("SetupToken should clear after Setup")
+	}
+	// Second Setup must fail.
+	_, err = s.Setup(context.Background(), tok, "b@example.com", "hunter22pw", "")
+	if !errors.Is(err, ErrAlreadyConfigured) {
+		t.Errorf("second Setup err=%v, want ErrAlreadyConfigured", err)
 	}
 }
 
-func TestPersistence(t *testing.T) {
-	dir := t.TempDir()
-	a1, err := New(dir)
+func TestPersistence_AcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	conn, err := db.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a1.SetPassword("hunter22pw", a1.SetupToken()); err != nil {
-		t.Fatal(err)
-	}
-	// Re-instantiate over the same dir.
-	a2, err := New(dir)
+	s, err := New(conn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !a2.Configured() {
-		t.Error("Configured()=false after reload")
-	}
-	if a2.SetupToken() != "" {
-		t.Error("SetupToken should be empty after reload")
-	}
-	if !a2.Verify("hunter22pw") {
-		t.Error("Verify failed after reload")
-	}
-}
-
-func TestNew_RejectsCorruptAuthJSON(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte("not json"), 0o600); err != nil {
+	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(dir); err == nil {
-		t.Fatal("expected parse error")
-	}
-}
+	_ = conn.Close()
 
-func TestNew_RejectsEmptyHash(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"hash":""}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := New(dir); err == nil {
-		t.Fatal("expected error for empty hash")
-	}
-}
-
-func TestSessions_CreateValidateDestroy(t *testing.T) {
-	a, _ := newAuth(t)
-	t1, err := a.CreateSession()
+	// Reopen.
+	conn2, err := db.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t2, err := a.CreateSession()
+	defer conn2.Close()
+	s2, err := New(conn2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured, _ := s2.Configured(context.Background())
+	if !configured {
+		t.Error("Configured=false after reopen")
+	}
+	if s2.SetupToken() != "" {
+		t.Error("SetupToken should be empty after reopen with existing user")
+	}
+	u, _, err := s2.Login(context.Background(), "a@b.com", "hunter22pw")
+	if err != nil {
+		t.Fatalf("Login after reopen: %v", err)
+	}
+	if u.Email != "a@b.com" {
+		t.Errorf("u.Email=%q", u.Email)
+	}
+}
+
+func TestLogin_WrongPasswordReturnsGenericError(t *testing.T) {
+	s, _ := newSvc(t)
+	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
+		t.Fatal(err)
+	}
+	_, until, err := s.Login(context.Background(), "a@b.com", "nope")
+	if !errors.Is(err, ErrInvalidLogin) {
+		t.Errorf("err=%v, want ErrInvalidLogin", err)
+	}
+	if !until.IsZero() {
+		t.Errorf("until=%v on first failure, want zero", until)
+	}
+}
+
+func TestLogin_UnknownEmailReturnsSameError(t *testing.T) {
+	s, _ := newSvc(t)
+	// No setup; users table is empty.
+	_, _, err := s.Login(context.Background(), "ghost@example.com", "whatever123")
+	if !errors.Is(err, ErrInvalidLogin) {
+		t.Errorf("err=%v, want ErrInvalidLogin (must not leak account existence)", err)
+	}
+}
+
+func TestLogin_HappyPathClearsFailures(t *testing.T) {
+	s, _ := newSvc(t)
+	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "A"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxFailedAttempts-1; i++ {
+		if _, _, err := s.Login(context.Background(), "a@b.com", "nope"); !errors.Is(err, ErrInvalidLogin) {
+			t.Fatalf("attempt %d: err=%v", i, err)
+		}
+	}
+	u, until, err := s.Login(context.Background(), "a@b.com", "hunter22pw")
+	if err != nil {
+		t.Fatalf("correct password rejected: %v", err)
+	}
+	if !until.IsZero() {
+		t.Errorf("until=%v on success", until)
+	}
+	if u.LastLoginAt.IsZero() {
+		t.Error("LastLoginAt not updated on success")
+	}
+	// Counter cleared: should be able to fail maxFailedAttempts more
+	// times before getting locked.
+	for i := 0; i < maxFailedAttempts-1; i++ {
+		if _, _, err := s.Login(context.Background(), "a@b.com", "nope"); !errors.Is(err, ErrInvalidLogin) {
+			t.Fatalf("post-reset attempt %d: err=%v", i, err)
+		}
+	}
+}
+
+func TestLogin_LocksAfterMaxFailures(t *testing.T) {
+	s, _ := newSvc(t)
+	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxFailedAttempts-1; i++ {
+		_, until, _ := s.Login(context.Background(), "a@b.com", "nope")
+		if !until.IsZero() {
+			t.Fatalf("premature lock at attempt %d", i)
+		}
+	}
+	_, until, _ := s.Login(context.Background(), "a@b.com", "nope")
+	if until.IsZero() {
+		t.Fatal("expected lockout after max failures")
+	}
+	// Even the right password is rejected while locked.
+	_, until2, err := s.Login(context.Background(), "a@b.com", "hunter22pw")
+	if err == nil {
+		t.Fatal("locked account accepted correct password")
+	}
+	if until2.IsZero() {
+		t.Fatal("expected until to remain set during lockout")
+	}
+}
+
+func TestLogin_LockoutKeyedByEmail(t *testing.T) {
+	s, _ := newSvc(t)
+	if _, err := s.Setup(context.Background(), s.SetupToken(), "alice@example.com", "hunter22pw", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateUser(context.Background(), "bob@example.com", "hunter22pw", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Burn Alice's lockout.
+	for i := 0; i < maxFailedAttempts; i++ {
+		s.Login(context.Background(), "alice@example.com", "nope")
+	}
+	if _, until, _ := s.Login(context.Background(), "alice@example.com", "hunter22pw"); until.IsZero() {
+		t.Fatal("Alice should be locked")
+	}
+	// Bob is independent.
+	if _, until, err := s.Login(context.Background(), "bob@example.com", "hunter22pw"); err != nil || !until.IsZero() {
+		t.Errorf("Bob locked by Alice's failures: err=%v until=%v", err, until)
+	}
+}
+
+// Regression: once a lockout expires, the failed-attempt counter must
+// reset so a single subsequent wrong password doesn't immediately
+// re-trip the lock. Without this, an attacker can keep an account
+// permanently locked with one probe per lockoutDuration window.
+func TestLogin_LockoutResetsCounterAfterExpiry(t *testing.T) {
+	s, _ := newSvc(t)
+	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
+		t.Fatal(err)
+	}
+	fakeNow := time.Now()
+	s.now = func() time.Time { return fakeNow }
+	for i := 0; i < maxFailedAttempts; i++ {
+		s.Login(context.Background(), "a@b.com", "nope")
+	}
+	// Advance past the lockout window.
+	fakeNow = fakeNow.Add(lockoutDuration + time.Second)
+
+	// One more wrong password — must NOT re-lock immediately.
+	_, until, _ := s.Login(context.Background(), "a@b.com", "nope")
+	if !until.IsZero() {
+		t.Fatalf("counter not reset after lockout expiry: single failure re-locked (until=%v)", until)
+	}
+}
+
+func TestLogin_UnlocksAfterDuration(t *testing.T) {
+	s, _ := newSvc(t)
+	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
+		t.Fatal(err)
+	}
+	fakeNow := time.Now()
+	s.now = func() time.Time { return fakeNow }
+	for i := 0; i < maxFailedAttempts; i++ {
+		s.Login(context.Background(), "a@b.com", "nope")
+	}
+	// Advance past the lockout window.
+	fakeNow = fakeNow.Add(lockoutDuration + time.Second)
+	u, until, err := s.Login(context.Background(), "a@b.com", "hunter22pw")
+	if err != nil {
+		t.Fatalf("expected success after lockout expires: %v", err)
+	}
+	if u == nil || !until.IsZero() {
+		t.Errorf("u=%v until=%v", u, until)
+	}
+}
+
+func TestCreateUser_DuplicateEmail(t *testing.T) {
+	s, _ := newSvc(t)
+	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.CreateUser(context.Background(), "A@B.COM", "hunter22pw", "")
+	if !errors.Is(err, ErrEmailTaken) {
+		t.Errorf("err=%v, want ErrEmailTaken (case-insensitive)", err)
+	}
+}
+
+func TestListUsers_OrderedByCreated(t *testing.T) {
+	s, _ := newSvc(t)
+	fakeNow := time.Unix(1_700_000_000, 0)
+	s.now = func() time.Time { return fakeNow }
+	if _, err := s.Setup(context.Background(), s.SetupToken(), "first@example.com", "hunter22pw", "First"); err != nil {
+		t.Fatal(err)
+	}
+	fakeNow = fakeNow.Add(time.Hour)
+	if _, err := s.CreateUser(context.Background(), "second@example.com", "hunter22pw", "Second"); err != nil {
+		t.Fatal(err)
+	}
+	users, err := s.ListUsers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != 2 || users[0].Email != "first@example.com" || users[1].Email != "second@example.com" {
+		t.Errorf("users=%+v", users)
+	}
+}
+
+func TestDeleteUser_RefusesLastUser(t *testing.T) {
+	s, _ := newSvc(t)
+	u, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteUser(context.Background(), u.ID); !errors.Is(err, ErrLastUser) {
+		t.Errorf("err=%v, want ErrLastUser", err)
+	}
+}
+
+func TestDeleteUser_CascadesSessions(t *testing.T) {
+	s, _ := newSvc(t)
+	a, _ := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "")
+	b, err := s.CreateUser(context.Background(), "b@b.com", "hunter22pw", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := s.CreateSession(context.Background(), b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteUser(context.Background(), b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := s.Lookup(context.Background(), tok); u != nil {
+		t.Errorf("session survived user delete: %+v", u)
+	}
+	if err := s.DeleteUser(context.Background(), 9999); !errors.Is(err, ErrUserNotFound) {
+		t.Errorf("delete missing err=%v, want ErrUserNotFound", err)
+	}
+	// a still exists.
+	if err := s.DeleteUser(context.Background(), a.ID); !errors.Is(err, ErrLastUser) {
+		t.Errorf("a deletable after b removed; err=%v", err)
+	}
+}
+
+func TestChangePassword(t *testing.T) {
+	s, _ := newSvc(t)
+	u, _ := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "")
+	if err := s.ChangePassword(context.Background(), u.ID, "wrong", "newpassword22"); !errors.Is(err, ErrInvalidPassword) {
+		t.Errorf("wrong old: err=%v", err)
+	}
+	if err := s.ChangePassword(context.Background(), u.ID, "hunter22pw", "short"); !errors.Is(err, ErrPasswordTooShort) {
+		t.Errorf("short new: err=%v", err)
+	}
+	if err := s.ChangePassword(context.Background(), u.ID, "hunter22pw", "newpassword22"); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+	if _, _, err := s.Login(context.Background(), "a@b.com", "hunter22pw"); !errors.Is(err, ErrInvalidLogin) {
+		t.Error("old password still works")
+	}
+	if _, _, err := s.Login(context.Background(), "a@b.com", "newpassword22"); err != nil {
+		t.Errorf("new password rejected: %v", err)
+	}
+}
+
+func TestSessions_LifecycleAndReap(t *testing.T) {
+	s, conn := newSvc(t)
+	u, _ := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "")
+	t1, err := s.CreateSession(context.Background(), u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t2, err := s.CreateSession(context.Background(), u.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if t1 == t2 {
 		t.Error("CreateSession returned duplicate tokens")
 	}
-	if !a.ValidateSession(t1) {
-		t.Error("ValidateSession(fresh)=false")
+	got, err := s.Lookup(context.Background(), t1)
+	if err != nil || got == nil || got.ID != u.ID {
+		t.Errorf("Lookup fresh: got=%+v err=%v", got, err)
 	}
-	if a.ValidateSession("") {
-		t.Error("ValidateSession(empty)=true")
+	if u, _ := s.Lookup(context.Background(), ""); u != nil {
+		t.Error("Lookup(empty) returned a user")
 	}
-	if a.ValidateSession("not-a-token") {
-		t.Error("ValidateSession(unknown)=true")
+	if u, _ := s.Lookup(context.Background(), "garbage"); u != nil {
+		t.Error("Lookup(unknown) returned a user")
 	}
-	a.DestroySession(t1)
-	if a.ValidateSession(t1) {
-		t.Error("ValidateSession after destroy=true")
+	if err := s.DestroySession(context.Background(), t1); err != nil {
+		t.Fatal(err)
 	}
-	// DestroySession on empty/unknown is a no-op.
-	a.DestroySession("")
-	a.DestroySession("nope")
-}
+	if u, _ := s.Lookup(context.Background(), t1); u != nil {
+		t.Error("Lookup after destroy returned a user")
+	}
+	// Idempotent.
+	if err := s.DestroySession(context.Background(), t1); err != nil {
+		t.Errorf("destroy after destroy: %v", err)
+	}
+	if err := s.DestroySession(context.Background(), ""); err != nil {
+		t.Errorf("destroy empty: %v", err)
+	}
 
-func TestSessions_ExpiredSessionRejected(t *testing.T) {
-	a, _ := newAuth(t)
-	tok, err := a.CreateSession()
+	// Force t2 expired by rewriting expires_at, then run one reaper
+	// tick worth of work.
+	_, err = conn.Exec(`UPDATE sessions SET expires_at = ? WHERE token = ?`,
+		time.Now().Add(-time.Second).Unix(), t2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.mu.Lock()
-	a.sessions[tok] = session{expires: time.Now().Add(-time.Second)}
-	a.mu.Unlock()
-	if a.ValidateSession(tok) {
+	if u, _ := s.Lookup(context.Background(), t2); u != nil {
 		t.Error("expired session validated")
 	}
-	// Eviction is deferred to ReapSessions; the entry may still be in
-	// the map at this point — that's fine, it's already rejected by
-	// ValidateSession. Mimic one ReapSessions tick and confirm it
-	// drops the expired entry.
-	a.mu.Lock()
-	for k, s := range a.sessions {
-		if time.Now().After(s.expires) {
-			delete(a.sessions, k)
-		}
-	}
-	a.mu.Unlock()
-	a.mu.RLock()
-	_, present := a.sessions[tok]
-	a.mu.RUnlock()
-	if present {
-		t.Error("expired session not removed by reap")
-	}
-}
-
-func TestStatus(t *testing.T) {
-	a, _ := newAuth(t)
-	configured, authed := a.Status("")
-	if configured || authed {
-		t.Errorf("fresh Status=(%v,%v), want (false,false)", configured, authed)
-	}
-	if err := a.SetPassword("hunter22pw", a.SetupToken()); err != nil {
-		t.Fatal(err)
-	}
-	configured, authed = a.Status("")
-	if !configured || authed {
-		t.Errorf("after setup with no token Status=(%v,%v), want (true,false)", configured, authed)
-	}
-	tok, err := a.CreateSession()
+	_, err = conn.Exec(`DELETE FROM sessions WHERE expires_at < ?`, time.Now().Unix())
 	if err != nil {
 		t.Fatal(err)
 	}
-	configured, authed = a.Status(tok)
-	if !configured || !authed {
-		t.Errorf("with valid session Status=(%v,%v), want (true,true)", configured, authed)
+	var n int
+	conn.QueryRow(`SELECT COUNT(*) FROM sessions WHERE token = ?`, t2).Scan(&n)
+	if n != 0 {
+		t.Errorf("expired session not removed by reap: n=%d", n)
+	}
+}
+
+func TestMiddleware(t *testing.T) {
+	s, _ := newSvc(t)
+	u, _ := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "Alice")
+	var seen *User
+	h := s.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = UserFrom(r.Context())
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	// No cookie → 401.
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", "/x", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("no cookie code=%d", w.Code)
+	}
+	if seen != nil {
+		t.Error("handler called without auth")
+	}
+
+	// Bad cookie → 401.
+	req := httptest.NewRequest("GET", "/x", nil)
+	req.AddCookie(&http.Cookie{Name: CookieName, Value: "garbage"})
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("bad cookie code=%d", w.Code)
+	}
+
+	// Valid session → passes through with user attached.
+	tok, _ := s.CreateSession(context.Background(), u.ID)
+	req = httptest.NewRequest("GET", "/x", nil)
+	req.AddCookie(&http.Cookie{Name: CookieName, Value: tok})
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Errorf("valid session code=%d", w.Code)
+	}
+	if seen == nil || seen.ID != u.ID || seen.Email != "a@b.com" {
+		t.Errorf("UserFrom=%+v", seen)
 	}
 }
 
@@ -219,7 +469,7 @@ func TestSetCookieAndClearCookie(t *testing.T) {
 	if c.Name != CookieName || c.Value != "abc123" {
 		t.Errorf("name=%q value=%q", c.Name, c.Value)
 	}
-	if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode {
+	if !c.HttpOnly || c.SameSite != http.SameSiteStrictMode {
 		t.Errorf("flags wrong: HttpOnly=%v SameSite=%v", c.HttpOnly, c.SameSite)
 	}
 	if c.Secure {
@@ -228,14 +478,11 @@ func TestSetCookieAndClearCookie(t *testing.T) {
 	if c.MaxAge != int(sessionTTL.Seconds()) {
 		t.Errorf("MaxAge=%d, want %d", c.MaxAge, int(sessionTTL.Seconds()))
 	}
-
-	// secure=true should propagate to the cookie.
 	w = httptest.NewRecorder()
 	SetCookie(w, "abc123", true)
 	if !w.Result().Cookies()[0].Secure {
 		t.Error("Secure=false when secure=true was passed")
 	}
-
 	w = httptest.NewRecorder()
 	ClearCookie(w, false)
 	cookies = w.Result().Cookies()
@@ -244,47 +491,25 @@ func TestSetCookieAndClearCookie(t *testing.T) {
 	}
 }
 
-func TestMiddleware(t *testing.T) {
-	a, _ := newAuth(t)
-	called := false
-	h := a.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusNoContent)
-	}))
-
-	// No cookie → 401.
-	req := httptest.NewRequest("GET", "/x", nil)
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("no cookie code=%d, want 401", w.Code)
+func TestNormalizeEmail(t *testing.T) {
+	cases := []struct {
+		in, want string
+		ok       bool
+	}{
+		{"a@b.com", "a@b.com", true},
+		{"  A@B.COM  ", "a@b.com", true},
+		{"", "", false},
+		{"not-an-email", "", false},
+		{"Alice <alice@example.com>", "alice@example.com", true}, // Go's mail.ParseAddress accepts name form
 	}
-	if called {
-		t.Error("handler called without auth")
-	}
-
-	// Bad cookie → 401.
-	req = httptest.NewRequest("GET", "/x", nil)
-	req.AddCookie(&http.Cookie{Name: CookieName, Value: "garbage"})
-	w = httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("bad cookie code=%d, want 401", w.Code)
-	}
-
-	// Valid session → passes through.
-	tok, err := a.CreateSession()
-	if err != nil {
-		t.Fatal(err)
-	}
-	req = httptest.NewRequest("GET", "/x", nil)
-	req.AddCookie(&http.Cookie{Name: CookieName, Value: tok})
-	w = httptest.NewRecorder()
-	h.ServeHTTP(w, req)
-	if w.Code != http.StatusNoContent {
-		t.Errorf("valid session code=%d, want 204", w.Code)
-	}
-	if !called {
-		t.Error("handler not called with valid session")
+	for _, c := range cases {
+		got, err := normalizeEmail(c.in)
+		if (err == nil) != c.ok {
+			t.Errorf("normalizeEmail(%q) err=%v ok=%v", c.in, err, c.ok)
+			continue
+		}
+		if c.ok && got != c.want {
+			t.Errorf("normalizeEmail(%q)=%q, want %q", c.in, got, c.want)
+		}
 	}
 }

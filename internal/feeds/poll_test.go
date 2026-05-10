@@ -4,9 +4,12 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nchapman/mizu/internal/db"
 )
 
 const sampleAtom = `<?xml version="1.0" encoding="utf-8"?>
@@ -33,11 +36,12 @@ const sampleAtom = `<?xml version="1.0" encoding="utf-8"?>
 
 func newPoller(t *testing.T) (*Poller, *Store) {
 	t.Helper()
-	st, err := OpenStore(t.TempDir())
+	conn, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(func() { _ = conn.Close() })
+	st := NewStore(conn)
 	p := NewPoller(st, time.Hour, "test/1.0")
 	// Bypass the SSRF-safe client so httptest (loopback) URLs work.
 	p.http = http.DefaultClient

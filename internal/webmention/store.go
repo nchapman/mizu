@@ -4,11 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
-	"path/filepath"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 // Status describes where a mention is in its lifecycle.
@@ -21,45 +17,14 @@ const (
 	StatusRemoved  Status = "removed"  // source no longer contains the link (deletion per spec)
 )
 
-const schema = `
-CREATE TABLE IF NOT EXISTS mentions (
-  id           INTEGER PRIMARY KEY,
-  source       TEXT NOT NULL,
-  target       TEXT NOT NULL,
-  status       TEXT NOT NULL,
-  received_at  INTEGER NOT NULL,
-  verified_at  INTEGER,
-  last_error   TEXT,
-  UNIQUE(source, target)
-);
-
-CREATE INDEX IF NOT EXISTS mentions_target_idx ON mentions(target, status);
-`
-
-// Store persists received mentions. The DB is regeneratable from the
-// JSONL log (see Logger), so a corrupted DB can be rebuilt without
-// data loss.
+// Store reads and writes the mentions table on the shared *sql.DB.
+// Schema is managed centrally by internal/db.
 type Store struct {
 	db *sql.DB
 }
 
-func OpenStore(cacheDir string) (*Store, error) {
-	if err := ensureDir(cacheDir); err != nil {
-		return nil, err
-	}
-	dsn := "file:" + filepath.Join(cacheDir, "webmentions.db") + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)"
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := db.Exec(schema); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("schema: %w", err)
-	}
-	return &Store{db: db}, nil
-}
-
-func (s *Store) Close() error { return s.db.Close() }
+// NewStore wires a Store onto an already-open, already-migrated DB.
+func NewStore(db *sql.DB) *Store { return &Store{db: db} }
 
 // Upsert inserts a new mention or updates the status of an existing
 // (source, target) pair. The (source, target) UNIQUE constraint
@@ -95,7 +60,7 @@ type Mention struct {
 // public render path never shows unverified user-supplied URLs.
 func (s *Store) ForTarget(ctx context.Context, target string) ([]Mention, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, source, target, status, received_at, verified_at, COALESCE(last_error, '')
+		SELECT id, source, target, status, received_at, verified_at, last_error
 		FROM mentions
 		WHERE target = ? AND status = ?
 		ORDER BY COALESCE(verified_at, received_at) DESC
@@ -134,7 +99,7 @@ func (s *Store) Recent(ctx context.Context, limit int) ([]Mention, error) {
 		limit = 200
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, source, target, status, received_at, verified_at, COALESCE(last_error, '')
+		SELECT id, source, target, status, received_at, verified_at, last_error
 		FROM mentions
 		WHERE status = ?
 		ORDER BY COALESCE(verified_at, received_at) DESC
@@ -169,7 +134,7 @@ func (s *Store) Recent(ctx context.Context, limit int) ([]Mention, error) {
 // per post page.
 func (s *Store) AllVerified(ctx context.Context) ([]Mention, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, source, target, status, received_at, verified_at, COALESCE(last_error, '')
+		SELECT id, source, target, status, received_at, verified_at, last_error
 		FROM mentions
 		WHERE status = ?
 		ORDER BY COALESCE(verified_at, received_at) DESC
@@ -237,6 +202,23 @@ func (s *Store) Pending(ctx context.Context) ([]PendingPair, error) {
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// SetLastError stamps a fresh error message onto an existing
+// (source, target) row without changing its status. Used by the
+// verifier when a fetch fails transiently — the row stays Pending so
+// the next startup retries, but the latest error text is captured for
+// the operator to inspect.
+//
+// Scoped to rows still in the pending state so a late-arriving
+// transient error can't clobber the message on a row that has since
+// been re-submitted and reset by Upsert.
+func (s *Store) SetLastError(ctx context.Context, source, target, msg string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE mentions SET last_error = ?
+		 WHERE source = ? AND target = ? AND status = ?`,
+		msg, source, target, string(StatusPending))
+	return err
 }
 
 // ErrNotFound is returned when looking up a mention by id finds nothing.

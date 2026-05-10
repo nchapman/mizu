@@ -36,7 +36,7 @@ describe("App auth screens", () => {
     withMe({ configured: true, authenticated: false });
     render(<App />);
     expect(await screen.findByRole("heading", { name: /Sign in/i })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("Password")).toBeInTheDocument();
+    expect(screen.getByLabelText("Password")).toBeInTheDocument();
   });
 
   it("renders the Shell when authenticated", async () => {
@@ -98,7 +98,7 @@ describe("App route navigation", () => {
     expect(await screen.findByText(/No subscriptions yet/i)).toBeInTheDocument();
   });
 
-  it("loads the Settings placeholder from the overflow menu", async () => {
+  it("loads the Settings panel from the overflow menu", async () => {
     withMe(
       { configured: true, authenticated: true },
       { status: 200, body: { items: [] } }, // /stream
@@ -108,7 +108,8 @@ describe("App route navigation", () => {
     await screen.findByRole("button", { name: "mizu" });
     await openMenu();
     await userEvent.click(await screen.findByRole("menuitem", { name: /Settings/i }));
-    expect(await screen.findByRole("heading", { name: /Settings/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /^Settings$/ })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /^Change password$/ })).toBeInTheDocument();
   });
 });
 
@@ -122,49 +123,55 @@ describe("App Login", () => {
       { status: 200, body: [] },                                              // /drafts (count)
     ]);
     render(<App />);
-    await screen.findByPlaceholderText("Password");
-    await userEvent.type(screen.getByPlaceholderText("Password"), "hunter22pw");
+    await screen.findByLabelText("Email");
+    await userEvent.type(screen.getByLabelText("Email"), "a@b.com");
+    await userEvent.type(screen.getByLabelText("Password"), "hunter22pw");
     await userEvent.click(screen.getByRole("button", { name: /Sign in/i }));
     expect(await screen.findByRole("button", { name: "mizu" })).toBeInTheDocument();
   });
 
-  it("surfaces 'Wrong password.' on 401", async () => {
+  it("surfaces 'Wrong email or password.' on 401", async () => {
     queueFetch([
       { status: 200, body: { configured: true, authenticated: false } },
       { status: 401, body: "" },
     ]);
     render(<App />);
-    await screen.findByPlaceholderText("Password");
-    await userEvent.type(screen.getByPlaceholderText("Password"), "wrong");
+    await screen.findByLabelText("Email");
+    await userEvent.type(screen.getByLabelText("Email"), "a@b.com");
+    await userEvent.type(screen.getByLabelText("Password"), "wrong");
     await userEvent.click(screen.getByRole("button", { name: /Sign in/i }));
-    expect(await screen.findByText("Wrong password.")).toBeInTheDocument();
+    expect(await screen.findByText("Wrong email or password.")).toBeInTheDocument();
   });
 });
 
 describe("App Setup", () => {
-  it("validates token, password length, and password match before submitting", async () => {
+  it("validates token, email, password length, and password match before submitting", async () => {
     withMe({ configured: false, authenticated: false });
     render(<App />);
     await screen.findByRole("heading", { name: /Welcome to mizu/i });
 
-    // No token → error.
-    await userEvent.click(screen.getByRole("button", { name: /Set password/i }));
+    // No token → token error.
+    await userEvent.click(screen.getByRole("button", { name: /Create account/i }));
     expect(await screen.findByText(/Setup token required/i)).toBeInTheDocument();
 
-    // Token + short password.
+    // Token, no email.
     await userEvent.type(screen.getByLabelText(/Setup token/i), "tok");
-    const pwInputs = screen.getAllByLabelText(/password/i);
-    await userEvent.type(pwInputs[0], "short");
-    await userEvent.type(pwInputs[1], "short");
-    await userEvent.click(screen.getByRole("button", { name: /Set password/i }));
+    await userEvent.click(screen.getByRole("button", { name: /Create account/i }));
+    expect(await screen.findByText(/Email required/i)).toBeInTheDocument();
+
+    // Email + short password.
+    await userEvent.type(screen.getByLabelText("Email"), "a@b.com");
+    await userEvent.type(screen.getByLabelText("New password"), "short");
+    await userEvent.type(screen.getByLabelText(/Confirm password/i), "short");
+    await userEvent.click(screen.getByRole("button", { name: /Create account/i }));
     expect(await screen.findByText(/at least 8 characters/i)).toBeInTheDocument();
 
     // Mismatched.
-    await userEvent.clear(pwInputs[0]);
-    await userEvent.clear(pwInputs[1]);
-    await userEvent.type(pwInputs[0], "longenough");
-    await userEvent.type(pwInputs[1], "different1");
-    await userEvent.click(screen.getByRole("button", { name: /Set password/i }));
+    await userEvent.clear(screen.getByLabelText("New password"));
+    await userEvent.clear(screen.getByLabelText(/Confirm password/i));
+    await userEvent.type(screen.getByLabelText("New password"), "longenough");
+    await userEvent.type(screen.getByLabelText(/Confirm password/i), "different1");
+    await userEvent.click(screen.getByRole("button", { name: /Create account/i }));
     expect(await screen.findByText(/Passwords don't match/i)).toBeInTheDocument();
   });
 
@@ -179,10 +186,10 @@ describe("App Setup", () => {
     render(<App />);
     await screen.findByRole("heading", { name: /Welcome to mizu/i });
     await userEvent.type(screen.getByLabelText(/Setup token/i), "tok");
-    const pwInputs = screen.getAllByLabelText(/password/i);
-    await userEvent.type(pwInputs[0], "longenough");
-    await userEvent.type(pwInputs[1], "longenough");
-    await userEvent.click(screen.getByRole("button", { name: /Set password/i }));
+    await userEvent.type(screen.getByLabelText("Email"), "alice@example.com");
+    await userEvent.type(screen.getByLabelText("New password"), "longenough");
+    await userEvent.type(screen.getByLabelText(/Confirm password/i), "longenough");
+    await userEvent.click(screen.getByRole("button", { name: /Create account/i }));
     expect(await screen.findByRole("button", { name: "mizu" })).toBeInTheDocument();
   });
 });
@@ -254,7 +261,7 @@ describe("App home view", () => {
     await screen.findByRole("button", { name: "mizu" });
     await openMenu();
     await userEvent.click(await screen.findByRole("menuitem", { name: /Sign out/i }));
-    expect(await screen.findByPlaceholderText("Password")).toBeInTheDocument();
+    expect(await screen.findByLabelText("Password")).toBeInTheDocument();
     expect(fn.mock.calls.find((c) => c[0] === "/admin/api/logout")).toBeTruthy();
   });
 });

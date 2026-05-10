@@ -146,3 +146,40 @@ export type Mention = {
 export async function listMentions(): Promise<Mention[]> {
   return api<Mention[]>("/admin/api/mentions");
 }
+
+export type User = {
+  id: number;
+  email: string;
+  display_name: string;
+  created_at: string;
+  last_login_at?: string;
+};
+
+export async function listUsers(): Promise<User[]> {
+  return api<User[]>("/admin/api/users");
+}
+
+export async function createUser(body: {
+  email: string;
+  password: string;
+  display_name?: string;
+}): Promise<User> {
+  return api<User>("/admin/api/users", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteUser(id: number): Promise<void> {
+  await api<void>(`/admin/api/users/${id}`, { method: "DELETE" });
+}
+
+export async function changeOwnPassword(body: {
+  old_password: string;
+  new_password: string;
+}): Promise<void> {
+  await api<void>("/admin/api/me/password", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}

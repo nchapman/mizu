@@ -2,18 +2,21 @@ package feeds
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/nchapman/mizu/internal/db"
 )
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	st, err := OpenStore(t.TempDir())
+	conn, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
-	return st
+	t.Cleanup(func() { _ = conn.Close() })
+	return NewStore(conn)
 }
 
 func TestStore_UpsertFeedRoundTrip(t *testing.T) {

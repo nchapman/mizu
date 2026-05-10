@@ -5,7 +5,13 @@ import { Setup } from "./Setup";
 import { Shell } from "./Shell";
 import { Button } from "@/components/ui/button";
 
-type Me = { configured: boolean; authenticated: boolean; site_title?: string };
+type MeUser = { id: number; email: string; display_name: string };
+type Me = {
+  configured: boolean;
+  authenticated: boolean;
+  site_title?: string;
+  user?: MeUser;
+};
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);

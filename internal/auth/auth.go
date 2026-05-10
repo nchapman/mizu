@@ -1,27 +1,23 @@
-// Package auth handles single-user password authentication for the admin UI.
-//
-// State lives in two places:
-//
-//   - state/auth.json on disk holds the bcrypt password hash. This is the
-//     durable record; a fresh checkout with no auth.json triggers the
-//     first-run setup flow.
-//   - An in-memory session map holds active session tokens. Sessions don't
-//     survive a restart by design — the trade-off is one extra login vs. a
-//     persisted session table for a single user.
+// Package auth handles user accounts, sessions, and login lockout for
+// the admin UI. All state lives in the shared SQLite DB owned by
+// internal/db — there is no on-disk auth file and no in-memory session
+// map. A handful of family members can share one instance; everyone
+// is equal, posts publish under the configured site author regardless
+// of which user wrote them.
 package auth
 
 import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
+	"net/mail"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,276 +31,581 @@ const (
 	bcryptCost     = 12
 
 	// maxFailedAttempts and lockoutDuration implement defense-in-depth
-	// against credential brute-forcing on top of the per-IP rate limit
-	// at the HTTP layer. The IP limit handles spray; this handles a
-	// patient attacker rotating through proxies.
+	// against credential brute-forcing on top of the per-IP HTTP rate
+	// limit. Keyed by email so failed attempts against a non-existent
+	// account still rate-limit and don't leak account existence by
+	// behavior.
 	maxFailedAttempts = 5
 	lockoutDuration   = 15 * time.Minute
 )
 
 var (
 	ErrAlreadyConfigured = errors.New("auth already configured")
+	ErrNotConfigured     = errors.New("auth not configured")
 	ErrPasswordTooShort  = fmt.Errorf("password must be at least %d characters", MinPasswordLen)
+	ErrInvalidEmail      = errors.New("invalid email address")
+	ErrInvalidLogin      = errors.New("invalid email or password")
 	ErrInvalidPassword   = errors.New("invalid password")
 	ErrBadSetupToken     = errors.New("invalid setup token")
+	ErrEmailTaken        = errors.New("email already in use")
+	ErrUserNotFound      = errors.New("user not found")
+	ErrLastUser          = errors.New("cannot delete the last remaining user")
 )
 
-type onDisk struct {
-	Hash string `json:"hash"`
+// User is the public view of a row in the users table.
+type User struct {
+	ID          int64
+	Email       string
+	DisplayName string
+	CreatedAt   time.Time
+	LastLoginAt time.Time // zero if never logged in
 }
 
-type session struct {
-	expires time.Time
-}
+// Service is the auth API. Construct one per process via New, sharing
+// the *sql.DB with the rest of the app.
+type Service struct {
+	db *sql.DB
 
-type Auth struct {
-	path string
-
-	mu         sync.RWMutex
-	hash       []byte // empty when not configured
-	sessions   map[string]session
-	setupToken string // non-empty only while unconfigured; required for SetPassword
-
-	// Failure-tracking state for login lockout. Single-user system, so
-	// the counter is global rather than keyed by username.
-	failedAttempts int
-	lockedUntil    time.Time
+	mu         sync.Mutex
+	setupToken string // non-empty only while no users exist
 
 	// Overridable for tests; production uses time.Now.
 	now func() time.Time
 }
 
-// New loads the existing hash from stateDir/auth.json if present. Missing
-// file is not an error — it means the system is in first-run state, and
-// a one-time setup token is generated to guard the /setup endpoint
-// against a hostile pre-emption race on internet-exposed instances.
-func New(stateDir string) (*Auth, error) {
-	a := &Auth{
-		path:     filepath.Join(stateDir, "auth.json"),
-		sessions: map[string]session{},
-		now:      time.Now,
+type ctxKey struct{}
+
+// dummyHash is bcrypt("placeholder", cost=12). Used to spend roughly
+// the same CPU on login attempts against unknown emails so timing
+// doesn't leak account existence. Generated once at init.
+var dummyHash []byte
+
+func init() {
+	h, err := bcrypt.GenerateFromPassword([]byte("not-a-real-password"), bcryptCost)
+	if err != nil {
+		// Genuinely impossible from in-process bcrypt; fail loud if it ever does.
+		panic("auth: failed to seed dummy bcrypt hash: " + err.Error())
 	}
-	b, err := os.ReadFile(a.path)
-	if errors.Is(err, os.ErrNotExist) {
-		token, err := randomToken()
+	dummyHash = h
+}
+
+// New constructs a Service over the given DB. If the users table is
+// empty it generates a one-time setup token and logs it via the
+// caller (caller checks SetupToken() after New). The token lives in
+// memory only — restarting before setup just mints a fresh one.
+func New(db *sql.DB) (*Service, error) {
+	s := &Service{db: db, now: time.Now}
+	configured, err := s.Configured(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	if !configured {
+		tok, err := randomToken()
 		if err != nil {
 			return nil, err
 		}
-		a.setupToken = token
-		return a, nil
+		s.setupToken = tok
+	}
+	return s, nil
+}
+
+// Configured returns true if at least one user exists. The SPA hits
+// /api/me before login to decide whether to render setup or login.
+func (s *Service) Configured(ctx context.Context) (bool, error) {
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
+		return false, fmt.Errorf("count users: %w", err)
+	}
+	return n > 0, nil
+}
+
+// SetupToken returns the one-time first-run token, or "" if any user
+// already exists. Print this at startup so the operator can paste it
+// into the setup form — without it, a stranger who beats the operator
+// to /setup can lock them out by creating their own first account.
+func (s *Service) SetupToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setupToken
+}
+
+// Setup creates the first user from the one-time token. Refuses if
+// any user already exists. Subsequent users are added via CreateUser
+// behind the authenticated /api/users endpoint.
+//
+// The token is *claimed* (zeroed) under the lock before the slow
+// bcrypt path runs, so two concurrent Setup calls with the same valid
+// token can't both pass the check. If insertUser fails (e.g. email
+// invalid at the DB layer), the token is restored so the operator can
+// try again without restarting the process.
+func (s *Service) Setup(ctx context.Context, token, email, password, displayName string) (*User, error) {
+	if err := validatePassword(password); err != nil {
+		return nil, err
+	}
+	email, err := normalizeEmail(email)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	expected := s.setupToken
+	if expected == "" {
+		s.mu.Unlock()
+		return nil, ErrAlreadyConfigured
+	}
+	if subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
+		s.mu.Unlock()
+		return nil, ErrBadSetupToken
+	}
+	s.setupToken = "" // claim before releasing the lock
+	s.mu.Unlock()
+
+	user, err := s.insertUser(ctx, email, password, displayName)
+	if err != nil {
+		// Restore the token so the operator can retry. Skip if another
+		// goroutine has already won the race and inserted a user — at
+		// that point Configured() is true and Setup must refuse anyway.
+		configured, cerr := s.Configured(ctx)
+		if cerr == nil && !configured {
+			s.mu.Lock()
+			s.setupToken = expected
+			s.mu.Unlock()
+		}
+		return nil, err
+	}
+	return user, nil
+}
+
+// CreateUser adds a new account. Called from the authenticated
+// /api/users endpoint so an existing user can invite a family member.
+// Returns ErrEmailTaken on UNIQUE conflict.
+func (s *Service) CreateUser(ctx context.Context, email, password, displayName string) (*User, error) {
+	if err := validatePassword(password); err != nil {
+		return nil, err
+	}
+	email, err := normalizeEmail(email)
+	if err != nil {
+		return nil, err
+	}
+	return s.insertUser(ctx, email, password, displayName)
+}
+
+func (s *Service) insertUser(ctx context.Context, email, password, displayName string) (*User, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	if err != nil {
+		return nil, fmt.Errorf("hash: %w", err)
+	}
+	now := s.now().UTC().Unix()
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO users (email, display_name, password_hash, created_at)
+		VALUES (?, ?, ?, ?)`,
+		email, strings.TrimSpace(displayName), string(hash), now,
+	)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrEmailTaken
+		}
+		return nil, fmt.Errorf("insert user: %w", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return nil, err
+	}
+	return &User{
+		ID:          id,
+		Email:       email,
+		DisplayName: strings.TrimSpace(displayName),
+		CreatedAt:   time.Unix(now, 0).UTC(),
+	}, nil
+}
+
+// ListUsers returns all accounts ordered by creation time.
+func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, email, display_name, created_at, COALESCE(last_login_at, 0)
+		FROM users ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []User
+	for rows.Next() {
+		var u User
+		var created, last int64
+		if err := rows.Scan(&u.ID, &u.Email, &u.DisplayName, &created, &last); err != nil {
+			return nil, err
+		}
+		u.CreatedAt = time.Unix(created, 0).UTC()
+		if last > 0 {
+			u.LastLoginAt = time.Unix(last, 0).UTC()
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// DeleteUser removes an account. Refuses to delete the last remaining
+// user so the operator can never get locked out by an accidental DELETE.
+// Cascading FK drops the user's sessions.
+func (s *Service) DeleteUser(ctx context.Context, id int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Check existence first so a missing id surfaces ErrUserNotFound
+	// even when only one user remains. Otherwise the operator can't
+	// tell apart "you can't delete the last user" from "that id was
+	// already gone."
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return ErrUserNotFound
+	}
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
+		return err
+	}
+	if n <= 1 {
+		return ErrLastUser
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ChangePassword updates a user's password. Verifies the existing
+// password first so a stolen session can't silently rotate credentials.
+//
+// All of the user's sessions are evicted on success, including the
+// caller's own — this is the primary incident-response action available
+// to a user who suspects a token has been stolen, and a quiet rotation
+// that left every existing token valid would defeat the purpose. The
+// caller's UI will see the next request return 401 and bounce to login.
+func (s *Service) ChangePassword(ctx context.Context, userID int64, oldPassword, newPassword string) error {
+	if err := validatePassword(newPassword); err != nil {
+		return err
+	}
+	var hash string
+	err := s.db.QueryRowContext(ctx, `SELECT password_hash FROM users WHERE id = ?`, userID).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrUserNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read auth.json: %w", err)
+		return err
 	}
-	var d onDisk
-	if err := json.Unmarshal(b, &d); err != nil {
-		return nil, fmt.Errorf("parse auth.json: %w", err)
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(oldPassword)) != nil {
+		return ErrInvalidPassword
 	}
-	if d.Hash == "" {
-		return nil, errors.New("auth.json present but missing hash")
-	}
-	a.hash = []byte(d.Hash)
-	return a, nil
-}
-
-func (a *Auth) Configured() bool {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return len(a.hash) > 0
-}
-
-// SetupToken returns the one-time first-run token, or "" if already
-// configured. Print this at startup so the operator can paste it into
-// the setup form — without it, a stranger who beats the operator to
-// /setup can lock them out by setting their own password.
-func (a *Auth) SetupToken() string {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.setupToken
-}
-
-// Status reports configured + authenticated atomically so the SPA
-// doesn't observe a half-mutated state during first-run setup.
-func (a *Auth) Status(token string) (configured, authenticated bool) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	configured = len(a.hash) > 0
-	if !configured || token == "" {
-		return
-	}
-	s, ok := a.sessions[token]
-	if ok && time.Now().Before(s.expires) {
-		authenticated = true
-	}
-	return
-}
-
-// SetPassword writes the initial password hash. Refuses to overwrite an
-// existing configuration so a stray /setup request can't lock the user
-// out by replacing the password. The token must match the one printed
-// at startup; this prevents a hostile party from racing the legitimate
-// operator during the first-run window.
-func (a *Auth) SetPassword(pw, token string) error {
-	if len(pw) < MinPasswordLen {
-		return ErrPasswordTooShort
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if len(a.hash) > 0 {
-		return ErrAlreadyConfigured
-	}
-	if a.setupToken == "" || subtle.ConstantTimeCompare([]byte(token), []byte(a.setupToken)) != 1 {
-		return ErrBadSetupToken
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcryptCost)
+	newHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcryptCost)
 	if err != nil {
 		return fmt.Errorf("hash: %w", err)
 	}
-	if err := writeJSONAtomic(a.path, onDisk{Hash: string(hash)}); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	a.hash = hash
-	a.setupToken = "" // one-shot
-	return nil
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE users SET password_hash = ? WHERE id = ?`, string(newHash), userID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM sessions WHERE user_id = ?`, userID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (a *Auth) Verify(pw string) bool {
-	a.mu.RLock()
-	hash := a.hash
-	a.mu.RUnlock()
-	if len(hash) == 0 {
-		return false
+// Login verifies credentials and tracks per-email failures. Returns the
+// user on success. On lockout, lockedUntil is non-zero — callers should
+// surface a 429 with Retry-After. On any other failure, returns
+// ErrInvalidLogin (constant message — never leak whether the email
+// exists).
+func (s *Service) Login(ctx context.Context, email, password string) (*User, time.Time, error) {
+	normalized, err := normalizeEmail(email)
+	if err != nil {
+		// Normalize errors are an obvious "bad format" — still bump the
+		// counter for the raw input so an attacker spraying badly-formed
+		// inputs trips the same gate.
+		normalized = strings.ToLower(strings.TrimSpace(email))
 	}
-	return bcrypt.CompareHashAndPassword(hash, []byte(pw)) == nil
+
+	// Lockout gate. Return ErrInvalidLogin alongside the unlock time so
+	// the handler can read both: until != zero ⇒ surface 429+Retry-After;
+	// otherwise ⇒ 401.
+	if locked, until, err := s.checkLock(ctx, normalized); err != nil {
+		return nil, time.Time{}, err
+	} else if locked {
+		return nil, until, ErrInvalidLogin
+	}
+
+	// Find the user. If missing, run bcrypt against a dummy hash so the
+	// timing doesn't reveal account existence.
+	var (
+		userID  int64
+		display string
+		created int64
+		lastLog sql.NullInt64
+		hash    string
+		found   bool
+	)
+	err = s.db.QueryRowContext(ctx, `
+		SELECT id, display_name, created_at, last_login_at, password_hash
+		FROM users WHERE email = ?`, normalized,
+	).Scan(&userID, &display, &created, &lastLog, &hash)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		found = false
+	case err != nil:
+		return nil, time.Time{}, err
+	default:
+		found = true
+	}
+
+	compareHash := []byte(hash)
+	if !found {
+		compareHash = dummyHash
+	}
+	bcryptOK := bcrypt.CompareHashAndPassword(compareHash, []byte(password)) == nil
+	if !found || !bcryptOK {
+		until, err := s.recordFailure(ctx, normalized)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		return nil, until, ErrInvalidLogin
+	}
+
+	if err := s.clearFailures(ctx, normalized); err != nil {
+		return nil, time.Time{}, err
+	}
+	now := s.now().UTC().Unix()
+	if _, err := s.db.ExecContext(ctx, `UPDATE users SET last_login_at = ? WHERE id = ?`, now, userID); err != nil {
+		return nil, time.Time{}, err
+	}
+	u := &User{
+		ID:          userID,
+		Email:       normalized,
+		DisplayName: display,
+		CreatedAt:   time.Unix(created, 0).UTC(),
+		LastLoginAt: time.Unix(now, 0).UTC(),
+	}
+	return u, time.Time{}, nil
 }
 
-// LoginAttempt verifies pw and tracks consecutive failures so a
-// patient brute-forcer (rotating IPs to skirt the HTTP rate limit)
-// still gets stopped at the auth layer. After maxFailedAttempts
-// consecutive failures, further attempts are rejected without
-// running bcrypt until lockoutDuration has elapsed.
-//
-// Successful verification resets the counter. The returned
-// lockedUntil is the zero value when the account is not locked.
-//
-// bcrypt is intentionally run *outside* the mutex so a slow hash
-// comparison (~100ms at cost 12) doesn't block ValidateSession on
-// every other admin request. If two attempts race past the lockout
-// gate, both run bcrypt and both increment failedAttempts on
-// failure — the lockout still triggers, just one bcrypt call later.
-func (a *Auth) LoginAttempt(pw string) (ok bool, lockedUntil time.Time) {
-	a.mu.Lock()
-	hash := a.hash
-	now := a.now()
-	if len(hash) == 0 {
-		a.mu.Unlock()
-		return false, time.Time{}
+func (s *Service) checkLock(ctx context.Context, email string) (locked bool, until time.Time, err error) {
+	var lockedUntil sql.NullInt64
+	err = s.db.QueryRowContext(ctx, `SELECT locked_until FROM login_attempts WHERE email = ?`, email).Scan(&lockedUntil)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, time.Time{}, nil
 	}
-	if !a.lockedUntil.IsZero() && now.Before(a.lockedUntil) {
-		locked := a.lockedUntil
-		a.mu.Unlock()
-		return false, locked
+	if err != nil {
+		return false, time.Time{}, err
 	}
-	a.mu.Unlock()
-
-	verified := bcrypt.CompareHashAndPassword(hash, []byte(pw)) == nil
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if verified {
-		a.failedAttempts = 0
-		a.lockedUntil = time.Time{}
-		return true, time.Time{}
+	if !lockedUntil.Valid {
+		return false, time.Time{}, nil
 	}
-	a.failedAttempts++
-	if a.failedAttempts >= maxFailedAttempts {
-		a.lockedUntil = a.now().Add(lockoutDuration)
-		log.Printf("auth: locking out after %d failed attempts; unlock at %s",
-			a.failedAttempts, a.lockedUntil.Format(time.RFC3339))
-		return false, a.lockedUntil
+	t := time.Unix(lockedUntil.Int64, 0)
+	if s.now().Before(t) {
+		return true, t, nil
 	}
-	return false, time.Time{}
+	// Lockout has expired. Clear the row so the failed_count resets to
+	// zero — otherwise the very next wrong password re-trips the lock,
+	// letting an attacker keep an account permanently locked with one
+	// probe per lockout window.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM login_attempts WHERE email = ?`, email); err != nil {
+		return false, time.Time{}, err
+	}
+	return false, time.Time{}, nil
 }
 
-// CreateSession returns a fresh opaque token bound to a server-side
-// expiry. Callers should set it in a cookie via SetCookie.
-func (a *Auth) CreateSession() (string, error) {
+func (s *Service) recordFailure(ctx context.Context, email string) (time.Time, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := s.now()
+	var failed int
+	var lastFailed int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT failed_count, last_failed_at FROM login_attempts WHERE email = ?`, email,
+	).Scan(&failed, &lastFailed)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, err
+	}
+	// Age out a stale counter: if it's been longer than the lockout
+	// window since the last failure, the campaign has gone cold and
+	// the counter should start fresh. Without this, four wrong
+	// passwords today + one wrong password next month = instant
+	// lockout, which is hostile to the operator without making the
+	// system more secure.
+	if lastFailed > 0 && now.Unix()-lastFailed > int64(lockoutDuration.Seconds()) {
+		failed = 0
+	}
+	failed++
+
+	var lockedUntil sql.NullInt64
+	var until time.Time
+	if failed >= maxFailedAttempts {
+		until = now.Add(lockoutDuration)
+		lockedUntil = sql.NullInt64{Int64: until.Unix(), Valid: true}
+		log.Printf("auth: locking out %q after %d failed attempts; unlock at %s",
+			email, failed, until.Format(time.RFC3339))
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO login_attempts (email, failed_count, last_failed_at, locked_until)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(email) DO UPDATE SET
+			failed_count   = excluded.failed_count,
+			last_failed_at = excluded.last_failed_at,
+			locked_until   = excluded.locked_until`,
+		email, failed, now.Unix(), lockedUntil,
+	)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return time.Time{}, err
+	}
+	return until, nil
+}
+
+func (s *Service) clearFailures(ctx context.Context, email string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM login_attempts WHERE email = ?`, email)
+	return err
+}
+
+// CreateSession inserts a fresh session row bound to userID and
+// returns its opaque token. Caller sets the cookie via SetCookie.
+func (s *Service) CreateSession(ctx context.Context, userID int64) (string, error) {
 	token, err := randomToken()
 	if err != nil {
 		return "", err
 	}
-	a.mu.Lock()
-	a.sessions[token] = session{expires: time.Now().Add(sessionTTL)}
-	a.mu.Unlock()
+	now := s.now().UTC().Unix()
+	expires := s.now().Add(sessionTTL).UTC().Unix()
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO sessions (token, user_id, created_at, last_seen_at, expires_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		token, userID, now, now, expires,
+	)
+	if err != nil {
+		return "", fmt.Errorf("insert session: %w", err)
+	}
 	return token, nil
 }
 
-func randomToken() (string, error) {
-	var buf [32]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return "", err
+// Lookup returns the user behind a session token, or nil if the token
+// is unknown or expired. Used by Middleware and /api/me.
+func (s *Service) Lookup(ctx context.Context, token string) (*User, error) {
+	if token == "" {
+		return nil, nil
 	}
-	return hex.EncodeToString(buf[:]), nil
+	var (
+		u       User
+		expires int64
+		created int64
+		lastLog sql.NullInt64
+	)
+	err := s.db.QueryRowContext(ctx, `
+		SELECT u.id, u.email, u.display_name, u.created_at, u.last_login_at, s.expires_at
+		FROM sessions s JOIN users u ON u.id = s.user_id
+		WHERE s.token = ?`, token,
+	).Scan(&u.ID, &u.Email, &u.DisplayName, &created, &lastLog, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if s.now().Unix() >= expires {
+		// Defer eviction to ReapSessions; treat as invalid here.
+		return nil, nil
+	}
+	u.CreatedAt = time.Unix(created, 0).UTC()
+	if lastLog.Valid {
+		u.LastLoginAt = time.Unix(lastLog.Int64, 0).UTC()
+	}
+	return &u, nil
 }
 
-// ReapSessions runs until ctx is cancelled, evicting expired session
-// tokens once an hour. Without this, abandoned tokens (browser closed
-// without logout) sit in the map until process restart.
-func (a *Auth) ReapSessions(ctx context.Context) {
-	t := time.NewTicker(time.Hour)
-	defer t.Stop()
+// DestroySession removes the session row. Idempotent.
+func (s *Service) DestroySession(ctx context.Context, token string) error {
+	if token == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE token = ?`, token)
+	return err
+}
+
+// ReapSessions runs until ctx is cancelled, deleting expired sessions
+// once an hour. Without this, abandoned tokens (browser closed without
+// logout) accumulate in the sessions table forever.
+func (s *Service) ReapSessions(ctx context.Context) {
+	tk := time.NewTicker(time.Hour)
+	defer tk.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-t.C:
-			a.mu.Lock()
-			for token, s := range a.sessions {
-				if now.After(s.expires) {
-					delete(a.sessions, token)
-				}
+		case <-tk.C:
+			now := s.now().Unix()
+			if _, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at < ?`, now); err != nil {
+				log.Printf("auth: reap sessions: %v", err)
 			}
-			a.mu.Unlock()
 		}
 	}
 }
 
-// ValidateSession returns true if the token is known and unexpired.
-// The fast path takes only the read lock so a slow login (bcrypt
-// holding the write lock briefly between snapshot and update) doesn't
-// stall every other admin request. Eviction of expired tokens is
-// deferred to ReapSessions; until then an expired token is treated as
-// invalid here, which is the only behavior callers care about.
-func (a *Auth) ValidateSession(token string) bool {
-	if token == "" {
-		return false
-	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	s, ok := a.sessions[token]
-	if !ok {
-		return false
-	}
-	if time.Now().After(s.expires) {
-		return false
-	}
-	return true
+// UserFrom returns the User attached to ctx by Middleware, or nil
+// if the request didn't pass through Middleware.
+func UserFrom(ctx context.Context) *User {
+	u, _ := ctx.Value(ctxKey{}).(*User)
+	return u
 }
 
-func (a *Auth) DestroySession(token string) {
-	if token == "" {
-		return
-	}
-	a.mu.Lock()
-	delete(a.sessions, token)
-	a.mu.Unlock()
+// Middleware enforces authentication. Unauth'd requests get 401 with
+// no body — the SPA handles redirect to login. On success, the User
+// is attached to the request context for handlers that want it.
+func (s *Service) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie(CookieName)
+		if err != nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		u, err := s.Lookup(r.Context(), c.Value)
+		if err != nil {
+			log.Printf("auth: lookup session: %v", err)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if u == nil {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		ctx := context.WithValue(r.Context(), ctxKey{}, u)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
-// SetCookie writes the session cookie. SameSite=Lax + HttpOnly are
-// always set; Secure is set when secure=true, which deployments
-// should pass when serving HTTPS so the cookie can never leak in
-// cleartext (notably on the first-visit HTTP→HTTPS redirect, before
-// HSTS is cached by the browser).
+// SetCookie writes the session cookie.
+//
+// SameSite=Strict closes the CSRF window that Lax leaves open: under
+// Lax, browsers still send the cookie on top-level POST navigations
+// (the bypass that a cross-site auto-submitting form exploits). Strict
+// withholds the cookie on every cross-site request. The behavioral cost
+// — clicking a link to /admin from another site lands you unauthed —
+// is fine for an admin UI; the operator just logs in. HttpOnly always
+// set; Secure when serving HTTPS so the cookie can't leak over the
+// first-visit HTTP→HTTPS redirect before HSTS caches.
 func SetCookie(w http.ResponseWriter, token string, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
@@ -312,7 +613,7 @@ func SetCookie(w http.ResponseWriter, token string, secure bool) {
 		Path:     "/admin",
 		HttpOnly: true,
 		Secure:   secure,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
 }
@@ -324,52 +625,46 @@ func ClearCookie(w http.ResponseWriter, secure bool) {
 		Path:     "/admin",
 		HttpOnly: true,
 		Secure:   secure,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   -1,
 	})
 }
 
-// Middleware enforces authentication on the wrapped handler. Unauth'd
-// requests get 401 with no body — the SPA handles redirect to login.
-func (a *Auth) Middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := r.Cookie(CookieName)
-		if err != nil || !a.ValidateSession(c.Value) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+func randomToken() (string, error) {
+	var buf [32]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf[:]), nil
 }
 
-func writeJSONAtomic(path string, v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
+func validatePassword(pw string) error {
+	if len(pw) < MinPasswordLen {
+		return ErrPasswordTooShort
+	}
+	return nil
+}
+
+func normalizeEmail(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", ErrInvalidEmail
+	}
+	addr, err := mail.ParseAddress(trimmed)
 	if err != nil {
-		return err
+		return "", ErrInvalidEmail
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	// fsync the file before rename so a power loss after rename can't
-	// leave the target path pointing to a zero-length inode. Losing the
-	// hash file would lock the operator out — fsync is cheap insurance.
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	// ParseAddress accepts the "Name <addr>" form too; we want just the
+	// addr-spec for storage. Lowercase the local-and-domain so login is
+	// case-insensitive (matches the UNIQUE COLLATE NOCASE column).
+	return strings.ToLower(addr.Address), nil
+}
+
+// isUniqueViolation reports whether err is a SQLite UNIQUE constraint
+// failure. modernc.org/sqlite (and mattn/go-sqlite3) both produce the
+// "UNIQUE constraint failed" prefix; we string-sniff rather than depend
+// on a driver-internal error type so the mapping survives a future
+// driver swap. Verified against modernc v1.x.
+func isUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }

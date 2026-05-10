@@ -18,6 +18,7 @@ import (
 	"github.com/nchapman/mizu/internal/admin"
 	"github.com/nchapman/mizu/internal/auth"
 	"github.com/nchapman/mizu/internal/config"
+	mizudb "github.com/nchapman/mizu/internal/db"
 	"github.com/nchapman/mizu/internal/feeds"
 	"github.com/nchapman/mizu/internal/media"
 	"github.com/nchapman/mizu/internal/post"
@@ -42,11 +43,15 @@ func main() {
 		log.Fatalf("posts: %v", err)
 	}
 
-	feedStore, err := feeds.OpenStore(cfg.Paths.Cache)
+	// One SQLite file holds everything durable: users, sessions,
+	// feeds/items, mentions, the draft salt. Schema is applied
+	// automatically on open via internal/db.
+	conn, err := mizudb.Open(cfg.Paths.DB)
 	if err != nil {
-		log.Fatalf("feed store: %v", err)
+		log.Fatalf("open db: %v", err)
 	}
 
+	feedStore := feeds.NewStore(conn)
 	feedSvc := feeds.NewService(feedStore, cfg.Paths.Subscriptions, cfg.Site.Title)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -62,15 +67,8 @@ func main() {
 		poller.Run(ctx)
 	}()
 
-	wmStore, err := webmention.OpenStore(cfg.Paths.Cache)
-	if err != nil {
-		log.Fatalf("webmention store: %v", err)
-	}
-	wmLog, err := webmention.NewLogger(cfg.Paths.State)
-	if err != nil {
-		log.Fatalf("webmention log: %v", err)
-	}
-	wmSvc := webmention.New(wmStore, wmLog, cfg.Site.BaseURL)
+	wmStore := webmention.NewStore(conn)
+	wmSvc := webmention.New(wmStore, cfg.Site.BaseURL)
 
 	// Boot-time sanity check: fail fast if the active theme is broken
 	// or missing, rather than letting the first render produce a 500.
@@ -80,7 +78,7 @@ func main() {
 		log.Fatalf("theme: %v", err)
 	}
 
-	draftSalt, err := render.LoadOrCreateDraftSalt(cfg.Paths.State)
+	draftSalt, err := render.LoadOrCreateDraftSalt(ctx, conn)
 	if err != nil {
 		log.Fatalf("draft salt: %v", err)
 	}
@@ -138,7 +136,7 @@ func main() {
 		wmSvc.RunVerifier(ctx)
 	}()
 
-	authSvc, err := auth.New(cfg.Paths.State)
+	authSvc, err := auth.New(conn)
 	if err != nil {
 		log.Fatalf("auth: %v", err)
 	}
@@ -233,6 +231,5 @@ func main() {
 	}()
 	shutWG.Wait()
 	bg.Wait()
-	_ = feedStore.Close()
-	_ = wmStore.Close()
+	_ = conn.Close()
 }

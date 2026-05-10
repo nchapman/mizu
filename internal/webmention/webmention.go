@@ -3,10 +3,9 @@
 // verification worker, and an outbound sender that scans published
 // posts for links and notifies the linked sites.
 //
-// Storage is split: webmentions.db (SQLite) is a queryable index of
-// the current state of every (source, target) pair; webmentions.log.jsonl
-// in the state dir is the durable append-only history. The DB can be
-// rebuilt from the log if it's ever lost.
+// State lives in the shared SQLite database (mentions table) — that's
+// the queryable index and the durable record. Schema lives in
+// internal/db/migrations.
 package webmention
 
 import (
@@ -24,11 +23,10 @@ import (
 	"github.com/nchapman/mizu/internal/safehttp"
 )
 
-// Service ties the store, log, and verifier together. One instance
-// per process; safe for concurrent use.
+// Service ties the store and verifier together. One instance per
+// process; safe for concurrent use.
 type Service struct {
 	store   *Store
-	log     *Logger
 	http    *http.Client
 	baseURL string // e.g. "https://example.com" — used to validate inbound targets
 
@@ -53,10 +51,9 @@ type job struct {
 
 // New wires up the service. baseURL is the site's public origin; only
 // targets within that origin are accepted by Receive.
-func New(store *Store, logger *Logger, baseURL string) *Service {
+func New(store *Store, baseURL string) *Service {
 	return &Service{
 		store:   store,
-		log:     logger,
 		http:    safehttp.NewClient(),
 		baseURL: strings.TrimRight(baseURL, "/"),
 		queue:   make(chan job, 256),
@@ -127,12 +124,6 @@ func (s *Service) Receive(ctx context.Context, source, target string) error {
 	if err := s.store.Upsert(ctx, m); err != nil {
 		return fmt.Errorf("store mention: %w", err)
 	}
-	_ = s.log.Append(LogEntry{
-		Direction: "received",
-		Source:    source,
-		Target:    target,
-		Status:    StatusPending,
-	})
 
 	// Non-blocking enqueue. If the queue is full the work is dropped
 	// at the door — the spec allows asynchronous processing and the
@@ -212,9 +203,6 @@ func (s *Service) processOne(ctx context.Context, j job) {
 			VerifiedAt: time.Now().UTC(),
 		}
 		_ = s.store.Upsert(jobCtx, m)
-		_ = s.log.Append(LogEntry{
-			Direction: "received", Source: j.source, Target: j.target, Status: StatusVerified,
-		})
 		s.fireOnChange()
 		return
 	}
@@ -223,7 +211,6 @@ func (s *Service) processOne(ctx context.Context, j job) {
 	// reachable and didn't link to us. Anything else (DNS failure,
 	// timeout, 5xx) we treat as transient — leave the row at
 	// StatusPending so a future startup or re-driver retries it.
-	// Always log the attempt either way.
 	if errors.Is(err, ErrLinkNotFound) {
 		m := Mention{
 			Source: j.source, Target: j.target,
@@ -237,15 +224,11 @@ func (s *Service) processOne(ctx context.Context, j job) {
 		// page on the next build. The hash-skip absorbs the no-op
 		// case where the mention was never verified to begin with.
 		s.fireOnChange()
+		return
 	}
-	status := StatusRejected
-	if !errors.Is(err, ErrLinkNotFound) {
-		status = StatusPending
-	}
-	_ = s.log.Append(LogEntry{
-		Direction: "received", Source: j.source, Target: j.target,
-		Status: status, Error: err.Error(),
-	})
+	// Transient: stash the latest error on the row but keep it pending
+	// so RunVerifier's startup sweep retries on the next process start.
+	_ = s.store.SetLastError(jobCtx, j.source, j.target, err.Error())
 }
 
 // ForTarget exposes the store's read API to handlers that render
@@ -343,15 +326,7 @@ func (s *Service) SendForPost(ctx context.Context, sourceURL, renderedHTML strin
 		}
 		if err := s.Send(ctx, endpoint, sourceURL, target); err != nil {
 			log.Printf("webmention: send %s -> %s: %v", sourceURL, target, err)
-			_ = s.log.Append(LogEntry{
-				Direction: "sent", Source: sourceURL, Target: target,
-				Status: StatusRejected, Error: err.Error(),
-			})
 			continue
 		}
-		_ = s.log.Append(LogEntry{
-			Direction: "sent", Source: sourceURL, Target: target,
-			Status: StatusVerified,
-		})
 	}
 }

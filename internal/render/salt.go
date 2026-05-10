@@ -1,80 +1,74 @@
 package render
 
 import (
+	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
-	"io/fs"
-	"os"
-	"path/filepath"
+	"fmt"
 )
 
+// draftSaltKey is the row in app_meta that stores the per-install
+// secret used to derive unguessable draft preview slugs.
+const draftSaltKey = "draft_salt"
+
 // LoadOrCreateDraftSalt returns the per-install secret used to derive
-// unguessable draft preview slugs. Persisted at <stateDir>/draft_salt
-// with mode 0o600 — readable by mizu only. A missing file is treated
-// as a fresh install: 32 random bytes are generated and written.
-func LoadOrCreateDraftSalt(stateDir string) ([]byte, error) {
-	path := filepath.Join(stateDir, "draft_salt")
-	b, err := os.ReadFile(path)
-	if err == nil {
-		// Stored hex-encoded for readability if an operator inspects the
-		// file. Decode failures are treated as corruption — regenerate
-		// rather than serve predictable URLs.
-		decoded, derr := hex.DecodeString(string(b))
-		if derr == nil && len(decoded) >= 16 {
-			return decoded, nil
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
+// unguessable draft preview slugs. The salt lives in the app_meta
+// table; the first call on a fresh DB generates 32 random bytes and
+// inserts them. Subsequent calls return the stored value.
+//
+// Stored hex-encoded for human inspection if the operator queries the
+// table directly. Decode failures are treated as corruption and the
+// caller gets an error rather than a silently regenerated salt — a
+// quietly rotated salt would invalidate every outstanding draft URL.
+func LoadOrCreateDraftSalt(ctx context.Context, db *sql.DB) ([]byte, error) {
+	if salt, ok, err := readSalt(ctx, db); err != nil {
+		return nil, err
+	} else if ok {
+		return salt, nil
+	}
+
+	// Generate and insert. INSERT OR IGNORE handles the race between
+	// two callers seeing an empty table simultaneously — whichever
+	// wins, both end up returning the same salt on the next read.
+	fresh := make([]byte, 32)
+	if _, err := rand.Read(fresh); err != nil {
+		return nil, fmt.Errorf("generate draft salt: %w", err)
+	}
+	encoded := hex.EncodeToString(fresh)
+	if _, err := db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO app_meta(key, value) VALUES(?, ?)`,
+		draftSaltKey, encoded,
+	); err != nil {
+		return nil, fmt.Errorf("insert draft salt: %w", err)
+	}
+	// Re-read so the loser of the insert race ends up with the same
+	// bytes as the winner.
+	salt, ok, err := readSalt(ctx, db)
+	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		return nil, err
-	}
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		return nil, err
-	}
-	encoded := []byte(hex.EncodeToString(salt))
-	// Write the salt with 0o600 mode from the start — the file's entire
-	// security value is its secrecy, so a wider permission even for the
-	// rename window is unacceptable. We bypass the shared atomicWrite
-	// helper (which hardcodes 0o644) and inline a 0o600 version.
-	if err := writeSecret(path, encoded); err != nil {
-		return nil, err
+	if !ok {
+		return nil, errors.New("draft salt missing after insert")
 	}
 	return salt, nil
 }
 
-func writeSecret(path string, body []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+func readSalt(ctx context.Context, db *sql.DB) ([]byte, bool, error) {
+	var value string
+	err := db.QueryRowContext(ctx,
+		`SELECT value FROM app_meta WHERE key = ?`, draftSaltKey,
+	).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
 	}
-	var rnd [6]byte
-	if _, err := rand.Read(rnd[:]); err != nil {
-		return err
-	}
-	tmp := path + ".tmp-" + hex.EncodeToString(rnd[:])
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return err
+		return nil, false, fmt.Errorf("read draft salt: %w", err)
 	}
-	if _, err := f.Write(body); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) < 16 {
+		return nil, false, fmt.Errorf("draft salt in app_meta is corrupt (len=%d, decode err=%v)", len(decoded), err)
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return decoded, true, nil
 }

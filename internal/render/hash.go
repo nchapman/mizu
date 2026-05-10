@@ -1,6 +1,7 @@
 package render
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -85,6 +86,46 @@ func sha256Hex(b []byte) string {
 // marshaling of map[string]string is stable in Go, but we route through
 // a sorted intermediate so the file diffs cleanly across builds even
 // if the upstream behavior ever changes.
+// writeSecret atomically writes body to path with mode 0o600 and an
+// fsync before rename, so a power loss can't leave the destination
+// pointing at a half-written or zero-length file. Used for files
+// whose security depends on staying readable only by mizu (build.json
+// reveals draft slugs, draft_salt is the HMAC key — when it was on
+// disk).
+func writeSecret(path string, body []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	var rnd [6]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return err
+	}
+	tmp := path + ".tmp-" + hex.EncodeToString(rnd[:])
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(body); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 func sortMap(m map[string]string) map[string]string {
 	if len(m) == 0 {
 		return m

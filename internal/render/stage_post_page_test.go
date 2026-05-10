@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nchapman/mizu/internal/db"
 	"github.com/nchapman/mizu/internal/webmention"
 )
 
@@ -37,16 +38,13 @@ func TestPostPage_MentionTrailingSlashKeyMatches(t *testing.T) {
 	// Patch the snapshot build to seed Mentions: easiest way is to
 	// run a Build with a stand-in WM service. Instead, set up a real
 	// in-memory store and upsert a verified row.
-	wmStore, err := webmention.OpenStore(t.TempDir())
+	conn, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = wmStore.Close() })
-	wmLog, err := webmention.NewLogger(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	wm := webmention.New(wmStore, wmLog, "https://example.test")
+	t.Cleanup(func() { _ = conn.Close() })
+	wmStore := webmention.NewStore(conn)
+	wm := webmention.New(wmStore, "https://example.test")
 	if err := wmStore.Upsert(context.Background(), webmention.Mention{
 		Source:     "https://other.example/x",
 		Target:     target,

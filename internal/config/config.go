@@ -60,8 +60,8 @@ type TLS struct {
 type Paths struct {
 	Content       string `yaml:"content"`
 	Media         string `yaml:"media"`
-	Cache         string `yaml:"cache"`
 	State         string `yaml:"state"`
+	DB            string `yaml:"db"`     // SQLite file; defaults to <state>/mizu.db
 	Public        string `yaml:"public"` // baked output of the render pipeline; defaults to <state>/public
 	Certs         string `yaml:"certs"`
 	AdminDist     string `yaml:"admin_dist"`
@@ -130,7 +130,6 @@ func Load(path string) (*Config, error) {
 		filepath.Join(c.Paths.Content, "posts"),
 		filepath.Join(c.Paths.Content, "drafts"),
 		c.Paths.Media,
-		c.Paths.Cache,
 		c.Paths.State,
 		c.Paths.Certs,
 		c.Paths.Public,
@@ -161,6 +160,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Paths.Public == "" {
 		c.Paths.Public = filepath.Join(c.Paths.State, "public")
+	}
+	if c.Paths.DB == "" {
+		c.Paths.DB = filepath.Join(c.Paths.State, "mizu.db")
 	}
 	if c.Server.TLS.Addr == "" {
 		c.Server.TLS.Addr = ":443"

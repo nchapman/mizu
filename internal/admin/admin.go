@@ -32,14 +32,14 @@ type Server struct {
 	posts  *post.Store
 	feeds  *feeds.Service
 	poller *feeds.Poller
-	auth   *auth.Auth
+	auth   *auth.Service
 	media  *media.Store
 	wm     *webmention.Service
 	dist   fs.FS           // built admin SPA (embedded by default)
 	bgCtx  context.Context // lives for the process lifetime; used for fire-and-forget jobs
 }
 
-func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller, a *auth.Auth, m *media.Store, wm *webmention.Service, dist fs.FS) *Server {
+func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller, a *auth.Service, m *media.Store, wm *webmention.Service, dist fs.FS) *Server {
 	return &Server{bgCtx: bgCtx, cfg: cfg, posts: posts, feeds: feedSvc, poller: poller, auth: a, media: m, wm: wm, dist: dist}
 }
 
@@ -52,7 +52,10 @@ func (s *Server) Routes(r chi.Router) {
 		r.Get("/me", s.me)
 		r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Setup)).Post("/setup", s.setup)
 		r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Login)).Post("/login", s.login)
-		r.Post("/logout", s.logout)
+		// Logout is reachable pre-auth (a stale cookie should still be
+		// clearable) but the per-IP cap keeps it from being abused as
+		// part of a denial-of-service or session-probe pattern.
+		r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Login)).Post("/logout", s.logout)
 
 		// Everything else requires a valid session.
 		r.Group(func(r chi.Router) {
@@ -80,6 +83,18 @@ func (s *Server) Routes(r chi.Router) {
 			r.Post("/media", s.uploadMedia)
 
 			r.Get("/mentions", s.listMentions)
+
+			// User management — any authenticated user can add or
+			// remove others, change their own password. No roles.
+			r.Get("/users", s.listUsers)
+			r.Post("/users", s.createUser)
+			r.Delete("/users/{id}", s.deleteUser)
+			// Password change is rate-limited because, while it requires
+			// a valid session, the old_password check is a credential
+			// oracle a stolen session could brute-force against bcrypt
+			// at the wire-speed limit. Reusing the login budget — same
+			// shape (per-IP credential probe), no need for a fresh knob.
+			r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Login)).Post("/me/password", s.changeOwnPassword)
 		})
 	})
 	r.Get("/*", s.serveSPA)
@@ -87,46 +102,63 @@ func (s *Server) Routes(r chi.Router) {
 
 // --- auth endpoints ---
 
-func (s *Server) me(w http.ResponseWriter, r *http.Request) {
-	var token string
-	if c, err := r.Cookie(auth.CookieName); err == nil {
-		token = c.Value
-	}
-	configured, authed := s.auth.Status(token)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"configured":    configured,
-		"authenticated": authed,
-		"site_title":    s.cfg.Site.Title,
-	})
+type userDTO struct {
+	ID          int64  `json:"id"`
+	Email       string `json:"email"`
+	DisplayName string `json:"display_name"`
+	CreatedAt   string `json:"created_at"`
+	LastLoginAt string `json:"last_login_at,omitempty"`
 }
 
-func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Password string `json:"password"`
-		Token    string `json:"token"`
+func toUserDTO(u *auth.User) userDTO {
+	dto := userDTO{
+		ID:          u.ID,
+		Email:       u.Email,
+		DisplayName: u.DisplayName,
+		CreatedAt:   u.CreatedAt.Format(time.RFC3339),
 	}
-	if !decodeJSON(w, r, s.cfg.Limits.Body.Setup, &in) {
-		return
+	if !u.LastLoginAt.IsZero() {
+		dto.LastLoginAt = u.LastLoginAt.Format(time.RFC3339)
 	}
-	err := s.auth.SetPassword(in.Password, in.Token)
-	if errors.Is(err, auth.ErrAlreadyConfigured) {
-		http.Error(w, err.Error(), http.StatusConflict)
-		return
-	}
-	if errors.Is(err, auth.ErrPasswordTooShort) {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if errors.Is(err, auth.ErrBadSetupToken) {
-		http.Error(w, err.Error(), http.StatusForbidden)
-		return
-	}
+	return dto
+}
+
+func (s *Server) me(w http.ResponseWriter, r *http.Request) {
+	configured, err := s.auth.Configured(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// Auto-login after setup so the user lands directly in the app.
-	token, err := s.auth.CreateSession()
+	resp := map[string]any{
+		"configured":    configured,
+		"authenticated": false,
+		"site_title":    s.cfg.Site.Title,
+	}
+	if c, err := r.Cookie(auth.CookieName); err == nil {
+		if u, err := s.auth.Lookup(r.Context(), c.Value); err == nil && u != nil {
+			resp["authenticated"] = true
+			resp["user"] = toUserDTO(u)
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Token       string `json:"token"`
+		Email       string `json:"email"`
+		Password    string `json:"password"`
+		DisplayName string `json:"display_name"`
+	}
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Setup, &in) {
+		return
+	}
+	u, err := s.auth.Setup(r.Context(), in.Token, in.Email, in.Password, in.DisplayName)
+	if code, mapped := mapAuthError(err); mapped != nil {
+		http.Error(w, mapped.Error(), code)
+		return
+	}
+	token, err := s.auth.CreateSession(r.Context(), u.ID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -136,31 +168,38 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	if !s.auth.Configured() {
+	configured, err := s.auth.Configured(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !configured {
 		http.Error(w, "not configured", http.StatusConflict)
 		return
 	}
 	var in struct {
+		Email    string `json:"email"`
 		Password string `json:"password"`
 	}
 	if !decodeJSON(w, r, s.cfg.Limits.Body.Login, &in) {
 		return
 	}
-	ok, lockedUntil := s.auth.LoginAttempt(in.Password)
-	if !ok {
-		if !lockedUntil.IsZero() {
-			retry := int(time.Until(lockedUntil).Seconds())
-			if retry < 1 {
-				retry = 1
-			}
-			w.Header().Set("Retry-After", strconv.Itoa(retry))
-			http.Error(w, "too many failed attempts; try again later", http.StatusTooManyRequests)
-			return
+	u, lockedUntil, err := s.auth.Login(r.Context(), in.Email, in.Password)
+	if !lockedUntil.IsZero() {
+		retry := int(time.Until(lockedUntil).Seconds())
+		if retry < 1 {
+			retry = 1
 		}
-		http.Error(w, "invalid password", http.StatusUnauthorized)
+		w.Header().Set("Retry-After", strconv.Itoa(retry))
+		http.Error(w, "too many failed attempts; try again later", http.StatusTooManyRequests)
 		return
 	}
-	token, err := s.auth.CreateSession()
+	if err != nil {
+		// Constant message — never reveal whether the email exists.
+		http.Error(w, "invalid email or password", http.StatusUnauthorized)
+		return
+	}
+	token, err := s.auth.CreateSession(r.Context(), u.ID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -171,10 +210,121 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(auth.CookieName); err == nil {
-		s.auth.DestroySession(c.Value)
+		_ = s.auth.DestroySession(r.Context(), c.Value)
 	}
 	auth.ClearCookie(w, s.cfg.Server.TLS.Enabled)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
+	users, err := s.auth.ListUsers(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := make([]userDTO, len(users))
+	for i := range users {
+		out[i] = toUserDTO(&users[i])
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Email       string `json:"email"`
+		Password    string `json:"password"`
+		DisplayName string `json:"display_name"`
+	}
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Setup, &in) {
+		return
+	}
+	u, err := s.auth.CreateUser(r.Context(), in.Email, in.Password, in.DisplayName)
+	if code, mapped := mapAuthError(err); mapped != nil {
+		http.Error(w, mapped.Error(), code)
+		return
+	}
+	writeJSON(w, http.StatusCreated, toUserDTO(u))
+}
+
+func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, "bad id", http.StatusBadRequest)
+		return
+	}
+	// Refuse self-deletion. The lower-level DeleteUser would allow it
+	// when another user exists, but that's a footgun: the operator
+	// drops their own account and has to remember another user's
+	// credentials to get back in. Rejecting at the handler is a small
+	// guardrail, not a security boundary.
+	if caller := auth.UserFrom(r.Context()); caller != nil && caller.ID == id {
+		http.Error(w, "cannot delete your own account", http.StatusForbidden)
+		return
+	}
+	err = s.auth.DeleteUser(r.Context(), id)
+	switch {
+	case errors.Is(err, auth.ErrUserNotFound):
+		http.NotFound(w, r)
+		return
+	case errors.Is(err, auth.ErrLastUser):
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// If the deleted user was the caller, the next request will fail
+	// auth because the cookie's session was cascaded away.
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) changeOwnPassword(w http.ResponseWriter, r *http.Request) {
+	caller := auth.UserFrom(r.Context())
+	if caller == nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var in struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Login, &in) {
+		return
+	}
+	err := s.auth.ChangePassword(r.Context(), caller.ID, in.OldPassword, in.NewPassword)
+	if code, mapped := mapAuthError(err); mapped != nil {
+		http.Error(w, mapped.Error(), code)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// mapAuthError translates a service-layer error into (status, clientError).
+// Returns (0, nil) when err is nil. Centralised so every endpoint
+// surfaces the same status codes for the same auth conditions.
+func mapAuthError(err error) (int, error) {
+	switch {
+	case err == nil:
+		return 0, nil
+	case errors.Is(err, auth.ErrAlreadyConfigured):
+		return http.StatusConflict, err
+	case errors.Is(err, auth.ErrPasswordTooShort), errors.Is(err, auth.ErrInvalidEmail):
+		return http.StatusBadRequest, err
+	case errors.Is(err, auth.ErrBadSetupToken):
+		return http.StatusForbidden, err
+	case errors.Is(err, auth.ErrEmailTaken):
+		return http.StatusConflict, err
+	case errors.Is(err, auth.ErrInvalidPassword):
+		return http.StatusUnauthorized, err
+	case errors.Is(err, auth.ErrUserNotFound):
+		return http.StatusNotFound, err
+	case errors.Is(err, auth.ErrLastUser):
+		return http.StatusConflict, err
+	case errors.Is(err, auth.ErrNotConfigured):
+		return http.StatusConflict, err
+	default:
+		return http.StatusInternalServerError, err
+	}
 }
 
 type postDTO struct {

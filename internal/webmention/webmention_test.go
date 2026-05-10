@@ -4,23 +4,27 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nchapman/mizu/internal/db"
 )
+
+func newStore(t *testing.T) *Store {
+	t.Helper()
+	conn, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return NewStore(conn)
+}
 
 func newService(t *testing.T, baseURL string) *Service {
 	t.Helper()
-	store, err := OpenStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	logger, err := NewLogger(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := New(store, logger, baseURL)
+	s := New(newStore(t), baseURL)
 	// Tests inject their own HTTP client that doesn't go through the
 	// SSRF filter, since httptest servers bind to 127.0.0.1.
 	s.http = http.DefaultClient

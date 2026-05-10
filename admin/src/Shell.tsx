@@ -39,7 +39,7 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
         )}
         {route === "subscriptions" && <SubscriptionsView onAuthLost={onLogout} />}
         {route === "mentions" && <MentionsView onAuthLost={onLogout} />}
-        {route === "settings" && <SettingsView />}
+        {route === "settings" && <SettingsView onAuthLost={onLogout} />}
       </main>
     </div>
   );

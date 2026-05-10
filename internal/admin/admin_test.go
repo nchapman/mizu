@@ -24,6 +24,7 @@ import (
 
 	"github.com/nchapman/mizu/internal/auth"
 	"github.com/nchapman/mizu/internal/config"
+	mizudb "github.com/nchapman/mizu/internal/db"
 	"github.com/nchapman/mizu/internal/feeds"
 	"github.com/nchapman/mizu/internal/media"
 	"github.com/nchapman/mizu/internal/post"
@@ -33,7 +34,7 @@ import (
 type harness struct {
 	srv    *Server
 	router http.Handler
-	auth   *auth.Auth
+	auth   *auth.Service
 	posts  *post.Store
 	feeds  *feeds.Service
 	media  *media.Store
@@ -56,8 +57,7 @@ func newHarness(t *testing.T) *harness {
 	}
 	mediaDir := filepath.Join(dir, "media")
 	stateDir := filepath.Join(dir, "state")
-	cacheDir := filepath.Join(dir, "cache")
-	for _, d := range []string{mediaDir, stateDir, cacheDir} {
+	for _, d := range []string{mediaDir, stateDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -71,15 +71,16 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := auth.New(stateDir)
+	conn, err := mizudb.Open(filepath.Join(stateDir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	feedStore, err := feeds.OpenStore(cacheDir)
+	t.Cleanup(func() { _ = conn.Close() })
+	a, err := auth.New(conn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = feedStore.Close() })
+	feedStore := feeds.NewStore(conn)
 	feedSvc := feeds.NewService(feedStore, filepath.Join(stateDir, "subs.opml"), "Test")
 	// Bypass safehttp for httptest URLs.
 	feedSvc.SetValidateForTest(func(_ context.Context, raw string) (string, error) {
@@ -91,16 +92,8 @@ func newHarness(t *testing.T) *harness {
 	poller := feeds.NewPoller(feedStore, 0, "test/1.0")
 	feeds.SetPollerHTTPForTest(poller, http.DefaultClient)
 
-	wmStore, err := webmention.OpenStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = wmStore.Close() })
-	wmLog, err := webmention.NewLogger(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	wm := webmention.New(wmStore, wmLog, "https://example.test")
+	wmStore := webmention.NewStore(conn)
+	wm := webmention.New(wmStore, "https://example.test")
 
 	cfg := &config.Config{
 		Site:  config.Site{Title: "Test", BaseURL: "https://example.test"},
@@ -121,14 +114,16 @@ func newHarness(t *testing.T) *harness {
 	}
 }
 
-// login configures the auth subsystem and returns a session cookie.
+// login runs first-run setup with a fixed email/password and returns
+// a session cookie ready to attach to subsequent requests.
 func (h *harness) login(t *testing.T) *http.Cookie {
 	t.Helper()
 	tok := h.auth.SetupToken()
-	if err := h.auth.SetPassword("hunter22pw", tok); err != nil {
+	u, err := h.auth.Setup(context.Background(), tok, "alice@example.com", "hunter22pw", "Alice")
+	if err != nil {
 		t.Fatal(err)
 	}
-	sess, err := h.auth.CreateSession()
+	sess, err := h.auth.CreateSession(context.Background(), u.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +185,12 @@ func TestSetup_HappyPath(t *testing.T) {
 	h := newHarness(t)
 	tok := h.auth.SetupToken()
 	w := h.do(t, "POST", "/admin/api/setup",
-		map[string]string{"password": "hunter22pw", "token": tok}, nil)
+		map[string]string{
+			"email":        "alice@example.com",
+			"password":     "hunter22pw",
+			"display_name": "Alice",
+			"token":        tok,
+		}, nil)
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
 	}
@@ -198,7 +198,7 @@ func TestSetup_HappyPath(t *testing.T) {
 	if len(cookies) == 0 {
 		t.Fatal("setup did not set session cookie")
 	}
-	// /me with the cookie should now show authenticated.
+	// /me with the cookie should now show authenticated + user.
 	req := httptest.NewRequest("GET", "/admin/api/me", nil)
 	req.AddCookie(cookies[0])
 	w2 := httptest.NewRecorder()
@@ -208,12 +208,19 @@ func TestSetup_HappyPath(t *testing.T) {
 	if got["configured"] != true || got["authenticated"] != true {
 		t.Errorf("after setup: got %+v", got)
 	}
+	user, ok := got["user"].(map[string]any)
+	if !ok {
+		t.Fatalf("/me did not return user: %+v", got)
+	}
+	if user["email"] != "alice@example.com" || user["display_name"] != "Alice" {
+		t.Errorf("user payload = %+v", user)
+	}
 }
 
 func TestSetup_RejectsBadToken(t *testing.T) {
 	h := newHarness(t)
 	w := h.do(t, "POST", "/admin/api/setup",
-		map[string]string{"password": "hunter22pw", "token": "wrong"}, nil)
+		map[string]string{"email": "a@b.com", "password": "hunter22pw", "token": "wrong"}, nil)
 	if w.Code != http.StatusForbidden {
 		t.Errorf("code=%d, want 403", w.Code)
 	}
@@ -222,7 +229,16 @@ func TestSetup_RejectsBadToken(t *testing.T) {
 func TestSetup_RejectsShortPassword(t *testing.T) {
 	h := newHarness(t)
 	w := h.do(t, "POST", "/admin/api/setup",
-		map[string]string{"password": "x", "token": h.auth.SetupToken()}, nil)
+		map[string]string{"email": "a@b.com", "password": "x", "token": h.auth.SetupToken()}, nil)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("code=%d, want 400", w.Code)
+	}
+}
+
+func TestSetup_RejectsInvalidEmail(t *testing.T) {
+	h := newHarness(t)
+	w := h.do(t, "POST", "/admin/api/setup",
+		map[string]string{"email": "not an email", "password": "hunter22pw", "token": h.auth.SetupToken()}, nil)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("code=%d, want 400", w.Code)
 	}
@@ -230,7 +246,7 @@ func TestSetup_RejectsShortPassword(t *testing.T) {
 
 func TestLogin_BeforeSetupConflicts(t *testing.T) {
 	h := newHarness(t)
-	w := h.do(t, "POST", "/admin/api/login", map[string]string{"password": "x"}, nil)
+	w := h.do(t, "POST", "/admin/api/login", map[string]string{"email": "a@b.com", "password": "x"}, nil)
 	if w.Code != http.StatusConflict {
 		t.Errorf("code=%d, want 409", w.Code)
 	}
@@ -238,17 +254,29 @@ func TestLogin_BeforeSetupConflicts(t *testing.T) {
 
 func TestLogin_WrongPassword(t *testing.T) {
 	h := newHarness(t)
-	h.login(t) // configure auth
-	w := h.do(t, "POST", "/admin/api/login", map[string]string{"password": "wrong-password"}, nil)
+	h.login(t)
+	w := h.do(t, "POST", "/admin/api/login",
+		map[string]string{"email": "alice@example.com", "password": "wrong-password"}, nil)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("code=%d, want 401", w.Code)
+	}
+}
+
+func TestLogin_UnknownEmailReturnsSame401(t *testing.T) {
+	h := newHarness(t)
+	h.login(t)
+	w := h.do(t, "POST", "/admin/api/login",
+		map[string]string{"email": "ghost@example.com", "password": "anything22"}, nil)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("code=%d, want 401 (must not 404 or 409, which would leak existence)", w.Code)
 	}
 }
 
 func TestLogin_HappyPath(t *testing.T) {
 	h := newHarness(t)
 	h.login(t)
-	w := h.do(t, "POST", "/admin/api/login", map[string]string{"password": "hunter22pw"}, nil)
+	w := h.do(t, "POST", "/admin/api/login",
+		map[string]string{"email": "alice@example.com", "password": "hunter22pw"}, nil)
 	if w.Code != http.StatusNoContent {
 		t.Errorf("code=%d body=%s", w.Code, w.Body.String())
 	}
@@ -260,11 +288,8 @@ func TestLogin_HappyPath(t *testing.T) {
 func TestLogin_OversizeBodyRejected(t *testing.T) {
 	h := newHarness(t)
 	h.login(t)
-	// Structurally valid JSON whose total size blows past the cap, so
-	// the decoder hits MaxBytesReader rather than failing on the first
-	// stray byte.
 	pad := strings.Repeat("a", int(h.cfg.Limits.Body.Login)+1)
-	big := `{"password":"` + pad + `"}`
+	big := `{"email":"alice@example.com","password":"` + pad + `"}`
 	w := h.do(t, "POST", "/admin/api/login", big, nil)
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("code=%d, want 413", w.Code)
@@ -274,17 +299,16 @@ func TestLogin_OversizeBodyRejected(t *testing.T) {
 func TestLogin_RateLimit(t *testing.T) {
 	h := newHarness(t)
 	h.login(t)
-	// Use the correct password so each call succeeds; we want to
-	// observe the per-IP rate limit independently of the auth-layer
-	// lockout (which also returns 429 but for failed-attempt reasons).
 	limit := h.cfg.Limits.Rate.Login.Requests
 	for i := 0; i < limit; i++ {
-		w := h.do(t, "POST", "/admin/api/login", map[string]string{"password": "hunter22pw"}, nil)
+		w := h.do(t, "POST", "/admin/api/login",
+			map[string]string{"email": "alice@example.com", "password": "hunter22pw"}, nil)
 		if w.Code == http.StatusTooManyRequests {
 			t.Fatalf("hit 429 too early at request %d", i)
 		}
 	}
-	w := h.do(t, "POST", "/admin/api/login", map[string]string{"password": "hunter22pw"}, nil)
+	w := h.do(t, "POST", "/admin/api/login",
+		map[string]string{"email": "alice@example.com", "password": "hunter22pw"}, nil)
 	if w.Code != http.StatusTooManyRequests {
 		t.Errorf("code=%d, want 429 after %d requests", w.Code, limit)
 	}
@@ -293,18 +317,95 @@ func TestLogin_RateLimit(t *testing.T) {
 func TestLogin_LockoutAfterFailures(t *testing.T) {
 	h := newHarness(t)
 	h.login(t)
-	// Five wrong-password attempts trip the auth-layer lockout.
 	const max = 5
 	for i := 0; i < max; i++ {
-		h.do(t, "POST", "/admin/api/login", map[string]string{"password": "wrong"}, nil)
+		h.do(t, "POST", "/admin/api/login",
+			map[string]string{"email": "alice@example.com", "password": "wrong"}, nil)
 	}
-	// Even the correct password is rejected while locked.
-	w := h.do(t, "POST", "/admin/api/login", map[string]string{"password": "hunter22pw"}, nil)
+	w := h.do(t, "POST", "/admin/api/login",
+		map[string]string{"email": "alice@example.com", "password": "hunter22pw"}, nil)
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("code=%d, want 429 (locked)", w.Code)
 	}
 	if w.Result().Header.Get("Retry-After") == "" {
 		t.Error("missing Retry-After header on lockout")
+	}
+}
+
+func TestUsers_CRUDAndDeleteSelfCascades(t *testing.T) {
+	h := newHarness(t)
+	c := h.login(t)
+	// Add a second user.
+	w := h.do(t, "POST", "/admin/api/users",
+		map[string]string{"email": "bob@example.com", "password": "hunter22pw", "display_name": "Bob"}, c)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create code=%d body=%s", w.Code, w.Body.String())
+	}
+	var bob userDTO
+	json.NewDecoder(w.Body).Decode(&bob)
+	if bob.Email != "bob@example.com" {
+		t.Errorf("bob.Email=%q", bob.Email)
+	}
+
+	// Duplicate email → 409.
+	w = h.do(t, "POST", "/admin/api/users",
+		map[string]string{"email": "BOB@example.com", "password": "another22"}, c)
+	if w.Code != http.StatusConflict {
+		t.Errorf("duplicate code=%d, want 409", w.Code)
+	}
+
+	// List shows two users.
+	w = h.do(t, "GET", "/admin/api/users", nil, c)
+	var list []userDTO
+	json.NewDecoder(w.Body).Decode(&list)
+	if len(list) != 2 {
+		t.Errorf("list len=%d", len(list))
+	}
+
+	// Delete Bob.
+	w = h.do(t, "DELETE", "/admin/api/users/"+strconv.FormatInt(bob.ID, 10), nil, c)
+	if w.Code != http.StatusNoContent {
+		t.Errorf("delete code=%d body=%s", w.Code, w.Body.String())
+	}
+	// (The "can't delete the last user" rule is enforced at the service
+	// layer and covered in internal/auth tests. The handler-level
+	// self-delete guard short-circuits before reaching it, so we can't
+	// exercise that branch from here.)
+}
+
+func TestUsers_RejectsSelfDelete(t *testing.T) {
+	h := newHarness(t)
+	c := h.login(t)
+	w := h.do(t, "GET", "/admin/api/users", nil, c)
+	var list []userDTO
+	json.NewDecoder(w.Body).Decode(&list)
+	if len(list) != 1 {
+		t.Fatalf("expected 1 user after login, got %d", len(list))
+	}
+	w = h.do(t, "DELETE", "/admin/api/users/"+strconv.FormatInt(list[0].ID, 10), nil, c)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("self-delete code=%d, want 403", w.Code)
+	}
+}
+
+func TestChangeOwnPassword(t *testing.T) {
+	h := newHarness(t)
+	c := h.login(t)
+	w := h.do(t, "POST", "/admin/api/me/password",
+		map[string]string{"old_password": "wrong", "new_password": "newpassword22"}, c)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("wrong old code=%d, want 401", w.Code)
+	}
+	w = h.do(t, "POST", "/admin/api/me/password",
+		map[string]string{"old_password": "hunter22pw", "new_password": "newpassword22"}, c)
+	if w.Code != http.StatusNoContent {
+		t.Errorf("happy path code=%d body=%s", w.Code, w.Body.String())
+	}
+	// Old password should no longer work.
+	w = h.do(t, "POST", "/admin/api/login",
+		map[string]string{"email": "alice@example.com", "password": "hunter22pw"}, nil)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("old password still works: code=%d", w.Code)
 	}
 }
 

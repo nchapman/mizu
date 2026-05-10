@@ -4,55 +4,19 @@
 // Two storage layers cooperate:
 //
 //   - subscriptions.opml on disk is the durable, portable source of truth
-//     for the user's subscription list.
-//   - cache/mizu.db (SQLite) is a regeneratable cache of fetched items
-//     and read state, indexed for timeline queries.
-//
-// The DB can be deleted at any time: the next poll will repopulate items
-// from the OPML. Read state is the only thing that doesn't survive a wipe;
-// a future iteration may move it to a JSON sidecar for portability.
+//     for the user's subscription list — easy to back up, easy to move
+//     between instances.
+//   - state/mizu.db (the shared SQLite owned by internal/db) holds the
+//     fetched items and read state. Schema for the feeds/items tables
+//     lives in db/migrations/.
 package feeds
 
 import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
-	"path/filepath"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
-
-const schema = `
-CREATE TABLE IF NOT EXISTS feeds (
-  id              INTEGER PRIMARY KEY,
-  url             TEXT NOT NULL UNIQUE,
-  title           TEXT,
-  site_url        TEXT,
-  category        TEXT,
-  etag            TEXT,
-  last_modified   TEXT,
-  last_fetched_at INTEGER,
-  last_error      TEXT
-);
-
-CREATE TABLE IF NOT EXISTS items (
-  id           INTEGER PRIMARY KEY,
-  feed_id      INTEGER NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
-  guid         TEXT NOT NULL,
-  url          TEXT,
-  title        TEXT,
-  author       TEXT,
-  content      TEXT,
-  published_at INTEGER,
-  fetched_at   INTEGER NOT NULL,
-  read_at      INTEGER,
-  UNIQUE(feed_id, guid)
-);
-
-CREATE INDEX IF NOT EXISTS items_published_idx ON items(published_at DESC);
-`
 
 type Feed struct {
 	ID            int64
@@ -80,24 +44,15 @@ type Item struct {
 	ReadAt      *time.Time
 }
 
+// Store reads and writes the feeds/items tables on the shared *sql.DB.
+// Schema is managed centrally by internal/db; we don't own the
+// connection here, so Close is a no-op.
 type Store struct {
 	db *sql.DB
 }
 
-func OpenStore(cacheDir string) (*Store, error) {
-	dsn := filepath.Join(cacheDir, "mizu.db") + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("schema: %w", err)
-	}
-	return &Store{db: db}, nil
-}
-
-func (s *Store) Close() error { return s.db.Close() }
+// NewStore wires a Store onto an already-open, already-migrated DB.
+func NewStore(db *sql.DB) *Store { return &Store{db: db} }
 
 // UpsertFeed inserts or updates a feed by URL, preserving fetch metadata
 // (etag, last_modified) on conflict so an OPML re-import doesn't force a
@@ -123,9 +78,8 @@ func (s *Store) DeleteFeedByURL(ctx context.Context, url string) error {
 
 func (s *Store) ListFeeds(ctx context.Context) ([]Feed, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, url, COALESCE(title,''), COALESCE(site_url,''), COALESCE(category,''),
-       COALESCE(etag,''), COALESCE(last_modified,''), COALESCE(last_fetched_at,0),
-       COALESCE(last_error,'')
+SELECT id, url, title, site_url, category, etag, last_modified,
+       COALESCE(last_fetched_at, 0), last_error
 FROM feeds ORDER BY title`)
 	if err != nil {
 		return nil, err
@@ -157,9 +111,9 @@ UPDATE feeds SET
   etag = ?,
   last_modified = ?,
   last_fetched_at = ?,
-  last_error = NULL,
-  title    = CASE WHEN COALESCE(title,'')    = '' THEN ? ELSE title    END,
-  site_url = CASE WHEN COALESCE(site_url,'') = '' THEN ? ELSE site_url END
+  last_error = '',
+  title    = CASE WHEN title    = '' THEN ? ELSE title    END,
+  site_url = CASE WHEN site_url = '' THEN ? ELSE site_url END
 WHERE id = ?`, etag, lastModified, time.Now().Unix(), parsedTitle, parsedSiteURL, feedID)
 	return err
 }
@@ -221,10 +175,9 @@ func (s *Store) Timeline(ctx context.Context, before TimelineCursor, limit int, 
 	}
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, `
-SELECT items.id, items.feed_id, COALESCE(feeds.title,''), items.guid,
-       COALESCE(items.url,''), COALESCE(items.title,''), COALESCE(items.author,''),
-       COALESCE(items.content,''), COALESCE(items.published_at,0), items.fetched_at,
-       items.read_at
+SELECT items.id, items.feed_id, feeds.title, items.guid,
+       items.url, items.title, items.author, items.content,
+       COALESCE(items.published_at, 0), items.fetched_at, items.read_at
 FROM items JOIN feeds ON feeds.id = items.feed_id
 WHERE `+where+`
 ORDER BY COALESCE(items.published_at, 0) DESC, items.id DESC
@@ -282,7 +235,7 @@ func (s *Store) MarkRead(ctx context.Context, itemID int64, read bool) error {
 
 // FeedFetchInfo returns the conditional-GET headers for the next poll.
 func (s *Store) FeedFetchInfo(ctx context.Context, feedID int64) (etag, lastModified string, err error) {
-	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(etag,''), COALESCE(last_modified,'') FROM feeds WHERE id = ?`, feedID)
+	row := s.db.QueryRowContext(ctx, `SELECT etag, last_modified FROM feeds WHERE id = ?`, feedID)
 	err = row.Scan(&etag, &lastModified)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = nil

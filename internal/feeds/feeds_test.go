@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nchapman/mizu/internal/db"
 )
 
 // noopValidate accepts every URL unchanged. Tests use it so they can
@@ -22,11 +24,12 @@ func noopValidate(_ context.Context, raw string) (string, error) {
 func newService(t *testing.T) *Service {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := OpenStore(dir)
+	conn, err := db.Open(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
+	t.Cleanup(func() { _ = conn.Close() })
+	st := NewStore(conn)
 	s := NewService(st, filepath.Join(dir, "subs.opml"), "My Site")
 	s.validate = noopValidate
 	return s

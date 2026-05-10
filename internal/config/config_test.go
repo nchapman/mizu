@@ -31,7 +31,6 @@ server:
 paths:
   content: `+filepath.Join(dir, "content")+`
   media: `+filepath.Join(dir, "media")+`
-  cache: `+filepath.Join(dir, "cache")+`
   state: `+filepath.Join(dir, "state")+`
 poller:
   interval: 30m
@@ -57,7 +56,6 @@ poller:
 		filepath.Join(dir, "content", "posts"),
 		filepath.Join(dir, "content", "drafts"),
 		filepath.Join(dir, "media"),
-		filepath.Join(dir, "cache"),
 		filepath.Join(dir, "state"),
 	} {
 		info, err := os.Stat(d)
@@ -78,7 +76,6 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 paths:
   content: `+filepath.Join(dir, "content")+`
   media: `+filepath.Join(dir, "media")+`
-  cache: `+filepath.Join(dir, "cache")+`
   state: `+filepath.Join(dir, "state")+`
 `)
 	c, err := Load(cfgPath)
@@ -118,7 +115,6 @@ func TestLoad_TLSValidation(t *testing.T) {
 paths:
   content: ` + filepath.Join(dir, "content") + `
   media: ` + filepath.Join(dir, "media") + `
-  cache: ` + filepath.Join(dir, "cache") + `
   state: ` + filepath.Join(dir, "state") + `
 `
 	// Enabled but missing domains and email.
@@ -185,7 +181,6 @@ func TestLoad_MkdirOverFile(t *testing.T) {
 paths:
   content: `+conflict+`
   media: `+filepath.Join(dir, "media")+`
-  cache: `+filepath.Join(dir, "cache")+`
   state: `+filepath.Join(dir, "state")+`
 `)
 	_, err := Load(cfgPath)

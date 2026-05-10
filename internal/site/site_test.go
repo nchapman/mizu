@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/nchapman/mizu/internal/config"
+	mizudb "github.com/nchapman/mizu/internal/db"
 	"github.com/nchapman/mizu/internal/webmention"
 )
 
@@ -26,16 +27,12 @@ func newSite(t *testing.T) (*Server, http.Handler, string) {
 	}
 	cfg.ApplyDefaults()
 
-	wmStore, err := webmention.OpenStore(t.TempDir())
+	conn, err := mizudb.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = wmStore.Close() })
-	wmLog, err := webmention.NewLogger(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	wm := webmention.New(wmStore, wmLog, "https://example.test")
+	t.Cleanup(func() { _ = conn.Close() })
+	wm := webmention.New(webmention.NewStore(conn), "https://example.test")
 
 	srv := New(cfg, wm, publicDir)
 	r := chi.NewRouter()

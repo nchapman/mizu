@@ -6,6 +6,8 @@ import { Label } from "@/components/ui/label";
 
 export function Setup({ onDone, siteTitle }: { onDone: () => void; siteTitle?: string }) {
   const [token, setToken] = useState("");
+  const [email, setEmail] = useState("");
+  const [displayName, setDisplayName] = useState("");
   const [pw, setPw] = useState("");
   const [pw2, setPw2] = useState("");
   const [err, setErr] = useState("");
@@ -15,6 +17,7 @@ export function Setup({ onDone, siteTitle }: { onDone: () => void; siteTitle?: s
     e.preventDefault();
     setErr("");
     if (!token.trim()) return setErr("Setup token required (printed in the server log).");
+    if (!email.trim()) return setErr("Email required.");
     if (pw.length < 8) return setErr("Password must be at least 8 characters.");
     if (pw !== pw2) return setErr("Passwords don't match.");
     setBusy(true);
@@ -24,7 +27,12 @@ export function Setup({ onDone, siteTitle }: { onDone: () => void; siteTitle?: s
       const r = await fetch("/admin/api/setup", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ password: pw, token: token.trim() }),
+        body: JSON.stringify({
+          token: token.trim(),
+          email: email.trim(),
+          display_name: displayName.trim(),
+          password: pw,
+        }),
       });
       if (!r.ok) {
         setErr((await r.text()) || "Setup failed.");
@@ -50,8 +58,8 @@ export function Setup({ onDone, siteTitle }: { onDone: () => void; siteTitle?: s
       </header>
       <h1 className="mb-2 text-lg font-semibold">Welcome to mizu</h1>
       <p className="mb-4 text-sm text-muted-foreground">
-        Set a password to lock down the admin UI. The one-time setup token was printed to your
-        server log when mizu started — paste it below to prove you're the operator.
+        Create your account. The one-time setup token was printed to your server log when
+        mizu started — paste it below to prove you're the operator.
       </p>
       <form onSubmit={submit} className="space-y-3 rounded-xl border border-border bg-card p-4 shadow-sm">
         <div className="space-y-1.5">
@@ -67,10 +75,29 @@ export function Setup({ onDone, siteTitle }: { onDone: () => void; siteTitle?: s
           />
         </div>
         <div className="space-y-1.5">
+          <Label htmlFor="setup-email">Email</Label>
+          <Input
+            id="setup-email"
+            type="email"
+            autoComplete="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="setup-display-name">Display name (optional)</Label>
+          <Input
+            id="setup-display-name"
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+          />
+        </div>
+        <div className="space-y-1.5">
           <Label htmlFor="setup-password">New password</Label>
           <Input
             id="setup-password"
             type="password"
+            autoComplete="new-password"
             value={pw}
             onChange={(e) => setPw(e.target.value)}
           />
@@ -80,6 +107,7 @@ export function Setup({ onDone, siteTitle }: { onDone: () => void; siteTitle?: s
           <Input
             id="setup-password-confirm"
             type="password"
+            autoComplete="new-password"
             value={pw2}
             onChange={(e) => setPw2(e.target.value)}
           />
@@ -91,7 +119,7 @@ export function Setup({ onDone, siteTitle }: { onDone: () => void; siteTitle?: s
         )}
         <div className="flex justify-end">
           <Button type="submit" size="sm" disabled={busy}>
-            {busy ? "Saving…" : "Set password"}
+            {busy ? "Saving…" : "Create account"}
           </Button>
         </div>
       </form>

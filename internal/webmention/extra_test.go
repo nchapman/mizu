@@ -2,113 +2,18 @@ package webmention
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// --- Logger ---
-
-func TestLogger_AppendAndReplay(t *testing.T) {
-	dir := t.TempDir()
-	l, err := NewLogger(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	entries := []LogEntry{
-		{Direction: "received", Source: "https://a/", Target: "https://b/", Status: StatusPending},
-		{Direction: "received", Source: "https://a/", Target: "https://b/", Status: StatusVerified},
-		{Direction: "sent", Source: "https://b/", Target: "https://c/", Status: StatusVerified},
-	}
-	for _, e := range entries {
-		if err := l.Append(e); err != nil {
-			t.Fatal(err)
-		}
-	}
-	var got []LogEntry
-	if err := l.Replay(func(e LogEntry) error {
-		got = append(got, e)
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != len(entries) {
-		t.Fatalf("got %d entries, want %d", len(got), len(entries))
-	}
-	for i := range got {
-		if got[i].Source != entries[i].Source || got[i].Target != entries[i].Target ||
-			got[i].Status != entries[i].Status || got[i].Direction != entries[i].Direction {
-			t.Errorf("entry %d mismatch: %+v vs %+v", i, got[i], entries[i])
-		}
-		if got[i].At.IsZero() {
-			t.Errorf("entry %d At not auto-populated", i)
-		}
-	}
-}
-
-func TestLogger_ReplayMissingFile(t *testing.T) {
-	l, err := NewLogger(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// No Append() yet: Replay must succeed with zero entries.
-	called := 0
-	if err := l.Replay(func(LogEntry) error { called++; return nil }); err != nil {
-		t.Errorf("Replay on empty log: %v", err)
-	}
-	if called != 0 {
-		t.Errorf("called=%d, want 0", called)
-	}
-}
-
-func TestLogger_ReplayCorruptLineErrors(t *testing.T) {
-	dir := t.TempDir()
-	l, err := NewLogger(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Append(LogEntry{Direction: "received", Source: "a", Target: "b", Status: StatusPending}); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "webmentions.log.jsonl"),
-		[]byte(`{"direction":"received","source":"a","target":"b","status":"pending"}`+"\n"+`not json`+"\n"),
-		0o600); err != nil {
-		t.Fatal(err)
-	}
-	err = l.Replay(func(LogEntry) error { return nil })
-	if err == nil {
-		t.Fatal("expected error on corrupt line, got nil")
-	}
-}
-
-func TestLogger_ReplayPropagatesFnError(t *testing.T) {
-	l, err := NewLogger(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Append(LogEntry{Direction: "received", Source: "a", Target: "b", Status: StatusPending}); err != nil {
-		t.Fatal(err)
-	}
-	want := errors.New("boom")
-	if got := l.Replay(func(LogEntry) error { return want }); !errors.Is(got, want) {
-		t.Errorf("got %v, want %v", got, want)
-	}
-}
-
 // --- Store: Pending and ForTarget filtering ---
 
 func TestStore_PendingOnlyReturnsPending(t *testing.T) {
-	st, err := OpenStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := newStore(t)
 	ctx := context.Background()
 	must := func(m Mention) {
 		if err := st.Upsert(ctx, m); err != nil {
@@ -141,11 +46,7 @@ func TestStore_PendingOnlyReturnsPending(t *testing.T) {
 }
 
 func TestStore_UpsertReplacesStatus(t *testing.T) {
-	st, err := OpenStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := newStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
 	if err := st.Upsert(ctx, Mention{Source: "s", Target: "t", Status: StatusPending, ReceivedAt: now}); err != nil {
@@ -167,11 +68,7 @@ func TestStore_UpsertReplacesStatus(t *testing.T) {
 }
 
 func TestStore_RecentVerifiedAcrossTargets(t *testing.T) {
-	st, err := OpenStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := newStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
 	must := func(m Mention) {
@@ -199,11 +96,7 @@ func TestStore_RecentVerifiedAcrossTargets(t *testing.T) {
 }
 
 func TestStore_RecentRespectsLimit(t *testing.T) {
-	st, err := OpenStore(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
+	st := newStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
 	for i := 0; i < 5; i++ {
@@ -233,16 +126,7 @@ func TestRunVerifier_ReenqueuesPendingOnStartup(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dbDir := t.TempDir()
-	store, err := OpenStore(dbDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-	logger, err := NewLogger(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := newStore(t)
 
 	// Pre-seed a pending row as if a previous process shut down before draining.
 	if err := store.Upsert(context.Background(), Mention{
@@ -252,7 +136,7 @@ func TestRunVerifier_ReenqueuesPendingOnStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := New(store, logger, "https://example.com")
+	s := New(store, "https://example.com")
 	s.http = http.DefaultClient
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
