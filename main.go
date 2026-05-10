@@ -22,6 +22,7 @@ import (
 	"github.com/nchapman/mizu/internal/post"
 	mizuserver "github.com/nchapman/mizu/internal/server"
 	"github.com/nchapman/mizu/internal/site"
+	"github.com/nchapman/mizu/internal/theme"
 	"github.com/nchapman/mizu/internal/webmention"
 )
 
@@ -86,7 +87,11 @@ func main() {
 		wmSvc.RunVerifier(ctx)
 	}()
 
-	siteSrv, err := site.New(cfg, posts, wmSvc, templatesFS())
+	activeTheme, err := theme.Load(cfg.Theme.Name, themesFS(), cfg.Theme.Settings)
+	if err != nil {
+		log.Fatalf("theme: %v", err)
+	}
+	siteSrv, err := site.New(cfg, posts, wmSvc, activeTheme)
 	if err != nil {
 		log.Fatalf("site: %v", err)
 	}

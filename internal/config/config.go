@@ -12,9 +12,19 @@ import (
 type Config struct {
 	Site   Site   `yaml:"site"`
 	Server Server `yaml:"server"`
+	Theme  Theme  `yaml:"theme"`
 	Paths  Paths  `yaml:"paths"`
 	Poller Poller `yaml:"poller"`
 	Limits Limits `yaml:"limits"`
+}
+
+// Theme selects the active public-site theme and supplies overrides
+// for any settings the theme exposes. Themes live at ./themes/<name>/;
+// the "default" theme is embedded in the binary so an empty Theme
+// block just renders the default look.
+type Theme struct {
+	Name     string         `yaml:"name"`
+	Settings map[string]any `yaml:"settings"`
 }
 
 type Site struct {
@@ -54,7 +64,6 @@ type Paths struct {
 	State         string `yaml:"state"`
 	Certs         string `yaml:"certs"`
 	AdminDist     string `yaml:"admin_dist"`
-	Templates     string `yaml:"templates"`
 	Subscriptions string `yaml:"subscriptions"`
 }
 
@@ -153,6 +162,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Server.TLS.HTTPAddr == "" {
 		c.Server.TLS.HTTPAddr = ":80"
+	}
+	if c.Theme.Name == "" {
+		c.Theme.Name = "default"
 	}
 
 	l := &c.Limits

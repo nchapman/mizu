@@ -9,44 +9,63 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/nchapman/mizu/internal/config"
 	"github.com/nchapman/mizu/internal/post"
+	"github.com/nchapman/mizu/internal/theme"
 	"github.com/nchapman/mizu/internal/webmention"
 )
 
 // minimal templates used by every site test. They mirror the layout
-// pattern used by the real templates without depending on the on-disk
-// theme: pages render their content first and base.liquid composes it
-// in via `content_for_layout`.
+// pattern used by the real templates without depending on the shipped
+// default theme: pages render their content first and base.liquid
+// composes it in via `content_for_layout`.
 const (
-	tplBase = `<!doctype html><html><head><title>{{ page_title | default: site.Title | escape }}</title></head><body>{{ content_for_layout }}</body></html>`
+	tplBase = `<!doctype html><html><head><title>{{ page_title | default: site.Title | escape }}</title><style>:root{--accent:{{ theme.settings.accent_color | css_value }};}</style></head><body><link rel="stylesheet" href="/assets/style.css?v={{ theme.version }}">{{ content_for_layout }}</body></html>`
 	tplIdx  = `{% for p in posts %}<article data-id="{{ p.ID }}">{% if p.Title %}<h2><a href="{{ p.Path }}">{{ p.Title }}</a></h2>{% else %}<a href="{{ p.Path }}">note</a>{% endif %}<div class="body">{{ p.HTML }}</div></article>{% else %}<p>none</p>{% endfor %}`
 	tplPost = `<article>{% if post.Title %}<h2>{{ post.Title }}</h2>{% endif %}<div class="body">{{ post.HTML }}</div></article>{% if mentions %}<ul>{% for m in mentions %}<li>{{ m.Source | host_of }}</li>{% endfor %}</ul>{% endif %}`
 )
 
-// newSite builds a fully wired site Server backed by tempdir templates,
-// posts, and a webmention service. The returned router has Routes
-// registered.
+// fakeThemeFS returns an embedded-shape FS containing a single
+// "default" theme with the test templates above. It mirrors what
+// theme.Load expects to receive from themesFS() in production.
+func fakeThemeFS(extra map[string]string) fstest.MapFS {
+	files := fstest.MapFS{
+		"default/theme.yaml": &fstest.MapFile{Data: []byte(`name: Test Default
+version: "1"
+settings:
+  accent_color: "#0066cc"
+  max_width: "640px"
+`)},
+		"default/base.liquid":      &fstest.MapFile{Data: []byte(tplBase)},
+		"default/index.liquid":     &fstest.MapFile{Data: []byte(tplIdx)},
+		"default/post.liquid":      &fstest.MapFile{Data: []byte(tplPost)},
+		"default/assets/style.css": &fstest.MapFile{Data: []byte("body{color:#222}")},
+	}
+	for name, body := range extra {
+		files["default/"+name] = &fstest.MapFile{Data: []byte(body)}
+	}
+	return files
+}
+
+// newSite builds a fully wired site Server backed by an in-memory
+// theme, posts on tempdir, and a webmention service. The returned
+// router has Routes registered.
 func newSite(t *testing.T) (*Server, http.Handler, *post.Store, *webmention.Service) {
 	t.Helper()
+	return newSiteWithTheme(t, nil, nil)
+}
+
+// newSiteWithTheme is newSite plus optional theme overrides and extra
+// theme files (e.g. partials, assets). Used by tests that need to
+// drive css_value, asset serving, or theme.settings overrides.
+func newSiteWithTheme(t *testing.T, overrides map[string]any, extraFiles map[string]string) (*Server, http.Handler, *post.Store, *webmention.Service) {
+	t.Helper()
 	dir := t.TempDir()
-	tplDir := filepath.Join(dir, "tpl")
-	if err := os.MkdirAll(tplDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for name, body := range map[string]string{
-		"base.liquid":  tplBase,
-		"index.liquid": tplIdx,
-		"post.liquid":  tplPost,
-	} {
-		if err := os.WriteFile(filepath.Join(tplDir, name), []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
 
 	contentDir := filepath.Join(dir, "content")
 	if err := os.MkdirAll(filepath.Join(contentDir, "posts"), 0o755); err != nil {
@@ -75,10 +94,17 @@ func newSite(t *testing.T) (*Server, http.Handler, *post.Store, *webmention.Serv
 			BaseURL:     "https://example.test",
 			Description: "test",
 		},
-		Paths: config.Paths{Templates: tplDir},
 	}
 	cfg.ApplyDefaults()
-	srv, err := New(cfg, posts, wm, nil)
+
+	// theme.Load checks ./themes/<name> on disk first; chdir to a clean
+	// dir so the test can't accidentally pick up the repo's themes/.
+	t.Chdir(t.TempDir())
+	th, err := theme.Load("default", fakeThemeFS(extraFiles), overrides)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(cfg, posts, wm, th)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,32 +321,114 @@ func TestSite_WebmentionRateLimit(t *testing.T) {
 	}
 }
 
-func TestSite_TemplateOverrideUsesDisk(t *testing.T) {
-	// The newSite helper already points cfg.Paths.Templates at a tempdir;
-	// to confirm the override is what's being used (not the embedded FS),
-	// modify one of the on-disk templates with a unique sentinel and
-	// check it appears in output.
-	_, r, posts, _ := newSite(t)
-	posts.Create("Hi", "body", nil)
+func TestSite_AssetsServeFromTheme(t *testing.T) {
+	_, r, _, _ := newSite(t)
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
-	if !strings.Contains(w.Body.String(), `data-id=`) {
-		t.Errorf("on-disk template marker missing — override not active: %s", w.Body.String())
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/assets/style.css", nil))
+	if w.Code != 200 {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/css") {
+		t.Errorf("content-type=%q, want text/css", ct)
+	}
+	if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("nosniff header = %q", got)
+	}
+	if got := w.Header().Get("Cache-Control"); got != "public, max-age=300" {
+		t.Errorf("cache-control = %q", got)
+	}
+	if !strings.Contains(w.Body.String(), "color:#222") {
+		t.Errorf("body missing asset content: %s", w.Body.String())
 	}
 }
 
-func TestActiveTemplatesFS_FallsBackToEmbedded(t *testing.T) {
-	// dir empty / nonexistent / lacks base.liquid → embedded wins.
-	embedded := os.DirFS(t.TempDir()) // any FS works as a sentinel
-	if got := activeTemplatesFS("", embedded); got != embedded {
-		t.Error("empty dir didn't return embedded")
+func TestSite_AssetsMissingFile404(t *testing.T) {
+	_, r, _, _ := newSite(t)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/assets/nope.css", nil))
+	if w.Code != 404 {
+		t.Errorf("code=%d, want 404", w.Code)
 	}
-	if got := activeTemplatesFS(filepath.Join(t.TempDir(), "nope"), embedded); got != embedded {
-		t.Error("missing dir didn't return embedded")
+}
+
+func TestSite_ThemeSettingsReachTemplates(t *testing.T) {
+	// Operator override should win and surface as a CSS custom property
+	// in the layout. Confirms the override → theme.Settings → template
+	// pipeline end-to-end.
+	_, r, _, _ := newSiteWithTheme(t, map[string]any{"accent_color": "#ff0066"}, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if !strings.Contains(w.Body.String(), "--accent:#ff0066") {
+		t.Errorf("override not reflected in :root block: %s", w.Body.String())
 	}
-	emptyDir := t.TempDir() // exists but no base.liquid
-	if got := activeTemplatesFS(emptyDir, embedded); got != embedded {
-		t.Error("dir without base.liquid didn't return embedded")
+}
+
+func TestSite_CSSValueRejectsHostileInput(t *testing.T) {
+	// A theme setting that tries to break out of the CSS declaration
+	// must drop to "" so the rule cascades, not embed verbatim.
+	hostile := "red; background: url(http://evil/)"
+	_, r, _, _ := newSiteWithTheme(t, map[string]any{"accent_color": hostile}, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	body := w.Body.String()
+	if strings.Contains(body, "evil") {
+		t.Errorf("hostile CSS payload reached output: %s", body)
+	}
+	if !strings.Contains(body, "--accent:;") {
+		t.Errorf("expected empty --accent value, got: %s", body)
+	}
+}
+
+func TestSite_StylesheetLinkCachebust(t *testing.T) {
+	// The default fakeThemeFS sets version: "1"; the link tag should
+	// carry ?v=1 so bumping theme.yaml's version invalidates browser
+	// caches without us inventing per-file fingerprinting.
+	_, r, _, _ := newSite(t)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if !strings.Contains(w.Body.String(), `/assets/style.css?v=1`) {
+		t.Errorf("link tag missing version cachebust: %s", w.Body.String())
+	}
+}
+
+func TestCSSValue(t *testing.T) {
+	cases := map[string]string{
+		"#0066cc":             "#0066cc",
+		"#abc":                "#abc",
+		"  42rem  ":           "42rem", // TrimSpace runs first
+		"42rem":               "42rem",
+		"100%":                "100%",
+		"0.5em":               "0.5em",
+		"0":                   "0",
+		"1.25":                "1.25",
+		"transparent":         "transparent",
+		"rgb(255, 0, 102)":    "rgb(255, 0, 102)",
+		"":                    "",
+		"red":                 "", // not in our keyword allowlist
+		"red; background: x":  "",
+		"javascript:alert(1)": "",
+		"}":                   "",
+		"#0066cc; color: red": "",
+	}
+	for in, want := range cases {
+		if got := cssValue(in); got != want {
+			t.Errorf("cssValue(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSite_AssetsRejectsDirectoryListing(t *testing.T) {
+	// Bare /assets/ would otherwise let http.FileServer render a
+	// directory listing, leaking what files the theme ships. Also pin
+	// the trailing-slash-less form for completeness — chi's wildcard
+	// matches both.
+	_, r, _, _ := newSite(t)
+	for _, path := range []string{"/assets/", "/assets"} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code == 200 && strings.Contains(w.Body.String(), "style.css") {
+			t.Errorf("%s leaked directory listing: %s", path, w.Body.String())
+		}
 	}
 }
 

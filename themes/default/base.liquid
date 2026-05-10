@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ page_title | default: site.Title | escape }}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="alternate" type="application/rss+xml" title="{{ site.Title | escape }}" href="/feed.xml">
+<link rel="webmention" href="/webmention">
+<link rel="stylesheet" href="/assets/style.css?v={{ theme.version | escape }}">
+<style>:root {
+  --accent: {{ theme.settings.accent_color | css_value }};
+  --max-width: {{ theme.settings.max_width | css_value }};
+}</style>
+</head>
+<body>
+<header>
+  <h1><a href="/">{{ site.Title | escape }}</a></h1>
+</header>
+<main>{{ content_for_layout }}</main>
+<footer>
+  by {{ site.Author | escape }} · <a href="/feed.xml">rss</a>
+</footer>
+</body>
+</html>

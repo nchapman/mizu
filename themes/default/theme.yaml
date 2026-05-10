@@ -1,0 +1,7 @@
+name: Default
+version: "1"
+author: mizu
+description: Minimal default theme that ships with mizu.
+settings:
+  accent_color: "#0066cc"
+  max_width: "640px"

@@ -31,18 +31,21 @@ func adminDistFS() fs.FS {
 	return sub
 }
 
-// templatesEmbed snapshots the public-site HTML templates so the
-// binary can render index/post pages without any files next to it.
-// Like adminDistEmbed, an on-disk override (cfg.Paths.Templates) wins
-// when present — so themes can be iterated without rebuilds.
+// themesEmbed snapshots the public-site themes so the binary can
+// render pages without any files next to it. The shipped "default"
+// theme always lives here; operators can add more themes on disk at
+// ./themes/<name>/ and select one via cfg.Theme.Name.
 //
-//go:embed templates
-var templatesEmbed embed.FS
+// The `all:` prefix mirrors the admin/dist directive so dotfiles inside
+// a theme (e.g. .keep) aren't silently dropped by the default glob.
+//
+//go:embed all:themes
+var themesEmbed embed.FS
 
-func templatesFS() fs.FS {
-	sub, err := fs.Sub(templatesEmbed, "templates")
+func themesFS() fs.FS {
+	sub, err := fs.Sub(themesEmbed, "themes")
 	if err != nil {
-		log.Fatalf("templates embed: %v", err)
+		log.Fatalf("themes embed: %v", err)
 	}
 	return sub
 }

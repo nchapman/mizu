@@ -10,7 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -22,22 +22,26 @@ import (
 	"github.com/nchapman/mizu/internal/config"
 	"github.com/nchapman/mizu/internal/post"
 	mizuserver "github.com/nchapman/mizu/internal/server"
+	"github.com/nchapman/mizu/internal/theme"
 	"github.com/nchapman/mizu/internal/webmention"
 )
 
 type Server struct {
-	cfg   *config.Config
-	posts *post.Store
-	tpls  map[string]*liquid.Template
-	wm    *webmention.Service
+	cfg       *config.Config
+	posts     *post.Store
+	tpls      map[string]*liquid.Template
+	theme     *theme.Theme
+	themeData map[string]any // built once; the theme is immutable after Load
+	wm        *webmention.Service
 }
 
-// newEnvironment returns a Liquid environment scoped to this server, with
-// mizu's custom filters registered. We use a dedicated environment rather
-// than the package-global one so filter registration is isolated per
+// newEnvironment returns a Liquid environment scoped to this server,
+// with mizu's custom filters registered and the active theme attached
+// as the partial loader. We use a dedicated environment rather than
+// the package-global one so filter registration is isolated per
 // Server (and per test) — important because liquid's package-global
 // registry is not safe to mutate concurrently with rendering.
-func newEnvironment() *liquid.Environment {
+func newEnvironment(themeFS fs.FS) *liquid.Environment {
 	env := liquid.NewEnvironment()
 	env.RegisterFilter("host_of", func(input any, _ ...any) any {
 		s, _ := input.(string)
@@ -55,46 +59,85 @@ func newEnvironment() *liquid.Environment {
 		}
 		return input
 	})
+	// css_value passes through values safe to interpolate inside a CSS
+	// declaration (hex color, length, bare number, single allowlisted
+	// keyword) and drops anything else to "" so the rule cascades back
+	// to whatever the stylesheet sets. `| escape` is HTML-escape and
+	// is *not* safe in CSS context — settings can contain ; { } " etc.
+	env.RegisterFilter("css_value", func(input any, _ ...any) any {
+		s, ok := input.(string)
+		if !ok {
+			return ""
+		}
+		return cssValue(s)
+	})
+	if themeFS != nil {
+		env.WithLoader(&liquid.FileSystemLoader{FS: themeFS, Ext: ".liquid"})
+	}
 	return env
 }
 
-// New parses base.liquid plus each page template. Pages are rendered
-// first into a string and then composed into base via the
-// `content_for_layout` variable, mirroring the Shopify layout pattern.
+// cssSafePattern accepts the small set of value shapes a theme setting
+// can legitimately use inside a CSS custom property:
+//   - hex colors (#abc, #aabbcc, #aabbccdd)
+//   - CSS lengths (12px, 1.5rem, 100%, 0.5em, 10vh, 12vw, 8ex, 4ch)
+//   - bare numbers (1, 0.5, .25)
+//   - rgb()/rgba()/hsl()/hsla() function calls with simple args
+//   - a small allowlist of color keywords (none, currentColor, transparent)
 //
-// embedded is the templates FS baked into the binary. cfg.Paths.Templates
-// can override it with a directory on disk (theme experimentation,
-// edit-without-rebuild).
-func New(cfg *config.Config, posts *post.Store, wm *webmention.Service, embedded fs.FS) (*Server, error) {
-	tplFS := activeTemplatesFS(cfg.Paths.Templates, embedded)
-	env := newEnvironment()
+// Anything else is rejected. The cost of being too strict is a missing
+// CSS variable (rule cascades to whatever's in style.css); the cost of
+// being too loose is letting a theme setting close the declaration and
+// inject arbitrary CSS.
+var cssSafePattern = regexp.MustCompile(
+	`^(#[0-9a-fA-F]{3,8}` +
+		`|-?\d*\.?\d+(px|rem|em|%|vw|vh|vmin|vmax|ex|ch|pt)?` +
+		`|(rgb|rgba|hsl|hsla)\([\d,.\s%/]+\)` +
+		`|none|currentColor|transparent` +
+		`)$`)
+
+func cssValue(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || !cssSafePattern.MatchString(s) {
+		return ""
+	}
+	return s
+}
+
+// New parses the active theme's base/index/post templates against a
+// per-Server liquid environment, attaching the theme's layered FS as
+// the partial loader. Pages are rendered first to a string and then
+// composed into base.liquid via `content_for_layout`, mirroring the
+// Shopify layout pattern.
+func New(cfg *config.Config, posts *post.Store, wm *webmention.Service, t *theme.Theme) (*Server, error) {
+	if t == nil {
+		return nil, fmt.Errorf("site: theme is required")
+	}
+	env := newEnvironment(t.FS)
 	tpls := map[string]*liquid.Template{}
 	for _, name := range []string{"base.liquid", "index.liquid", "post.liquid"} {
-		src, err := fs.ReadFile(tplFS, name)
+		src, err := fs.ReadFile(t.FS, name)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", name, err)
 		}
-		t, err := env.Parse(string(src))
+		tpl, err := env.Parse(string(src))
 		if err != nil {
 			return nil, fmt.Errorf("parse %s: %w", name, err)
 		}
-		tpls[name] = t.WithName(name)
+		tpls[name] = tpl.WithName(name)
 	}
-	return &Server{cfg: cfg, posts: posts, tpls: tpls, wm: wm}, nil
-}
-
-// activeTemplatesFS returns the on-disk override if it exists and
-// contains base.liquid, otherwise the embedded snapshot.
-func activeTemplatesFS(dir string, embedded fs.FS) fs.FS {
-	if dir != "" {
-		if info, err := os.Stat(dir); err == nil && info.IsDir() {
-			diskFS := os.DirFS(dir)
-			if _, err := fs.Stat(diskFS, "base.liquid"); err == nil {
-				return diskFS
-			}
-		}
-	}
-	return embedded
+	return &Server{
+		cfg:   cfg,
+		posts: posts,
+		tpls:  tpls,
+		theme: t,
+		themeData: map[string]any{
+			"name":     t.Name,
+			"version":  t.Version,
+			"settings": t.Settings,
+		},
+		wm: wm,
+	}, nil
 }
 
 func (s *Server) Routes(r chi.Router) {
@@ -104,7 +147,41 @@ func (s *Server) Routes(r chi.Router) {
 	r.Get("/sitemap.xml", s.sitemap)
 	r.Get("/notes/{id}", s.note)
 	r.Get("/{year:[0-9]{4}}/{month:[0-9]{2}}/{day:[0-9]{2}}/{slug}", s.article)
+	r.Handle("/assets/*", s.assets())
 	r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Webmention)).Post("/webmention", s.webmention)
+}
+
+// assets serves the active theme's assets/ subtree under /assets/*.
+// Short cache + the ?v={{ theme.version }} cachebust parameter on the
+// stylesheet link is what makes it safe to bump short here without
+// risking stale CSS forever — bumping the theme's version: invalidates
+// every linked asset.
+func (s *Server) assets() http.Handler {
+	// "assets" is a string constant; fs.Sub only errors on names that
+	// fail fs.ValidPath, which this can't, so panic if it ever does
+	// rather than degrading silently.
+	sub, err := fs.Sub(s.theme.FS, "assets")
+	if err != nil {
+		panic(fmt.Sprintf("theme assets sub: %v", err))
+	}
+	fileServer := http.FileServer(http.FS(sub))
+	return http.StripPrefix("/assets/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Block directory listings: a bare /assets/ or /assets/foo/
+		// would otherwise let http.FileServer enumerate what the theme
+		// ships. Templates always reference files by full path, so a
+		// directory request is never legitimate.
+		if r.URL.Path == "" || strings.HasSuffix(r.URL.Path, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		// nosniff matches the media handler for the same defense-in-depth
+		// reason: a stale or hand-placed file shouldn't be sniffed into
+		// something executable. max-age=300 keeps stale CSS bounded
+		// while the ?v= cachebust does the heavy lifting on real changes.
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		fileServer.ServeHTTP(w, r)
+	}))
 }
 
 // webmention is the receive endpoint. Per spec: accept form-encoded
@@ -174,6 +251,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	}
 	s.exec(w, "index.liquid", "", map[string]any{
 		"site":  s.cfg.Site,
+		"theme": s.themeData,
 		"posts": rendered,
 	})
 }
@@ -225,6 +303,7 @@ func (s *Server) renderPost(w http.ResponseWriter, r *http.Request, p *post.Post
 	}
 	s.exec(w, "post.liquid", pageTitle, map[string]any{
 		"site":     s.cfg.Site,
+		"theme":    s.themeData,
 		"post":     s.render(p),
 		"mentions": views,
 	})
@@ -351,6 +430,7 @@ func (s *Server) exec(w http.ResponseWriter, name, pageTitle string, data map[st
 	}
 	layoutData := map[string]any{
 		"site":               s.cfg.Site,
+		"theme":              s.themeData,
 		"page_title":         pageTitle,
 		"content_for_layout": body,
 	}
