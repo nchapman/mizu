@@ -1,0 +1,10 @@
+{% for p in posts %}
+<article>
+  <time datetime="{{ p.Date | iso8601 | escape }}">{{ p.Date | date: "%b %-d, %Y" }}</time>
+  {% if p.Title %}<h2><a href="{{ p.Path | escape }}">{{ p.Title | escape }}</a></h2>{% endif %}
+  <div class="body">{{ p.HTML }}</div>
+  {% unless p.Title %}<a href="{{ p.Path | escape }}">permalink</a>{% endunless %}
+</article>
+{% else %}
+<p>No posts yet.</p>
+{% endfor %}

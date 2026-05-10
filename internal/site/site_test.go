@@ -18,12 +18,14 @@ import (
 	"github.com/nchapman/mizu/internal/webmention"
 )
 
-// minimal templates used by every site test. They cover all the blocks
-// New() expects without depending on the real on-disk theme.
+// minimal templates used by every site test. They mirror the layout
+// pattern used by the real templates without depending on the on-disk
+// theme: pages render their content first and base.liquid composes it
+// in via `content_for_layout`.
 const (
-	tplBase = `{{define "base"}}<!doctype html><html><head><title>{{block "title" .}}{{.Site.Title}}{{end}}</title></head><body>{{block "main" .}}{{end}}</body></html>{{end}}`
-	tplIdx  = `{{template "base" .}}{{define "main"}}{{range .Posts}}<article data-id="{{.ID}}">{{if .Title}}<h2><a href="{{.Path}}">{{.Title}}</a></h2>{{else}}<a href="{{.Path}}">note</a>{{end}}<div class="body">{{.HTML}}</div></article>{{else}}<p>none</p>{{end}}{{end}}`
-	tplPost = `{{template "base" .}}{{define "main"}}<article>{{if .Post.Title}}<h2>{{.Post.Title}}</h2>{{end}}<div class="body">{{.Post.HTML}}</div></article>{{if .Mentions}}<ul>{{range .Mentions}}<li>{{hostOf .Source}}</li>{{end}}</ul>{{end}}{{end}}`
+	tplBase = `<!doctype html><html><head><title>{{ page_title | default: site.Title | escape }}</title></head><body>{{ content_for_layout }}</body></html>`
+	tplIdx  = `{% for p in posts %}<article data-id="{{ p.ID }}">{% if p.Title %}<h2><a href="{{ p.Path }}">{{ p.Title }}</a></h2>{% else %}<a href="{{ p.Path }}">note</a>{% endif %}<div class="body">{{ p.HTML }}</div></article>{% else %}<p>none</p>{% endfor %}`
+	tplPost = `<article>{% if post.Title %}<h2>{{ post.Title }}</h2>{% endif %}<div class="body">{{ post.HTML }}</div></article>{% if mentions %}<ul>{% for m in mentions %}<li>{{ m.Source | host_of }}</li>{% endfor %}</ul>{% endif %}`
 )
 
 // newSite builds a fully wired site Server backed by tempdir templates,
@@ -37,9 +39,9 @@ func newSite(t *testing.T) (*Server, http.Handler, *post.Store, *webmention.Serv
 		t.Fatal(err)
 	}
 	for name, body := range map[string]string{
-		"base.html":  tplBase,
-		"index.html": tplIdx,
-		"post.html":  tplPost,
+		"base.liquid":  tplBase,
+		"index.liquid": tplIdx,
+		"post.liquid":  tplPost,
 	} {
 		if err := os.WriteFile(filepath.Join(tplDir, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
@@ -134,6 +136,11 @@ func TestSite_NoteRoute(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "just a note") {
 		t.Errorf("note body missing: %s", w.Body.String())
 	}
+	// A title-less post falls back to the site title alone — no
+	// "Title · Site" composition.
+	if !strings.Contains(w.Body.String(), "<title>Test Site</title>") {
+		t.Errorf("note title should be site title only: %s", w.Body.String())
+	}
 	// Webmention discovery hint is set on per-post pages.
 	if got := w.Header().Get("Link"); !strings.Contains(got, `rel="webmention"`) {
 		t.Errorf("Link header = %q, want webmention rel", got)
@@ -167,6 +174,16 @@ func TestSite_ArticleRoute(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "Hello World") {
 		t.Errorf("title missing: %s", w.Body.String())
+	}
+	// Article pages compose <title> as "Post Title · Site Title".
+	if !strings.Contains(w.Body.String(), "<title>Hello World · Test Site</title>") {
+		t.Errorf("article title composition wrong: %s", w.Body.String())
+	}
+	// Sanitized markdown HTML must reach the response unescaped — the
+	// trust boundary is at ingest, not at render. Catches an
+	// accidentally-added `| escape` on the post body.
+	if !strings.Contains(w.Body.String(), "<strong>bold</strong>") {
+		t.Errorf("rendered markdown HTML was escaped or missing: %s", w.Body.String())
 	}
 	// Wrong date in URL → 404.
 	other := time.Now().AddDate(-1, 0, 0)
@@ -293,7 +310,7 @@ func TestSite_TemplateOverrideUsesDisk(t *testing.T) {
 }
 
 func TestActiveTemplatesFS_FallsBackToEmbedded(t *testing.T) {
-	// dir empty / nonexistent / lacks base.html → embedded wins.
+	// dir empty / nonexistent / lacks base.liquid → embedded wins.
 	embedded := os.DirFS(t.TempDir()) // any FS works as a sentinel
 	if got := activeTemplatesFS("", embedded); got != embedded {
 		t.Error("empty dir didn't return embedded")
@@ -301,9 +318,9 @@ func TestActiveTemplatesFS_FallsBackToEmbedded(t *testing.T) {
 	if got := activeTemplatesFS(filepath.Join(t.TempDir(), "nope"), embedded); got != embedded {
 		t.Error("missing dir didn't return embedded")
 	}
-	emptyDir := t.TempDir() // exists but no base.html
+	emptyDir := t.TempDir() // exists but no base.liquid
 	if got := activeTemplatesFS(emptyDir, embedded); got != embedded {
-		t.Error("dir without base.html didn't return embedded")
+		t.Error("dir without base.liquid didn't return embedded")
 	}
 }
 

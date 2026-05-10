@@ -5,7 +5,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"html/template"
 	"io"
 	"io/fs"
 	"log"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/feeds"
+	liquid "github.com/nchapman/go-liquid"
 
 	"github.com/nchapman/mizu/internal/config"
 	"github.com/nchapman/mizu/internal/post"
@@ -28,40 +28,68 @@ import (
 type Server struct {
 	cfg   *config.Config
 	posts *post.Store
-	tpls  map[string]*template.Template
+	tpls  map[string]*liquid.Template
 	wm    *webmention.Service
 }
 
-// New parses each page as its own template set, with base.html shared across
-// all of them. Sharing one set would cause define-blocks (like "main") to
-// collide between pages.
+// newEnvironment returns a Liquid environment scoped to this server, with
+// mizu's custom filters registered. We use a dedicated environment rather
+// than the package-global one so filter registration is isolated per
+// Server (and per test) — important because liquid's package-global
+// registry is not safe to mutate concurrently with rendering.
+func newEnvironment() *liquid.Environment {
+	env := liquid.NewEnvironment()
+	env.RegisterFilter("host_of", func(input any, _ ...any) any {
+		s, _ := input.(string)
+		return hostOf(s)
+	})
+	// iso8601 emits an RFC 3339 timestamp with a colon-separated offset
+	// ("2006-01-02T15:04:05Z07:00"). Liquid's `date` filter uses Ruby
+	// strftime which has no `%:z` directive — `%z` produces the
+	// no-colon form (`+0000`) that the WHATWG <time datetime> parser
+	// rejects. Keep the formatting in Go so feed validators and
+	// browsers see a parseable value.
+	env.RegisterFilter("iso8601", func(input any, _ ...any) any {
+		if t, ok := input.(time.Time); ok {
+			return t.Format(time.RFC3339)
+		}
+		return input
+	})
+	return env
+}
+
+// New parses base.liquid plus each page template. Pages are rendered
+// first into a string and then composed into base via the
+// `content_for_layout` variable, mirroring the Shopify layout pattern.
 //
 // embedded is the templates FS baked into the binary. cfg.Paths.Templates
 // can override it with a directory on disk (theme experimentation,
 // edit-without-rebuild).
 func New(cfg *config.Config, posts *post.Store, wm *webmention.Service, embedded fs.FS) (*Server, error) {
 	tplFS := activeTemplatesFS(cfg.Paths.Templates, embedded)
-	funcs := template.FuncMap{
-		"hostOf": hostOf,
-	}
-	tpls := map[string]*template.Template{}
-	for _, name := range []string{"index.html", "post.html"} {
-		t, err := template.New(name).Funcs(funcs).ParseFS(tplFS, "base.html", name)
+	env := newEnvironment()
+	tpls := map[string]*liquid.Template{}
+	for _, name := range []string{"base.liquid", "index.liquid", "post.liquid"} {
+		src, err := fs.ReadFile(tplFS, name)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		t, err := env.Parse(string(src))
 		if err != nil {
 			return nil, fmt.Errorf("parse %s: %w", name, err)
 		}
-		tpls[name] = t
+		tpls[name] = t.WithName(name)
 	}
 	return &Server{cfg: cfg, posts: posts, tpls: tpls, wm: wm}, nil
 }
 
 // activeTemplatesFS returns the on-disk override if it exists and
-// contains base.html, otherwise the embedded snapshot.
+// contains base.liquid, otherwise the embedded snapshot.
 func activeTemplatesFS(dir string, embedded fs.FS) fs.FS {
 	if dir != "" {
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
 			diskFS := os.DirFS(dir)
-			if _, err := fs.Stat(diskFS, "base.html"); err == nil {
+			if _, err := fs.Stat(diskFS, "base.liquid"); err == nil {
 				return diskFS
 			}
 		}
@@ -118,9 +146,16 @@ func (s *Server) webmention(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// renderedPost bundles a post with its already-rendered HTML body so
+// templates don't have to call RenderHTML themselves. The embedded
+// *post.Post pointer is load-bearing: go-liquid's getProperty walks
+// embedded structs via reflect.FieldByName for fields like Title/Date
+// and via callTemplateMethod for promoted pointer-receiver methods like
+// Path(). Don't change Post to a non-pointer or unembed it without
+// updating the templates.
 type renderedPost struct {
 	*post.Post
-	HTML template.HTML
+	HTML string
 }
 
 func (s *Server) render(p *post.Post) renderedPost {
@@ -128,7 +163,7 @@ func (s *Server) render(p *post.Post) renderedPost {
 	if err != nil {
 		log.Printf("render post %s: %v", p.ID, err)
 	}
-	return renderedPost{Post: p, HTML: template.HTML(html)}
+	return renderedPost{Post: p, HTML: html}
 }
 
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
@@ -137,9 +172,9 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	for i, p := range recent {
 		rendered[i] = s.render(p)
 	}
-	s.exec(w, "index.html", map[string]any{
-		"Site":  s.cfg.Site,
-		"Posts": rendered,
+	s.exec(w, "index.liquid", "", map[string]any{
+		"site":  s.cfg.Site,
+		"posts": rendered,
 	})
 }
 
@@ -172,7 +207,7 @@ type mentionView struct {
 func (s *Server) renderPost(w http.ResponseWriter, r *http.Request, p *post.Post) {
 	// Advertise the webmention endpoint via Link header so senders
 	// don't have to parse our HTML to discover it. Belt + braces with
-	// the in-body <link> emitted from base.html.
+	// the in-body <link> emitted from base.liquid.
 	w.Header().Add("Link", `</webmention>; rel="webmention"`)
 
 	target := s.cfg.Site.BaseURL + p.Path()
@@ -184,14 +219,18 @@ func (s *Server) renderPost(w http.ResponseWriter, r *http.Request, p *post.Post
 	for i, m := range mentions {
 		views[i] = mentionView{Source: m.Source, VerifiedAt: m.VerifiedAt}
 	}
-	s.exec(w, "post.html", map[string]any{
-		"Site":     s.cfg.Site,
-		"Post":     s.render(p),
-		"Mentions": views,
+	pageTitle := s.cfg.Site.Title
+	if p.Title != "" {
+		pageTitle = p.Title + " · " + s.cfg.Site.Title
+	}
+	s.exec(w, "post.liquid", pageTitle, map[string]any{
+		"site":     s.cfg.Site,
+		"post":     s.render(p),
+		"mentions": views,
 	})
 }
 
-// hostOf is a template helper so post.html can render
+// hostOf is a template helper so post.liquid can render
 // "host.example.com" instead of the full URL when listing mentions.
 // Hostname() strips userinfo and port so we don't render
 // "user:pass@example.com:8080" in the public list.
@@ -293,12 +332,31 @@ func (s *Server) sitemap(w http.ResponseWriter, r *http.Request) {
 	_, _ = buf.WriteTo(w)
 }
 
-// exec renders into a buffer first so a mid-render template error doesn't
-// leave the client with a partial 200 response.
-func (s *Server) exec(w http.ResponseWriter, name string, data any) {
-	var buf bytes.Buffer
-	if err := s.tpls[name].ExecuteTemplate(&buf, name, data); err != nil {
+// exec renders the named page template, then composes it into base.liquid
+// via `content_for_layout`. We render to an in-memory buffer first so a
+// mid-render template error doesn't leave the client with a partial 200
+// response.
+func (s *Server) exec(w http.ResponseWriter, name, pageTitle string, data map[string]any) {
+	page, ok := s.tpls[name]
+	if !ok {
+		log.Printf("template %s: not found", name)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	body, err := page.Render(data)
+	if err != nil {
 		log.Printf("template %s: %v", name, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	layoutData := map[string]any{
+		"site":               s.cfg.Site,
+		"page_title":         pageTitle,
+		"content_for_layout": body,
+	}
+	var buf bytes.Buffer
+	if err := s.tpls["base.liquid"].RenderTo(&buf, layoutData); err != nil {
+		log.Printf("template base.liquid: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
