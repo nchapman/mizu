@@ -22,7 +22,7 @@ describe("DraftsView", () => {
   it("renders an empty-state message when there are no drafts", async () => {
     queueFetch([{ status: 200, body: [] }]);
     render(<DraftsView onAuthLost={() => {}} onEdit={() => {}} />);
-    expect(await screen.findByText(/No drafts\./i)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /No drafts/i })).toBeInTheDocument();
   });
 
   it("lists drafts and renders the server-sanitized HTML", async () => {
@@ -41,7 +41,7 @@ describe("DraftsView", () => {
     const onEdit = vi.fn();
     render(<DraftsView onAuthLost={() => {}} onEdit={onEdit} />);
     await screen.findByRole("heading", { name: "Draft One" });
-    await userEvent.click(screen.getByRole("button", { name: "edit" }));
+    await userEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(onEdit).toHaveBeenCalledTimes(1);
     expect(onEdit.mock.calls[0][0].id).toBe("d1");
   });
@@ -55,8 +55,9 @@ describe("DraftsView", () => {
     render(<DraftsView onAuthLost={() => {}} onEdit={() => {}} />);
     await screen.findByRole("heading", { name: "Draft One" });
 
-    await userEvent.click(screen.getByRole("button", { name: "delete" }));
-    await waitFor(() => expect(screen.getByText(/No drafts\./)).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: "More" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Delete draft/i }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: /No drafts/i })).toBeInTheDocument());
 
     expect(fn.mock.calls[1][0]).toBe("/admin/api/drafts/d1");
     expect((fn.mock.calls[1][1] as RequestInit).method).toBe("DELETE");
@@ -71,8 +72,9 @@ describe("DraftsView", () => {
     render(<DraftsView onAuthLost={() => {}} onEdit={() => {}} />);
     await screen.findByRole("heading", { name: "Draft One" });
 
-    await userEvent.click(screen.getByRole("button", { name: "publish" }));
-    await waitFor(() => expect(screen.getByText(/No drafts\./)).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: "More" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Publish now/i }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: /No drafts/i })).toBeInTheDocument());
 
     expect(fn.mock.calls[1][0]).toBe("/admin/api/drafts/d1/publish");
     expect((fn.mock.calls[1][1] as RequestInit).method).toBe("POST");
@@ -83,7 +85,8 @@ describe("DraftsView", () => {
     const fn = queueFetch([{ status: 200, body: [sample()] }]);
     render(<DraftsView onAuthLost={() => {}} onEdit={() => {}} />);
     await screen.findByRole("heading", { name: "Draft One" });
-    await userEvent.click(screen.getByRole("button", { name: "delete" }));
+    await userEvent.click(screen.getByRole("button", { name: "More" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Delete draft/i }));
     // Only the initial GET, no DELETE.
     expect(fn).toHaveBeenCalledTimes(1);
   });
@@ -102,7 +105,8 @@ describe("DraftsView", () => {
     ]);
     render(<DraftsView onAuthLost={() => {}} onEdit={() => {}} />);
     await screen.findByRole("heading", { name: "Draft One" });
-    await userEvent.click(screen.getByRole("button", { name: "publish" }));
+    await userEvent.click(screen.getByRole("button", { name: "More" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Publish now/i }));
     expect(await screen.findByText("publish exploded")).toBeInTheDocument();
   });
 });
