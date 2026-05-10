@@ -90,9 +90,10 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		token = c.Value
 	}
 	configured, authed := s.auth.Status(token)
-	writeJSON(w, http.StatusOK, map[string]bool{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"configured":    configured,
 		"authenticated": authed,
+		"site_title":    s.cfg.Site.Title,
 	})
 }
 

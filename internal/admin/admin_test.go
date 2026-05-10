@@ -175,10 +175,13 @@ func TestMe_FreshIsUnconfigured(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("code=%d", w.Code)
 	}
-	var got map[string]bool
+	var got map[string]any
 	json.NewDecoder(w.Body).Decode(&got)
-	if got["configured"] || got["authenticated"] {
+	if got["configured"] != false || got["authenticated"] != false {
 		t.Errorf("got %+v, want both false", got)
+	}
+	if got["site_title"] != "Test" {
+		t.Errorf("site_title=%v, want Test", got["site_title"])
 	}
 }
 
@@ -199,9 +202,9 @@ func TestSetup_HappyPath(t *testing.T) {
 	req.AddCookie(cookies[0])
 	w2 := httptest.NewRecorder()
 	h.router.ServeHTTP(w2, req)
-	var got map[string]bool
+	var got map[string]any
 	json.NewDecoder(w2.Body).Decode(&got)
-	if !got["configured"] || !got["authenticated"] {
+	if got["configured"] != true || got["authenticated"] != true {
 		t.Errorf("after setup: got %+v", got)
 	}
 }

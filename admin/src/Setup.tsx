@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
-export function Setup({ onDone }: { onDone: () => void }) {
+export function Setup({ onDone, siteTitle }: { onDone: () => void; siteTitle?: string }) {
   const [token, setToken] = useState("");
   const [pw, setPw] = useState("");
   const [pw2, setPw2] = useState("");
@@ -36,6 +36,16 @@ export function Setup({ onDone }: { onDone: () => void }) {
 
   return (
     <div className="mx-auto mt-16 max-w-md px-4">
+      <header className="mb-6 text-center">
+        <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          repeat
+        </div>
+        {siteTitle && (
+          <div className="mt-1 text-base font-semibold tracking-tight text-foreground">
+            {siteTitle}
+          </div>
+        )}
+      </header>
       <h1 className="mb-2 text-lg font-semibold">Welcome to repeat</h1>
       <p className="mb-4 text-sm text-muted-foreground">
         Set a password to lock down the admin UI. The one-time setup token was printed to your

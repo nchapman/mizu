@@ -5,7 +5,7 @@ import { Setup } from "./Setup";
 import { Shell } from "./Shell";
 import { Button } from "@/components/ui/button";
 
-type Me = { configured: boolean; authenticated: boolean };
+type Me = { configured: boolean; authenticated: boolean; site_title?: string };
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
@@ -38,7 +38,7 @@ export function App() {
     );
   }
   if (!me) return null;
-  if (!me.configured) return <Setup onDone={loadMe} />;
-  if (!me.authenticated) return <Login onDone={loadMe} />;
+  if (!me.configured) return <Setup onDone={loadMe} siteTitle={me.site_title} />;
+  if (!me.authenticated) return <Login onDone={loadMe} siteTitle={me.site_title} />;
   return <Shell onLogout={loadMe} />;
 }

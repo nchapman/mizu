@@ -3,7 +3,7 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
-export function Login({ onDone }: { onDone: () => void }) {
+export function Login({ onDone, siteTitle }: { onDone: () => void; siteTitle?: string }) {
   const [pw, setPw] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -30,7 +30,17 @@ export function Login({ onDone }: { onDone: () => void }) {
 
   return (
     <div className="mx-auto mt-16 max-w-sm px-4">
-      <h1 className="mb-4 text-lg font-semibold">Sign in</h1>
+      <header className="mb-6 text-center">
+        <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          repeat
+        </div>
+        {siteTitle && (
+          <div className="mt-1 text-base font-semibold tracking-tight text-foreground">
+            {siteTitle}
+          </div>
+        )}
+      </header>
+      <h1 className="mb-3 text-lg font-semibold">Sign in</h1>
       <form onSubmit={submit} className="space-y-3 rounded-xl border border-border bg-card p-4 shadow-sm">
         <Input
           type="password"
