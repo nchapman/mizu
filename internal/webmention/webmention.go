@@ -32,6 +32,12 @@ type Service struct {
 	baseURL string // e.g. "https://example.com" — used to validate inbound targets
 
 	queue chan job // verification work
+
+	// onVerified is invoked once per mention that flips to Verified.
+	// Used by the render pipeline to enqueue a rebuild so the target
+	// post's static page picks up the new mention. Optional: nil means
+	// "no notification."
+	onVerified func()
 }
 
 type job struct {
@@ -203,6 +209,9 @@ func (s *Service) processOne(ctx context.Context, j job) {
 		_ = s.log.Append(LogEntry{
 			Direction: "received", Source: j.source, Target: j.target, Status: StatusVerified,
 		})
+		if s.onVerified != nil {
+			s.onVerified()
+		}
 		return
 	}
 
@@ -234,6 +243,19 @@ func (s *Service) processOne(ctx context.Context, j job) {
 // mention lists on post pages.
 func (s *Service) ForTarget(ctx context.Context, target string) ([]Mention, error) {
 	return s.store.ForTarget(ctx, target)
+}
+
+// AllVerified returns every verified mention. Used by the render
+// pipeline to populate per-post mention lists in a single query.
+func (s *Service) AllVerified(ctx context.Context) ([]Mention, error) {
+	return s.store.AllVerified(ctx)
+}
+
+// OnVerified registers a callback invoked when a mention transitions
+// to Verified. Set by main.go to point at Pipeline.Enqueue so post
+// pages re-render with the new mention. Pass nil to clear.
+func (s *Service) OnVerified(cb func()) {
+	s.onVerified = cb
 }
 
 // Recent passes through to the store. Used by the admin to list

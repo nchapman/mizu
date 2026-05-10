@@ -163,6 +163,40 @@ func (s *Store) Recent(ctx context.Context, limit int) ([]Mention, error) {
 	return out, rows.Err()
 }
 
+// AllVerified returns every verified mention across all targets,
+// newest verified first. Used by the render pipeline to populate
+// per-post mention lists in a single query rather than one query
+// per post page.
+func (s *Store) AllVerified(ctx context.Context) ([]Mention, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, source, target, status, received_at, verified_at, COALESCE(last_error, '')
+		FROM mentions
+		WHERE status = ?
+		ORDER BY COALESCE(verified_at, received_at) DESC
+	`, string(StatusVerified))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Mention
+	for rows.Next() {
+		var m Mention
+		var status string
+		var receivedAt int64
+		var verifiedAt sql.NullInt64
+		if err := rows.Scan(&m.ID, &m.Source, &m.Target, &status, &receivedAt, &verifiedAt, &m.LastError); err != nil {
+			return nil, err
+		}
+		m.Status = Status(status)
+		m.ReceivedAt = time.Unix(receivedAt, 0)
+		if verifiedAt.Valid {
+			m.VerifiedAt = time.Unix(verifiedAt.Int64, 0)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // CountPending returns the number of (source, target) pairs in the
 // pending state. Used to bound queue depth at the receive endpoint
 // so a flood of novel pairs can't grow the mentions table or the

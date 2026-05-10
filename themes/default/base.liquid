@@ -6,7 +6,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="alternate" type="application/rss+xml" title="{{ site.Title | escape }}" href="/feed.xml">
 <link rel="webmention" href="/webmention">
-<link rel="stylesheet" href="/assets/style.css?v={{ theme.version | escape }}">
+<link rel="stylesheet" href="{{ 'style.css' | asset_url }}">
 <style>:root {
   --accent: {{ theme.settings.accent_color | css_value }};
   --max-width: {{ theme.settings.max_width | css_value }};

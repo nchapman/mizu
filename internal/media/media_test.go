@@ -5,15 +5,12 @@ import (
 	"errors"
 	"image"
 	"image/color"
-	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	_ "golang.org/x/image/webp"
 )
 
 // makePNG returns an encoded PNG of the given dimensions filled with
@@ -50,17 +47,6 @@ func makeJPEG(t *testing.T, w, h int) []byte {
 	return buf.Bytes()
 }
 
-func makeGIF(t *testing.T, w, h int) []byte {
-	t.Helper()
-	pal := color.Palette{color.Black, color.White}
-	img := image.NewPaletted(image.Rect(0, 0, w, h), pal)
-	var buf bytes.Buffer
-	if err := gif.Encode(&buf, img, nil); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
 func newStore(t *testing.T) *Store {
 	t.Helper()
 	dir := t.TempDir()
@@ -71,16 +57,10 @@ func newStore(t *testing.T) *Store {
 	return s
 }
 
-func decodeBounds(t *testing.T, b []byte) image.Rectangle {
-	t.Helper()
-	img, _, err := image.Decode(bytes.NewReader(b))
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	return img.Bounds()
-}
-
-func TestSave_PNG_PassthroughBelowLimit(t *testing.T) {
+func TestSave_WritesOriginalOnly(t *testing.T) {
+	// Save now writes nothing but the original — display variants are
+	// produced asynchronously by the render pipeline. The display dir
+	// (s.dir) should contain only the orig/ subdirectory after a Save.
 	s := newStore(t)
 	src := makePNG(t, 200, 100)
 	got, err := s.Save(bytes.NewReader(src))
@@ -88,94 +68,42 @@ func TestSave_PNG_PassthroughBelowLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.HasSuffix(got.Name, ".png") {
-		t.Errorf("display ext=%q, want .png", filepath.Ext(got.Name))
+		t.Errorf("name=%q, want .png suffix", got.Name)
 	}
 	if got.MIME != "image/png" {
 		t.Errorf("MIME=%q", got.MIME)
 	}
-
-	// Original preserved byte-for-byte.
-	origBase := strings.TrimSuffix(got.Name, ".png") + ".png"
-	orig, err := os.ReadFile(filepath.Join(s.origDir, origBase))
+	orig, err := os.ReadFile(filepath.Join(s.origDir, got.Name))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("original missing: %v", err)
 	}
 	if !bytes.Equal(orig, src) {
 		t.Error("original bytes differ from input")
 	}
-
-	// Display variant is still 200x100 (no upscale, no downscale).
-	disp, err := os.ReadFile(filepath.Join(s.dir, got.Name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	b := decodeBounds(t, disp)
-	if b.Dx() != 200 || b.Dy() != 100 {
-		t.Errorf("display bounds=%v, want 200x100", b)
+	// No display variant should have been written into s.dir.
+	entries, _ := os.ReadDir(s.dir)
+	for _, e := range entries {
+		if !e.IsDir() {
+			t.Errorf("Save wrote unexpected file %s — display variants must come from the render pipeline", e.Name())
+		}
 	}
 }
 
-func TestSave_PNG_ResizesOversized(t *testing.T) {
+func TestSave_URLPointsAtDisplayVariant(t *testing.T) {
+	// WebP transcodes to JPEG in the display variant; the URL Save
+	// returns must reflect that so the admin UI embeds the right path.
+	// Use a JPEG → JPEG case here since testing without WebP fixture
+	// and the rule still demonstrates the URL/extension contract.
 	s := newStore(t)
-	// 4000x2000 — long edge well over 1600.
-	src := makePNG(t, 4000, 2000)
-	got, err := s.Save(bytes.NewReader(src))
+	got, err := s.Save(bytes.NewReader(makeJPEG(t, 50, 50)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	disp, err := os.ReadFile(filepath.Join(s.dir, got.Name))
-	if err != nil {
-		t.Fatal(err)
+	if !strings.HasPrefix(got.URL, "/media/") {
+		t.Errorf("URL=%q, want /media/ prefix", got.URL)
 	}
-	b := decodeBounds(t, disp)
-	if b.Dx() != DisplayLongEdge {
-		t.Errorf("display width=%d, want %d", b.Dx(), DisplayLongEdge)
-	}
-	if b.Dy() != 800 {
-		// 4000x2000 → 1600x800 (aspect preserved)
-		t.Errorf("display height=%d, want 800", b.Dy())
-	}
-}
-
-func TestSave_JPEG_TallerThanWide(t *testing.T) {
-	s := newStore(t)
-	// 1000x3200 — long edge is height.
-	src := makeJPEG(t, 1000, 3200)
-	got, err := s.Save(bytes.NewReader(src))
-	if err != nil {
-		t.Fatal(err)
-	}
-	disp, err := os.ReadFile(filepath.Join(s.dir, got.Name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	b := decodeBounds(t, disp)
-	if b.Dy() != DisplayLongEdge {
-		t.Errorf("display height=%d, want %d", b.Dy(), DisplayLongEdge)
-	}
-	if b.Dx() != 500 {
-		// 1000x3200 → 500x1600
-		t.Errorf("display width=%d, want 500", b.Dx())
-	}
-}
-
-func TestSave_GIF_Passthrough(t *testing.T) {
-	s := newStore(t)
-	// Oversized GIF: would normally trigger resize, but GIFs pass through.
-	src := makeGIF(t, 2400, 1200)
-	got, err := s.Save(bytes.NewReader(src))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasSuffix(got.Name, ".gif") {
-		t.Errorf("display ext=%q, want .gif", filepath.Ext(got.Name))
-	}
-	disp, err := os.ReadFile(filepath.Join(s.dir, got.Name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(disp, src) {
-		t.Error("GIF display variant differs from source — should be passthrough")
+	if !strings.HasSuffix(got.URL, ".jpg") {
+		t.Errorf("URL=%q, want .jpg suffix for JPEG upload", got.URL)
 	}
 }
 
@@ -185,7 +113,6 @@ func TestSave_RejectsNonImage(t *testing.T) {
 	if !errors.Is(err, ErrUnsupportedExt) {
 		t.Errorf("err=%v want ErrUnsupportedExt", err)
 	}
-	// Make sure nothing was written to either dir.
 	for _, d := range []string{s.dir, s.origDir} {
 		entries, _ := os.ReadDir(d)
 		for _, e := range entries {
@@ -226,43 +153,5 @@ func TestSave_UniqueNames(t *testing.T) {
 	}
 	if a.Name == b.Name {
 		t.Errorf("two saves produced same name %q", a.Name)
-	}
-}
-
-func TestSave_PNG_NoReencodeWhenSmall(t *testing.T) {
-	// A small PNG should be passed through to the display dir
-	// byte-for-byte — re-encoding would either lose quality or just
-	// shuffle the same pixels through a different deflate stream.
-	s := newStore(t)
-	src := makePNG(t, 200, 100)
-	got, err := s.Save(bytes.NewReader(src))
-	if err != nil {
-		t.Fatal(err)
-	}
-	disp, err := os.ReadFile(filepath.Join(s.dir, got.Name))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(disp, src) {
-		t.Error("small PNG was re-encoded; expected byte-for-byte passthrough")
-	}
-}
-
-func TestResizeIfLarger_DegenerateAspectRatio(t *testing.T) {
-	// A 1×3200 sliver scaled to a 1600 long-edge would compute width=0
-	// without the floor guard, producing a zero-pixel canvas.
-	src := image.NewRGBA(image.Rect(0, 0, 1, 3200))
-	got := resizeIfLarger(src, 1600)
-	b := got.Bounds()
-	if b.Dx() < 1 || b.Dy() < 1 {
-		t.Errorf("got %dx%d, want both dims >= 1", b.Dx(), b.Dy())
-	}
-}
-
-func TestResizeIfLarger_NoUpscale(t *testing.T) {
-	src := image.NewRGBA(image.Rect(0, 0, 100, 50))
-	got := resizeIfLarger(src, 1600)
-	if got != image.Image(src) {
-		t.Error("small image was modified; expected passthrough (no upscale)")
 	}
 }

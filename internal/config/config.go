@@ -62,6 +62,7 @@ type Paths struct {
 	Media         string `yaml:"media"`
 	Cache         string `yaml:"cache"`
 	State         string `yaml:"state"`
+	Public        string `yaml:"public"` // baked output of the render pipeline; defaults to <state>/public
 	Certs         string `yaml:"certs"`
 	AdminDist     string `yaml:"admin_dist"`
 	Subscriptions string `yaml:"subscriptions"`
@@ -132,6 +133,7 @@ func Load(path string) (*Config, error) {
 		c.Paths.Cache,
 		c.Paths.State,
 		c.Paths.Certs,
+		c.Paths.Public,
 	} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("mkdir %s: %w", dir, err)
@@ -156,6 +158,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Paths.Certs == "" {
 		c.Paths.Certs = filepath.Join(c.Paths.State, "certs")
+	}
+	if c.Paths.Public == "" {
+		c.Paths.Public = filepath.Join(c.Paths.State, "public")
 	}
 	if c.Server.TLS.Addr == "" {
 		c.Server.TLS.Addr = ":443"

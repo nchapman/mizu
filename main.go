@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/nchapman/mizu/internal/feeds"
 	"github.com/nchapman/mizu/internal/media"
 	"github.com/nchapman/mizu/internal/post"
+	"github.com/nchapman/mizu/internal/render"
 	mizuserver "github.com/nchapman/mizu/internal/server"
 	"github.com/nchapman/mizu/internal/site"
 	"github.com/nchapman/mizu/internal/theme"
@@ -39,7 +41,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("posts: %v", err)
 	}
-	postWatcher := post.NewWatcher(posts)
 
 	feedStore, err := feeds.OpenStore(cfg.Paths.Cache)
 	if err != nil {
@@ -54,22 +55,11 @@ func main() {
 	}
 	poller := feeds.NewPoller(feedStore, cfg.Poller.Interval, cfg.Poller.UserAgent)
 
-	// Track the poller goroutine so we can wait for it to drain before
-	// closing the database. Otherwise an in-flight PollOne can hit a
-	// closed connection on shutdown.
 	var bg sync.WaitGroup
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
 		poller.Run(ctx)
-	}()
-
-	bg.Add(1)
-	go func() {
-		defer bg.Done()
-		if err := postWatcher.Run(ctx); err != nil {
-			log.Printf("post watcher: %v", err)
-		}
 	}()
 
 	wmStore, err := webmention.OpenStore(cfg.Paths.Cache)
@@ -81,20 +71,68 @@ func main() {
 		log.Fatalf("webmention log: %v", err)
 	}
 	wmSvc := webmention.New(wmStore, wmLog, cfg.Site.BaseURL)
+
+	activeTheme, err := theme.Load(cfg.Theme.Name, themesFS(), cfg.Theme.Settings)
+	if err != nil {
+		log.Fatalf("theme: %v", err)
+	}
+
+	draftSalt, err := render.LoadOrCreateDraftSalt(cfg.Paths.State)
+	if err != nil {
+		log.Fatalf("draft salt: %v", err)
+	}
+
+	pipeline, err := render.NewPipeline(render.Options{
+		Sources: &render.SnapshotSources{
+			Cfg:       cfg,
+			Posts:     posts,
+			Theme:     activeTheme,
+			WM:        wmSvc,
+			MediaDir:  cfg.Paths.Media,
+			DraftSalt: draftSalt,
+		},
+		PublicDir: cfg.Paths.Public,
+		HashPath:  filepath.Join(cfg.Paths.State, "build.json"),
+	})
+	if err != nil {
+		log.Fatalf("render pipeline: %v", err)
+	}
+
+	// Webmention verifier kicks the pipeline whenever a mention
+	// promotes to verified, so the affected post page picks up the new
+	// mention in the next render cycle.
+	wmSvc.OnVerified(pipeline.Enqueue)
+
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		pipeline.Run(ctx)
+	}()
+
+	postsDir, draftsDir := posts.Dirs()
+	watcher := render.NewWatcher(pipeline,
+		[]string{
+			postsDir,
+			draftsDir,
+			filepath.Join(cfg.Paths.Media, "orig"),
+			"themes", // disk-resident custom themes; no-op if absent
+		},
+		[]string{*cfgPath}, // config.yaml — site title, base_url, theme settings all flow through here
+	)
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		if err := watcher.Run(ctx); err != nil {
+			log.Printf("render watcher: %v", err)
+		}
+	}()
+
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
 		wmSvc.RunVerifier(ctx)
 	}()
 
-	activeTheme, err := theme.Load(cfg.Theme.Name, themesFS(), cfg.Theme.Settings)
-	if err != nil {
-		log.Fatalf("theme: %v", err)
-	}
-	siteSrv, err := site.New(cfg, posts, wmSvc, activeTheme)
-	if err != nil {
-		log.Fatalf("site: %v", err)
-	}
 	authSvc, err := auth.New(cfg.Paths.State)
 	if err != nil {
 		log.Fatalf("auth: %v", err)
@@ -119,8 +157,7 @@ func main() {
 	// listener directly and there is no trusted reverse proxy, so any
 	// X-Forwarded-For header is attacker-controlled and would let a
 	// caller spoof the client IP — completely defeating the per-IP
-	// rate limit. Trust r.RemoteAddr instead. Restore RealIP only when
-	// you put mizu behind a proxy whose XFF you trust.
+	// rate limit.
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -129,14 +166,23 @@ func main() {
 	r.Use(mizuserver.RateLimit(cfg.Limits.Rate.Global))
 
 	r.Route("/admin", adminSrv.Routes)
-	mediaFS := http.StripPrefix("/media/", http.FileServer(http.Dir(cfg.Paths.Media)))
+	mediaFS := http.StripPrefix("/media/", http.FileServer(http.Dir(filepath.Join(cfg.Paths.Public, "media"))))
 	r.Handle("/media/*", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		// Defense in depth: even though uploads are restricted to a small
-		// set of raster types, a stale or hand-placed file shouldn't be
+		// Serve the *baked* display variants from public/media (produced
+		// by the ImageVariantStage), not the raw originals. Defense in
+		// depth: even though uploads are restricted to a small set of
+		// raster types, a stale or hand-placed file shouldn't be
 		// content-sniffed by the browser into something executable.
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		// Display variants are content-derivatives of their originals;
+		// the URL changes when the source filename changes (originals
+		// keep their generated base across edits). A day of caching is
+		// safe and saves a lot of conditional-GET round trips.
+		w.Header().Set("Cache-Control", "public, max-age=86400")
 		mediaFS.ServeHTTP(w, req)
 	}))
+
+	siteSrv := site.New(cfg, wmSvc, cfg.Paths.Public)
 	siteSrv.Routes(r)
 
 	srv := &http.Server{
@@ -170,8 +216,6 @@ func main() {
 	log.Print("shutting down")
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()
-	// Drain both servers concurrently so each gets the full deadline
-	// rather than whatever's left after the other finishes draining.
 	var shutWG sync.WaitGroup
 	shutWG.Add(2)
 	go func() {
