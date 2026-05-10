@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+
+	mizudb "github.com/nchapman/mizu/internal/db"
 )
 
 // draftSaltKey is the row in app_meta that stores the per-install
@@ -22,8 +24,8 @@ const draftSaltKey = "draft_salt"
 // table directly. Decode failures are treated as corruption and the
 // caller gets an error rather than a silently regenerated salt — a
 // quietly rotated salt would invalidate every outstanding draft URL.
-func LoadOrCreateDraftSalt(ctx context.Context, db *sql.DB) ([]byte, error) {
-	if salt, ok, err := readSalt(ctx, db); err != nil {
+func LoadOrCreateDraftSalt(ctx context.Context, db *mizudb.DB) ([]byte, error) {
+	if salt, ok, err := readSalt(ctx, db.R); err != nil {
 		return nil, err
 	} else if ok {
 		return salt, nil
@@ -37,15 +39,17 @@ func LoadOrCreateDraftSalt(ctx context.Context, db *sql.DB) ([]byte, error) {
 		return nil, fmt.Errorf("generate draft salt: %w", err)
 	}
 	encoded := hex.EncodeToString(fresh)
-	if _, err := db.ExecContext(ctx,
+	if _, err := db.W.ExecContext(ctx,
 		`INSERT OR IGNORE INTO app_meta(key, value) VALUES(?, ?)`,
 		draftSaltKey, encoded,
 	); err != nil {
 		return nil, fmt.Errorf("insert draft salt: %w", err)
 	}
 	// Re-read so the loser of the insert race ends up with the same
-	// bytes as the winner.
-	salt, ok, err := readSalt(ctx, db)
+	// bytes as the winner. Read via the writer pool: the row was just
+	// committed and we want strict read-after-write semantics here
+	// without relying on the reader pool's snapshot timing.
+	salt, ok, err := readSalt(ctx, db.W)
 	if err != nil {
 		return nil, err
 	}
@@ -55,9 +59,9 @@ func LoadOrCreateDraftSalt(ctx context.Context, db *sql.DB) ([]byte, error) {
 	return salt, nil
 }
 
-func readSalt(ctx context.Context, db *sql.DB) ([]byte, bool, error) {
+func readSalt(ctx context.Context, conn *sql.DB) ([]byte, bool, error) {
 	var value string
-	err := db.QueryRowContext(ctx,
+	err := conn.QueryRowContext(ctx,
 		`SELECT value FROM app_meta WHERE key = ?`, draftSaltKey,
 	).Scan(&value)
 	if errors.Is(err, sql.ErrNoRows) {

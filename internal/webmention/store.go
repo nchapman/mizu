@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"time"
+
+	mizudb "github.com/nchapman/mizu/internal/db"
 )
 
 // Status describes where a mention is in its lifecycle.
@@ -20,11 +22,11 @@ const (
 // Store reads and writes the mentions table on the shared *sql.DB.
 // Schema is managed centrally by internal/db.
 type Store struct {
-	db *sql.DB
+	db *mizudb.DB
 }
 
 // NewStore wires a Store onto an already-open, already-migrated DB.
-func NewStore(db *sql.DB) *Store { return &Store{db: db} }
+func NewStore(db *mizudb.DB) *Store { return &Store{db: db} }
 
 // Upsert inserts a new mention or updates the status of an existing
 // (source, target) pair. The (source, target) UNIQUE constraint
@@ -34,7 +36,7 @@ func (s *Store) Upsert(ctx context.Context, m Mention) error {
 	if m.Status == StatusVerified && !m.VerifiedAt.IsZero() {
 		verifiedAt = sql.NullInt64{Int64: m.VerifiedAt.Unix(), Valid: true}
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.db.W.ExecContext(ctx, `
 		INSERT INTO mentions (source, target, status, received_at, verified_at, last_error)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(source, target) DO UPDATE SET
@@ -59,7 +61,7 @@ type Mention struct {
 // newest first. Pending and rejected mentions are filtered out so the
 // public render path never shows unverified user-supplied URLs.
 func (s *Store) ForTarget(ctx context.Context, target string) ([]Mention, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.R.QueryContext(ctx, `
 		SELECT id, source, target, status, received_at, verified_at, last_error
 		FROM mentions
 		WHERE target = ? AND status = ?
@@ -98,7 +100,7 @@ func (s *Store) Recent(ctx context.Context, limit int) ([]Mention, error) {
 	if limit > 200 {
 		limit = 200
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.R.QueryContext(ctx, `
 		SELECT id, source, target, status, received_at, verified_at, last_error
 		FROM mentions
 		WHERE status = ?
@@ -133,7 +135,7 @@ func (s *Store) Recent(ctx context.Context, limit int) ([]Mention, error) {
 // per-post mention lists in a single query rather than one query
 // per post page.
 func (s *Store) AllVerified(ctx context.Context) ([]Mention, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.R.QueryContext(ctx, `
 		SELECT id, source, target, status, received_at, verified_at, last_error
 		FROM mentions
 		WHERE status = ?
@@ -168,7 +170,7 @@ func (s *Store) AllVerified(ctx context.Context) ([]Mention, error) {
 // verifier backlog without limit.
 func (s *Store) CountPending(ctx context.Context) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx,
+	err := s.db.R.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM mentions WHERE status = ?`,
 		string(StatusPending),
 	).Scan(&n)
@@ -186,7 +188,7 @@ type PendingPair struct {
 // process didn't finish — for example, mentions received just before
 // shutdown, or jobs dropped when the in-memory queue was full.
 func (s *Store) Pending(ctx context.Context) ([]PendingPair, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.db.R.QueryContext(ctx,
 		`SELECT source, target FROM mentions WHERE status = ?`,
 		string(StatusPending))
 	if err != nil {
@@ -214,7 +216,7 @@ func (s *Store) Pending(ctx context.Context) ([]PendingPair, error) {
 // transient error can't clobber the message on a row that has since
 // been re-submitted and reset by Upsert.
 func (s *Store) SetLastError(ctx context.Context, source, target, msg string) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.db.W.ExecContext(ctx,
 		`UPDATE mentions SET last_error = ?
 		 WHERE source = ? AND target = ? AND status = ?`,
 		msg, source, target, string(StatusPending))

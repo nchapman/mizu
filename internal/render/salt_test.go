@@ -58,7 +58,7 @@ func TestLoadOrCreateDraftSalt_RejectsCorruptStored(t *testing.T) {
 	}
 	defer conn.Close()
 	// Hand-write a junk value into app_meta.
-	if _, err := conn.Exec(`INSERT INTO app_meta(key, value) VALUES('draft_salt', 'not-hex')`); err != nil {
+	if _, err := conn.W.Exec(`INSERT INTO app_meta(key, value) VALUES('draft_salt', 'not-hex')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadOrCreateDraftSalt(context.Background(), conn); err == nil {

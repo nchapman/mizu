@@ -3,10 +3,15 @@
 // fetched feed items and read state, received webmentions, and the
 // per-install draft salt.
 //
-// Other packages (auth, feeds, webmention, render) share the *sql.DB
-// returned by Open. Schema lives in migrations/*.sql and is applied
-// in order via PRAGMA user_version, so post-release schema changes
-// only require dropping a new file in the migrations dir.
+// Open returns a *DB that wraps two connection pools to the same
+// underlying file: a single-connection writer (so writes serialize at
+// the Go layer with no SQLITE_BUSY churn) and a multi-connection
+// reader (so WAL's concurrent-read story actually pays out). Services
+// pick the right handle for the call: writes/transactions go through
+// W, read-only queries go through R. Schema lives in migrations/*.sql
+// and is applied in order via PRAGMA user_version, so post-release
+// schema changes only require dropping a new file in the migrations
+// dir.
 package db
 
 import (
@@ -16,6 +21,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,41 +32,83 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-// Open returns a *sql.DB pointing at path, ready for use by every
-// service. WAL is on for concurrent reads during a write; foreign
-// keys are enforced so ON DELETE CASCADE works; a busy timeout
-// absorbs the small writer-contention windows that show up on a
-// busy server. Migrations are applied automatically.
-func Open(path string) (*sql.DB, error) {
+// DB groups the two SQLite connection pools the rest of the app uses.
+// SQLite serializes writers at the file level regardless of pool size,
+// so the writer pool is capped at one connection; WAL mode lets many
+// readers run concurrently against committed snapshots, so the reader
+// pool is sized to the box. Splitting the pools means a long write
+// (e.g. a feed poll committing dozens of item inserts in one tx)
+// doesn't queue up admin reads behind it.
+//
+// Both handles point at the same database file. Callers should treat
+// W as the source of truth for read-after-write semantics inside a
+// single transaction, and use R for everything else.
+type DB struct {
+	// W is the writer pool, capped at one open connection so the auth
+	// lockout flow's read-then-write sequences can rely on no other
+	// writer interleaving. Opened with _txlock=immediate so every
+	// BeginTx grabs the write lock at BEGIN — without this, a
+	// transaction that starts with a SELECT and later UPDATEs has to
+	// upgrade its lock mid-flight and can lose the race to another
+	// writer (returning SQLITE_BUSY).
+	W *sql.DB
+	// R is the reader pool. Opened with query_only so any accidental
+	// write through this handle is rejected at the SQLite layer
+	// instead of being silently routed to the wrong pool.
+	R *sql.DB
+}
+
+// Open opens both pools, applies pending migrations against the
+// writer, and returns the wrapper. The reader is opened after
+// migrations so it sees a fully-built schema on its very first query.
+func Open(path string) (*DB, error) {
 	if path == "" {
 		return nil, fmt.Errorf("db path is empty")
 	}
-	// `file:` prefix lets SQLite parse the path itself; `?_pragma=` is
-	// modernc's way to set PRAGMAs at open time. We leave synchronous
-	// at WAL's default of NORMAL: every commit fsyncs the WAL, and the
-	// only data loss window is an OS crash or power cut between commit
-	// and the next checkpoint. FULL would double-fsync on every write
-	// for a microblog's traffic — not the right tradeoff here.
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
-	conn, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	// The pool is capped at one connection on purpose. SQLite serializes
-	// writers regardless of pool size, and WAL mode buys us concurrent
-	// readers — but several invariants in internal/auth (notably the
-	// lockout counter in checkLock/recordFailure) assume that read +
-	// write are serialized at the Go side. If you raise this cap, audit
-	// those flows for concurrent-failure interleavings and switch the
-	// write transactions to BEGIN IMMEDIATE first. For a single-operator
-	// instance the throughput cost of one connection is invisible.
-	conn.SetMaxOpenConns(1)
+	// Shared pragmas: WAL for concurrent reads during a write;
+	// foreign_keys so ON DELETE CASCADE works; busy_timeout absorbs
+	// the brief windows where a reader trips over a checkpointer or
+	// the writer holds the write lock at commit. synchronous stays at
+	// WAL's default of NORMAL — every commit fsyncs the WAL, and the
+	// only data-loss window is an OS crash between commit and the
+	// next checkpoint. FULL would double-fsync every write for a
+	// microblog's traffic — not the right tradeoff.
+	common := "_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 
-	if err := Migrate(conn); err != nil {
-		_ = conn.Close()
+	writer, err := sql.Open("sqlite", "file:"+path+"?"+common+"&_txlock=immediate")
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite writer: %w", err)
+	}
+	writer.SetMaxOpenConns(1)
+
+	if err := Migrate(writer); err != nil {
+		_ = writer.Close()
 		return nil, err
 	}
-	return conn, nil
+
+	reader, err := sql.Open("sqlite", "file:"+path+"?"+common+"&_pragma=query_only(1)")
+	if err != nil {
+		_ = writer.Close()
+		return nil, fmt.Errorf("open sqlite reader: %w", err)
+	}
+	n := runtime.NumCPU()
+	if n < 4 {
+		n = 4
+	}
+	reader.SetMaxOpenConns(n)
+
+	return &DB{W: writer, R: reader}, nil
+}
+
+// Close closes both pools. The writer is closed last so any final
+// reader cleanup that races shutdown can still see committed state.
+func (d *DB) Close() error {
+	rerr := d.R.Close()
+	werr := d.W.Close()
+	if werr != nil {
+		return werr
+	}
+	return rerr
 }
 
 // Migrate brings the database up to the latest schema version by

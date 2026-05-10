@@ -109,6 +109,7 @@ func (p *Poller) PollOne(ctx context.Context, f Feed) error {
 		return fmt.Errorf("parse: %w", err)
 	}
 	now := time.Now()
+	items := make([]*Item, 0, len(parsed.Items))
 	for _, e := range parsed.Items {
 		guid := e.GUID
 		if guid == "" {
@@ -135,7 +136,7 @@ func (p *Poller) PollOne(ctx context.Context, f Feed) error {
 		// UGCPolicy strips <script>, event handlers, javascript: URIs,
 		// and other XSS vectors while preserving common formatting.
 		content = p.sanitizer.Sanitize(content)
-		if _, err := p.store.InsertItem(ctx, &Item{
+		items = append(items, &Item{
 			FeedID:      f.ID,
 			GUID:        guid,
 			URL:         e.Link,
@@ -144,9 +145,14 @@ func (p *Poller) PollOne(ctx context.Context, f Feed) error {
 			Content:     content,
 			PublishedAt: published,
 			FetchedAt:   now,
-		}); err != nil {
-			return fmt.Errorf("insert item: %w", err)
-		}
+		})
 	}
-	return p.store.MarkFetched(ctx, f.ID, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), parsed.Title, parsed.Link)
+	// IngestPoll commits all N inserts plus the feed-metadata update in
+	// one transaction: one fsync, one short hold on the writer pool.
+	if _, err := p.store.IngestPoll(ctx, f.ID, items,
+		resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"),
+		parsed.Title, parsed.Link); err != nil {
+		return fmt.Errorf("ingest poll: %w", err)
+	}
+	return nil
 }

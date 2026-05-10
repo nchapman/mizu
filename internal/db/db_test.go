@@ -7,18 +7,18 @@ import (
 
 func TestOpen_AppliesV1Schema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
-	conn, err := Open(path)
+	d, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = conn.Close() })
+	t.Cleanup(func() { _ = d.Close() })
 
 	// Open applies every embedded migration, so the recorded version
 	// tracks the latest file in migrations/. We assert "at least 1"
 	// rather than a specific number so adding migrations doesn't churn
 	// this test — the per-table assertions below cover what we actually
 	// care about (the v1 schema is fully present).
-	v, err := readVersion(conn)
+	v, err := readVersion(d.W)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func TestOpen_AppliesV1Schema(t *testing.T) {
 	// schema_version row is in app_meta, not PRAGMA user_version, so
 	// the bump commits atomically with the DDL.
 	var stored string
-	if err := conn.QueryRow(`SELECT value FROM app_meta WHERE key='schema_version'`).Scan(&stored); err != nil {
+	if err := d.R.QueryRow(`SELECT value FROM app_meta WHERE key='schema_version'`).Scan(&stored); err != nil {
 		t.Fatal(err)
 	}
 	if stored == "" {
@@ -42,7 +42,7 @@ func TestOpen_AppliesV1Schema(t *testing.T) {
 		"feeds", "items", "mentions",
 	} {
 		var name string
-		err := conn.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
+		err := d.R.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
 		if err != nil {
 			t.Errorf("table %q missing: %v", table, err)
 		}
@@ -50,7 +50,7 @@ func TestOpen_AppliesV1Schema(t *testing.T) {
 
 	// Foreign keys must be enforced (DSN sets the pragma).
 	var fk int
-	if err := conn.QueryRow("PRAGMA foreign_keys").Scan(&fk); err != nil {
+	if err := d.W.QueryRow("PRAGMA foreign_keys").Scan(&fk); err != nil {
 		t.Fatal(err)
 	}
 	if fk != 1 {
@@ -60,26 +60,26 @@ func TestOpen_AppliesV1Schema(t *testing.T) {
 
 func TestMigrate_IdempotentOnRerun(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
-	conn, err := Open(path)
+	d, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = conn.Close() })
+	t.Cleanup(func() { _ = d.Close() })
 
 	// Insert a sentinel row so we can detect if Migrate accidentally
 	// re-ran 0001_init (CREATE TABLE would have failed, but if the
 	// runner ever swallowed errors the row would survive while the
 	// table got blown away — explicit assertion is cheaper than trust).
-	if _, err := conn.Exec(`INSERT INTO app_meta(key, value) VALUES('canary', 'v1')`); err != nil {
+	if _, err := d.W.Exec(`INSERT INTO app_meta(key, value) VALUES('canary', 'v1')`); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := Migrate(conn); err != nil {
+	if err := Migrate(d.W); err != nil {
 		t.Fatalf("second Migrate: %v", err)
 	}
 
 	var got string
-	if err := conn.QueryRow(`SELECT value FROM app_meta WHERE key='canary'`).Scan(&got); err != nil {
+	if err := d.R.QueryRow(`SELECT value FROM app_meta WHERE key='canary'`).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
 	if got != "v1" {

@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+
+	mizudb "github.com/nchapman/mizu/internal/db"
 )
 
 const (
@@ -62,9 +64,11 @@ type User struct {
 }
 
 // Service is the auth API. Construct one per process via New, sharing
-// the *sql.DB with the rest of the app.
+// the *db.DB with the rest of the app. Reads use db.R (concurrent
+// with other readers); writes and read-then-write transactions use
+// db.W (serialized, immediate-locking).
 type Service struct {
-	db *sql.DB
+	db *mizudb.DB
 
 	mu         sync.Mutex
 	setupToken string // non-empty only while no users exist
@@ -93,7 +97,7 @@ func init() {
 // empty it generates a one-time setup token and logs it via the
 // caller (caller checks SetupToken() after New). The token lives in
 // memory only — restarting before setup just mints a fresh one.
-func New(db *sql.DB) (*Service, error) {
+func New(db *mizudb.DB) (*Service, error) {
 	s := &Service{db: db, now: time.Now}
 	configured, err := s.Configured(context.Background())
 	if err != nil {
@@ -113,7 +117,7 @@ func New(db *sql.DB) (*Service, error) {
 // /api/me before login to decide whether to render setup or login.
 func (s *Service) Configured(ctx context.Context) (bool, error) {
 	var n int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
+	if err := s.db.R.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
 		return false, fmt.Errorf("count users: %w", err)
 	}
 	return n > 0, nil
@@ -196,7 +200,7 @@ func (s *Service) insertUser(ctx context.Context, email, password, displayName s
 		return nil, fmt.Errorf("hash: %w", err)
 	}
 	now := s.now().UTC().Unix()
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.db.W.ExecContext(ctx, `
 		INSERT INTO users (email, display_name, password_hash, created_at)
 		VALUES (?, ?, ?, ?)`,
 		email, strings.TrimSpace(displayName), string(hash), now,
@@ -221,7 +225,7 @@ func (s *Service) insertUser(ctx context.Context, email, password, displayName s
 
 // ListUsers returns all accounts ordered by creation time.
 func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.R.QueryContext(ctx, `
 		SELECT id, email, display_name, created_at, COALESCE(last_login_at, 0)
 		FROM users ORDER BY created_at ASC, id ASC`)
 	if err != nil {
@@ -248,7 +252,7 @@ func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
 // user so the operator can never get locked out by an accidental DELETE.
 // Cascading FK drops the user's sessions.
 func (s *Service) DeleteUser(ctx context.Context, id int64) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.W.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -290,7 +294,7 @@ func (s *Service) ChangePassword(ctx context.Context, userID int64, oldPassword,
 		return err
 	}
 	var hash string
-	err := s.db.QueryRowContext(ctx, `SELECT password_hash FROM users WHERE id = ?`, userID).Scan(&hash)
+	err := s.db.R.QueryRowContext(ctx, `SELECT password_hash FROM users WHERE id = ?`, userID).Scan(&hash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrUserNotFound
 	}
@@ -304,15 +308,25 @@ func (s *Service) ChangePassword(ctx context.Context, userID int64, oldPassword,
 	if err != nil {
 		return fmt.Errorf("hash: %w", err)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.W.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE users SET password_hash = ? WHERE id = ?`, string(newHash), userID,
-	); err != nil {
+	// Compare-and-set on the old hash: with the reader pool now serving
+	// the verify SELECT above, a concurrent ChangePassword could have
+	// landed between our read and this write. Conditioning the UPDATE
+	// on the original hash makes the success path atomic — if the row
+	// has changed, RowsAffected is 0 and we report ErrInvalidPassword.
+	res, err := tx.ExecContext(ctx,
+		`UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?`,
+		string(newHash), userID, hash,
+	)
+	if err != nil {
 		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrInvalidPassword
 	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM sessions WHERE user_id = ?`, userID,
@@ -355,7 +369,7 @@ func (s *Service) Login(ctx context.Context, email, password string) (*User, tim
 		hash    string
 		found   bool
 	)
-	err = s.db.QueryRowContext(ctx, `
+	err = s.db.R.QueryRowContext(ctx, `
 		SELECT id, display_name, created_at, last_login_at, password_hash
 		FROM users WHERE email = ?`, normalized,
 	).Scan(&userID, &display, &created, &lastLog, &hash)
@@ -385,7 +399,7 @@ func (s *Service) Login(ctx context.Context, email, password string) (*User, tim
 		return nil, time.Time{}, err
 	}
 	now := s.now().UTC().Unix()
-	if _, err := s.db.ExecContext(ctx, `UPDATE users SET last_login_at = ? WHERE id = ?`, now, userID); err != nil {
+	if _, err := s.db.W.ExecContext(ctx, `UPDATE users SET last_login_at = ? WHERE id = ?`, now, userID); err != nil {
 		return nil, time.Time{}, err
 	}
 	u := &User{
@@ -400,7 +414,7 @@ func (s *Service) Login(ctx context.Context, email, password string) (*User, tim
 
 func (s *Service) checkLock(ctx context.Context, email string) (locked bool, until time.Time, err error) {
 	var lockedUntil sql.NullInt64
-	err = s.db.QueryRowContext(ctx, `SELECT locked_until FROM login_attempts WHERE email = ?`, email).Scan(&lockedUntil)
+	err = s.db.R.QueryRowContext(ctx, `SELECT locked_until FROM login_attempts WHERE email = ?`, email).Scan(&lockedUntil)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, time.Time{}, nil
 	}
@@ -418,14 +432,14 @@ func (s *Service) checkLock(ctx context.Context, email string) (locked bool, unt
 	// zero — otherwise the very next wrong password re-trips the lock,
 	// letting an attacker keep an account permanently locked with one
 	// probe per lockout window.
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM login_attempts WHERE email = ?`, email); err != nil {
+	if _, err := s.db.W.ExecContext(ctx, `DELETE FROM login_attempts WHERE email = ?`, email); err != nil {
 		return false, time.Time{}, err
 	}
 	return false, time.Time{}, nil
 }
 
 func (s *Service) recordFailure(ctx context.Context, email string) (time.Time, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.W.BeginTx(ctx, nil)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -478,7 +492,7 @@ func (s *Service) recordFailure(ctx context.Context, email string) (time.Time, e
 }
 
 func (s *Service) clearFailures(ctx context.Context, email string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM login_attempts WHERE email = ?`, email)
+	_, err := s.db.W.ExecContext(ctx, `DELETE FROM login_attempts WHERE email = ?`, email)
 	return err
 }
 
@@ -491,7 +505,7 @@ func (s *Service) CreateSession(ctx context.Context, userID int64) (string, erro
 	}
 	now := s.now().UTC().Unix()
 	expires := s.now().Add(sessionTTL).UTC().Unix()
-	_, err = s.db.ExecContext(ctx, `
+	_, err = s.db.W.ExecContext(ctx, `
 		INSERT INTO sessions (token, user_id, created_at, last_seen_at, expires_at)
 		VALUES (?, ?, ?, ?, ?)`,
 		token, userID, now, now, expires,
@@ -514,7 +528,7 @@ func (s *Service) Lookup(ctx context.Context, token string) (*User, error) {
 		created int64
 		lastLog sql.NullInt64
 	)
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.R.QueryRowContext(ctx, `
 		SELECT u.id, u.email, u.display_name, u.created_at, u.last_login_at, s.expires_at
 		FROM sessions s JOIN users u ON u.id = s.user_id
 		WHERE s.token = ?`, token,
@@ -541,7 +555,7 @@ func (s *Service) DestroySession(ctx context.Context, token string) error {
 	if token == "" {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE token = ?`, token)
+	_, err := s.db.W.ExecContext(ctx, `DELETE FROM sessions WHERE token = ?`, token)
 	return err
 }
 
@@ -557,7 +571,7 @@ func (s *Service) ReapSessions(ctx context.Context) {
 			return
 		case <-tk.C:
 			now := s.now().Unix()
-			if _, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at < ?`, now); err != nil {
+			if _, err := s.db.W.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at < ?`, now); err != nil {
 				log.Printf("auth: reap sessions: %v", err)
 			}
 			// Drop stale login_attempts rows. Without this, an attacker
@@ -568,7 +582,7 @@ func (s *Service) ReapSessions(ctx context.Context) {
 			// first attempt after the window, so any row older than
 			// 2*window is guaranteed dead state.
 			cutoff := now - int64(2*lockoutDuration.Seconds())
-			if _, err := s.db.ExecContext(ctx,
+			if _, err := s.db.W.ExecContext(ctx,
 				`DELETE FROM login_attempts
 				 WHERE last_failed_at < ?
 				   AND (locked_until IS NULL OR locked_until < ?)`,

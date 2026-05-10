@@ -16,6 +16,8 @@ import (
 	"database/sql"
 	"errors"
 	"time"
+
+	mizudb "github.com/nchapman/mizu/internal/db"
 )
 
 type Feed struct {
@@ -48,12 +50,12 @@ type Item struct {
 // Schema is managed centrally by internal/db; we don't own the
 // connection here, so Close is a no-op.
 type Store struct {
-	db  *sql.DB
+	db  *mizudb.DB
 	now func() time.Time
 }
 
 // NewStore wires a Store onto an already-open, already-migrated DB.
-func NewStore(db *sql.DB) *Store { return &Store{db: db, now: time.Now} }
+func NewStore(db *mizudb.DB) *Store { return &Store{db: db, now: time.Now} }
 
 // UpsertFeed inserts or updates a feed by URL, preserving fetch metadata
 // (etag, last_modified) on conflict so an OPML re-import doesn't force a
@@ -68,17 +70,17 @@ ON CONFLICT(url) DO UPDATE SET
   category = excluded.category
 RETURNING id`
 	var id int64
-	err := s.db.QueryRowContext(ctx, q, f.URL, f.Title, f.SiteURL, f.Category).Scan(&id)
+	err := s.db.W.QueryRowContext(ctx, q, f.URL, f.Title, f.SiteURL, f.Category).Scan(&id)
 	return id, err
 }
 
 func (s *Store) DeleteFeedByURL(ctx context.Context, url string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM feeds WHERE url = ?`, url)
+	_, err := s.db.W.ExecContext(ctx, `DELETE FROM feeds WHERE url = ?`, url)
 	return err
 }
 
 func (s *Store) ListFeeds(ctx context.Context) ([]Feed, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.R.QueryContext(ctx, `
 SELECT id, url, title, site_url, category, etag, last_modified,
        COALESCE(last_fetched_at, 0), last_error
 FROM feeds ORDER BY title`)
@@ -107,7 +109,15 @@ FROM feeds ORDER BY title`)
 // they fill in empty slots only, so an operator-supplied title/site URL stays
 // sticky — same precedence as UpsertFeed's ON CONFLICT clause.
 func (s *Store) MarkFetched(ctx context.Context, feedID int64, etag, lastModified, parsedTitle, parsedSiteURL string) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.db.W.ExecContext(ctx, markFetchedSQL,
+		etag, lastModified, s.now().Unix(), parsedTitle, parsedSiteURL, feedID)
+	return err
+}
+
+// markFetchedSQL is shared between MarkFetched (no-change path / 304) and
+// IngestPoll (success path), so the title/site_url precedence rules can't
+// drift between them.
+const markFetchedSQL = `
 UPDATE feeds SET
   etag = ?,
   last_modified = ?,
@@ -115,24 +125,21 @@ UPDATE feeds SET
   last_error = '',
   title    = CASE WHEN title    = '' THEN ? ELSE title    END,
   site_url = CASE WHEN site_url = '' THEN ? ELSE site_url END
-WHERE id = ?`, etag, lastModified, s.now().Unix(), parsedTitle, parsedSiteURL, feedID)
-	return err
-}
+WHERE id = ?`
 
 func (s *Store) MarkFetchError(ctx context.Context, feedID int64, msg string) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.db.W.ExecContext(ctx, `
 UPDATE feeds SET last_fetched_at = ?, last_error = ? WHERE id = ?`,
 		s.now().Unix(), msg, feedID)
 	return err
 }
 
 // InsertItem inserts a single item, ignoring duplicates on (feed_id, guid).
-// Returns true if the row was newly inserted.
+// Returns true if the row was newly inserted. Used by tests and by the
+// admin's manual-insert paths; the poller uses IngestPoll instead so its
+// N inserts plus the feed-metadata update commit as one transaction.
 func (s *Store) InsertItem(ctx context.Context, it *Item) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `
-INSERT INTO items (feed_id, guid, url, title, author, content, published_at, fetched_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(feed_id, guid) DO NOTHING`,
+	res, err := s.db.W.ExecContext(ctx, insertItemSQL,
 		it.FeedID, it.GUID, it.URL, it.Title, it.Author, it.Content,
 		nullableUnix(it.PublishedAt), it.FetchedAt.Unix())
 	if err != nil {
@@ -140,6 +147,63 @@ ON CONFLICT(feed_id, guid) DO NOTHING`,
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+const insertItemSQL = `
+INSERT INTO items (feed_id, guid, url, title, author, content, published_at, fetched_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(feed_id, guid) DO NOTHING`
+
+// IngestPoll commits a poll's worth of work in a single transaction: it
+// inserts every item (deduping on (feed_id, guid)) and then stamps the
+// feed's fetch metadata. Wrapping these in one tx turns N+1 fsyncs into
+// one and keeps the writer connection busy for a single short window
+// rather than across N round trips — important because the writer pool
+// only holds one connection and every other write blocks behind it.
+//
+// Returns the number of net-new items inserted. On any error the
+// transaction is rolled back and no rows are visible.
+func (s *Store) IngestPoll(ctx context.Context, feedID int64, items []*Item, etag, lastModified, parsedTitle, parsedSiteURL string) (int, error) {
+	tx, err := s.db.W.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	insert, err := tx.PrepareContext(ctx, insertItemSQL)
+	if err != nil {
+		return 0, err
+	}
+
+	inserted := 0
+	for _, it := range items {
+		res, err := insert.ExecContext(ctx,
+			it.FeedID, it.GUID, it.URL, it.Title, it.Author, it.Content,
+			nullableUnix(it.PublishedAt), it.FetchedAt.Unix())
+		if err != nil {
+			_ = insert.Close()
+			return 0, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			inserted++
+		}
+	}
+	// Close the prepared statement before commit so its lifecycle is
+	// explicit — avoids relying on defer ordering against the rollback
+	// guard above.
+	if err := insert.Close(); err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.ExecContext(ctx, markFetchedSQL,
+		etag, lastModified, s.now().Unix(), parsedTitle, parsedSiteURL, feedID,
+	); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return inserted, nil
 }
 
 // TimelineCursor is the page boundary for Timeline. It is composite —
@@ -175,7 +239,7 @@ func (s *Store) Timeline(ctx context.Context, before TimelineCursor, limit int, 
 		where += " AND items.read_at IS NULL"
 	}
 	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.R.QueryContext(ctx, `
 SELECT items.id, items.feed_id, feeds.title, items.guid,
        items.url, items.title, items.author, items.content,
        COALESCE(items.published_at, 0), items.fetched_at, items.read_at
@@ -217,9 +281,9 @@ func (s *Store) MarkRead(ctx context.Context, itemID int64, read bool) error {
 	var res sql.Result
 	var err error
 	if read {
-		res, err = s.db.ExecContext(ctx, `UPDATE items SET read_at = ? WHERE id = ?`, s.now().Unix(), itemID)
+		res, err = s.db.W.ExecContext(ctx, `UPDATE items SET read_at = ? WHERE id = ?`, s.now().Unix(), itemID)
 	} else {
-		res, err = s.db.ExecContext(ctx, `UPDATE items SET read_at = NULL WHERE id = ?`, itemID)
+		res, err = s.db.W.ExecContext(ctx, `UPDATE items SET read_at = NULL WHERE id = ?`, itemID)
 	}
 	if err != nil {
 		return err
@@ -236,7 +300,7 @@ func (s *Store) MarkRead(ctx context.Context, itemID int64, read bool) error {
 
 // FeedFetchInfo returns the conditional-GET headers for the next poll.
 func (s *Store) FeedFetchInfo(ctx context.Context, feedID int64) (etag, lastModified string, err error) {
-	row := s.db.QueryRowContext(ctx, `SELECT etag, last_modified FROM feeds WHERE id = ?`, feedID)
+	row := s.db.R.QueryRowContext(ctx, `SELECT etag, last_modified FROM feeds WHERE id = ?`, feedID)
 	err = row.Scan(&etag, &lastModified)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = nil

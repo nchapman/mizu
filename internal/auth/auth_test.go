@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -13,7 +12,7 @@ import (
 	"github.com/nchapman/mizu/internal/db"
 )
 
-func newSvc(t *testing.T) (*Service, *sql.DB) {
+func newSvc(t *testing.T) (*Service, *db.DB) {
 	t.Helper()
 	conn, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -397,7 +396,7 @@ func TestSessions_LifecycleAndReap(t *testing.T) {
 
 	// Force t2 expired by rewriting expires_at, then run one reaper
 	// tick worth of work.
-	_, err = conn.Exec(`UPDATE sessions SET expires_at = ? WHERE token = ?`,
+	_, err = conn.W.Exec(`UPDATE sessions SET expires_at = ? WHERE token = ?`,
 		time.Now().Add(-time.Second).Unix(), t2)
 	if err != nil {
 		t.Fatal(err)
@@ -405,12 +404,12 @@ func TestSessions_LifecycleAndReap(t *testing.T) {
 	if u, _ := s.Lookup(context.Background(), t2); u != nil {
 		t.Error("expired session validated")
 	}
-	_, err = conn.Exec(`DELETE FROM sessions WHERE expires_at < ?`, time.Now().Unix())
+	_, err = conn.W.Exec(`DELETE FROM sessions WHERE expires_at < ?`, time.Now().Unix())
 	if err != nil {
 		t.Fatal(err)
 	}
 	var n int
-	conn.QueryRow(`SELECT COUNT(*) FROM sessions WHERE token = ?`, t2).Scan(&n)
+	conn.R.QueryRow(`SELECT COUNT(*) FROM sessions WHERE token = ?`, t2).Scan(&n)
 	if n != 0 {
 		t.Errorf("expired session not removed by reap: n=%d", n)
 	}

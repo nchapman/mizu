@@ -189,12 +189,19 @@ func (s *Service) RunVerifier(ctx context.Context) {
 }
 
 func (s *Service) processOne(ctx context.Context, j job) {
-	// Independent timeout per job — we don't want a slow source to
-	// block the worker indefinitely.
+	// Independent timeout for the *fetch* — we don't want a slow source
+	// to block the worker indefinitely. The store calls below run
+	// against a separate budget rooted on the parent ctx so a slow
+	// verify can't leave the DB write with a near-zero deadline (which
+	// would lose the result of a successful verification).
 	jobCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	err := Verify(jobCtx, s.http, j.source, j.target)
+
+	dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer dbCancel()
+
 	if err == nil {
 		m := Mention{
 			Source: j.source, Target: j.target,
@@ -202,7 +209,7 @@ func (s *Service) processOne(ctx context.Context, j job) {
 			ReceivedAt: time.Now().UTC(),
 			VerifiedAt: time.Now().UTC(),
 		}
-		_ = s.store.Upsert(jobCtx, m)
+		_ = s.store.Upsert(dbCtx, m)
 		s.fireOnChange()
 		return
 	}
@@ -218,7 +225,7 @@ func (s *Service) processOne(ctx context.Context, j job) {
 			ReceivedAt: time.Now().UTC(),
 			LastError:  err.Error(),
 		}
-		_ = s.store.Upsert(jobCtx, m)
+		_ = s.store.Upsert(dbCtx, m)
 		// Fire on rejection too: a previously-verified mention whose
 		// source dropped the link must disappear from the rendered
 		// page on the next build. The hash-skip absorbs the no-op
@@ -228,7 +235,7 @@ func (s *Service) processOne(ctx context.Context, j job) {
 	}
 	// Transient: stash the latest error on the row but keep it pending
 	// so RunVerifier's startup sweep retries on the next process start.
-	_ = s.store.SetLastError(jobCtx, j.source, j.target, err.Error())
+	_ = s.store.SetLastError(dbCtx, j.source, j.target, err.Error())
 }
 
 // ForTarget exposes the store's read API to handlers that render
