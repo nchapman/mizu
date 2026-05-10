@@ -1,0 +1,79 @@
+# Build and publish the mizu container image to GitHub Container
+# Registry (GHCR). The image is what Watchtower-enabled production
+# hosts pull from, so the tagging strategy here is the contract:
+#
+#   - tag vX.Y.Z             -> :X.Y.Z, :X.Y, :X, :latest
+#   - manual workflow_dispatch builds without pushing (smoke test)
+#
+# Tagged releases only: Watchtower hosts tracking :latest auto-update
+# the moment a tag is pushed, so trunk pushes must NOT move :latest.
+# A separate trigger for trunk builds (e.g. publishing :edge from
+# main) can be added later if we want users to opt into pre-release
+# builds; for now there's no such channel.
+
+name: Publish container image
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU lets a single amd64 runner cross-build arm64 layers.
+      # arm64 matters because Ampere/Graviton VPSes (Hetzner CAX,
+      # Oracle Free Tier, AWS Lightsail arm) are the cheapest hosts
+      # for a single-user app like this.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        # Only push on real refs, not workflow_dispatch smoke builds.
+        if: github.event_name != 'workflow_dispatch'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # Stable channel only. The `!contains(...'-')` guard keeps
+            # pre-release tags like v1.0.0-rc1 from clobbering :latest
+            # for Watchtower hosts.
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'workflow_dispatch' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # gha cache is scoped per-ref by default; `mode=max` caches
+          # all stages (admin npm install + go mod download are the
+          # expensive ones) so cross-PR rebuilds stay fast.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
