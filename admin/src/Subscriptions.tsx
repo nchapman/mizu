@@ -97,7 +97,7 @@ export function SubscriptionsView({ onAuthLost }: { onAuthLost: () => void }) {
             className="flex-1"
           />
           <Button type="submit" size="sm" disabled={busy || !url.trim()}>
-            {busy ? "Adding…" : "Subscribe"}
+            {busy ? "Subscribing…" : "Subscribe"}
           </Button>
         </div>
 

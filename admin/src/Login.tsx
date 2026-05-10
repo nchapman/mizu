@@ -13,6 +13,9 @@ export function Login({ onDone, siteTitle }: { onDone: () => void; siteTitle?: s
     setErr("");
     setBusy(true);
     try {
+      // Bypass api() on purpose: a 401 here is a wrong-password response,
+      // not a session expiry, so we don't want it routed through the
+      // global Unauthorized handler that drops back to login.
       const r = await fetch("/admin/api/login", {
         method: "POST",
         headers: { "content-type": "application/json" },

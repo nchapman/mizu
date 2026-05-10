@@ -105,7 +105,13 @@ export function DraftsView({
           const showBody = !!d.title?.trim();
           return (
             <li key={d.id} className="px-1 py-3">
-              <div className="flex items-start justify-between gap-2">
+              <div className="flex items-start gap-3">
+                <div
+                  aria-hidden
+                  className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-full bg-accent text-foreground/70"
+                >
+                  <FileText className="size-4" />
+                </div>
                 <div className="min-w-0 flex-1">
                   <h2 className="truncate text-base font-semibold leading-snug">
                     <button

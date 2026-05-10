@@ -423,13 +423,12 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             </Button>
           </div>
         </div>
+        {err && (
+          <div role="alert" className="mt-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+            {err}
+          </div>
+        )}
       </form>
-
-      {err && (
-        <div role="alert" className="mb-4 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-          {err}
-        </div>
-      )}
     </TooltipProvider>
   );
 });

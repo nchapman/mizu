@@ -119,7 +119,7 @@ export function HomeView({ onAuthLost, editTarget, onEditConsumed }: Props) {
         onEditOwn={startEditPost}
         onReply={replyTo}
         refreshToken={streamRefresh}
-        onPostsChanged={() => setStreamRefresh((n) => n + 1)}
+        onChanged={() => setStreamRefresh((n) => n + 1)}
       />
       <DraftsDrawer
         open={draftsOpen}

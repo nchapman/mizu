@@ -68,11 +68,11 @@ function MentionRow({ m }: { m: Mention }) {
   const when = m.verified_at || m.received_at;
 
   return (
-    <li className="px-1 py-4">
+    <li className="px-1 py-3">
       <div className="flex items-start gap-3">
         <div
           aria-hidden
-          className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full bg-accent text-foreground/70"
+          className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-full bg-accent text-foreground/70"
         >
           <AtSign className="size-4" />
         </div>

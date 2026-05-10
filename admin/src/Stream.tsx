@@ -29,15 +29,16 @@ interface Props {
   // Bumping refreshToken forces a full re-fetch (e.g. after composer
   // submit, draft publish, or a deletion that originated outside Stream).
   refreshToken?: number;
-  onPostsChanged?: () => void;
+  onChanged?: () => void;
 }
 
-export function StreamView({ onAuthLost, onEditOwn, onReply, refreshToken = 0, onPostsChanged }: Props) {
+export function StreamView({ onAuthLost, onEditOwn, onReply, refreshToken = 0, onChanged }: Props) {
   const [items, setItems] = useState<StreamItem[]>([]);
   const [cursor, setCursor] = useState<string | undefined>(undefined);
   const [done, setDone] = useState(false);
   const [filter, setFilter] = useState<Filter>("all");
   const [loading, setLoading] = useState(false);
+  const [loaded, setLoaded] = useState(false);
   const [err, setErr] = useState("");
 
   // fetchPage takes the cursor as an argument rather than reading state, so
@@ -60,6 +61,7 @@ export function StreamView({ onAuthLost, onEditOwn, onReply, refreshToken = 0, o
         setErr((e as Error).message);
       } finally {
         setLoading(false);
+        setLoaded(true);
       }
     },
     [filter, onAuthLost],
@@ -69,6 +71,7 @@ export function StreamView({ onAuthLost, onEditOwn, onReply, refreshToken = 0, o
     setItems([]);
     setCursor(undefined);
     setDone(false);
+    setLoaded(false);
     fetchPage(undefined);
   }, [filter, refreshToken, fetchPage]);
 
@@ -111,13 +114,13 @@ export function StreamView({ onAuthLost, onEditOwn, onReply, refreshToken = 0, o
         setItems((prev) =>
           prev.filter((x) => !(x.kind === "own" && x.post.id === p.id)),
         );
-        onPostsChanged?.();
+        onChanged?.();
       } catch (e) {
         if (e instanceof Unauthorized) return onAuthLost();
         setErr((e as Error).message);
       }
     },
-    [onAuthLost, onPostsChanged],
+    [onAuthLost, onChanged],
   );
 
   return (
@@ -130,7 +133,7 @@ export function StreamView({ onAuthLost, onEditOwn, onReply, refreshToken = 0, o
         </div>
       )}
 
-      {items.length === 0 && !loading && <StreamEmpty filter={filter} />}
+      {items.length === 0 && loaded && !loading && <StreamEmpty filter={filter} />}
 
       {items.length === 0 && loading && (
         <div className="space-y-4 py-2">

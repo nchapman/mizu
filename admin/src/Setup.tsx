@@ -19,6 +19,8 @@ export function Setup({ onDone, siteTitle }: { onDone: () => void; siteTitle?: s
     if (pw !== pw2) return setErr("Passwords don't match.");
     setBusy(true);
     try {
+      // Bypass api() on purpose: pre-auth flows shouldn't go through the
+      // global Unauthorized handler — there's no session to drop yet.
       const r = await fetch("/admin/api/setup", {
         method: "POST",
         headers: { "content-type": "application/json" },
