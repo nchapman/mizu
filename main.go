@@ -102,10 +102,11 @@ func main() {
 		log.Fatalf("render pipeline: %v", err)
 	}
 
-	// Webmention verifier kicks the pipeline whenever a mention
-	// promotes to verified, so the affected post page picks up the new
-	// mention in the next render cycle.
-	wmSvc.OnVerified(pipeline.Enqueue)
+	// Webmention verifier kicks the pipeline whenever a mention reaches
+	// a terminal state (verified or rejected). Verified → page needs
+	// to grow the entry. Verified-then-rejected (source removed the
+	// link, sender re-notified) → page needs to drop the stale entry.
+	wmSvc.OnMentionsChanged(pipeline.Enqueue)
 
 	bg.Add(1)
 	go func() {

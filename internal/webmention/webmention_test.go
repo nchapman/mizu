@@ -203,6 +203,59 @@ func TestService_Receive_RejectsSameSource(t *testing.T) {
 	}
 }
 
+func TestService_OnMentionsChanged_FiresOnVerifiedAndRejected(t *testing.T) {
+	// Verified path fires the callback (post page needs the new entry).
+	// Rejected path also fires (a previously-verified mention may need
+	// to disappear from the rendered page; the pipeline's hash-skip
+	// absorbs the no-op case where the mention was never verified).
+	// Transient errors do NOT fire — the row stays Pending and nothing
+	// observable changed.
+	target := "https://example.com/post"
+	withLink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<html><a href="` + target + `">link</a></html>`))
+	}))
+	defer withLink.Close()
+	without := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<html><p>no link here</p></html>`))
+	}))
+	defer without.Close()
+	transient := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer transient.Close()
+
+	s := newService(t, "https://example.com")
+	var calls int
+	s.OnMentionsChanged(func() { calls++ })
+
+	// Verified
+	if err := s.Receive(context.Background(), withLink.URL+"/v", target); err != nil {
+		t.Fatal(err)
+	}
+	s.processOne(context.Background(), <-s.queue)
+	if calls != 1 {
+		t.Errorf("after verify: calls=%d, want 1", calls)
+	}
+
+	// Rejected (link not found)
+	if err := s.Receive(context.Background(), without.URL+"/r", target); err != nil {
+		t.Fatal(err)
+	}
+	s.processOne(context.Background(), <-s.queue)
+	if calls != 2 {
+		t.Errorf("after reject: calls=%d, want 2 (rejection must trigger rebuild for verified→rejected case)", calls)
+	}
+
+	// Transient — no fire
+	if err := s.Receive(context.Background(), transient.URL+"/t", target); err != nil {
+		t.Fatal(err)
+	}
+	s.processOne(context.Background(), <-s.queue)
+	if calls != 2 {
+		t.Errorf("after transient: calls=%d, want 2 (Pending state should not trigger rebuild)", calls)
+	}
+}
+
 func TestService_TransientErrorLeavesPending(t *testing.T) {
 	// 500 responses mean we couldn't determine link presence. The
 	// row must stay at StatusPending so a later restart re-tries.

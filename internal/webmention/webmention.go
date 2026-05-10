@@ -34,12 +34,16 @@ type Service struct {
 
 	queue chan job // verification work
 
-	// onVerified is invoked once per mention that flips to Verified.
-	// Used by the render pipeline to enqueue a rebuild so the target
-	// post's static page picks up the new mention. Read by the
-	// verifier goroutine, written by main wiring; guarded by onVerMu.
-	onVerMu    sync.RWMutex
-	onVerified func()
+	// onChange is invoked when a mention reaches a terminal state
+	// (Verified or Rejected). The render pipeline hooks this to
+	// rebuild affected post pages: Verified→need to add the entry,
+	// Rejected-after-Verified→need to remove the now-stale entry.
+	// Pending and transient-error transitions don't fire — Pending
+	// mentions are never rendered, so no observable state changes.
+	// Read by the verifier goroutine, written by main wiring;
+	// guarded by onChangeMu.
+	onChangeMu sync.RWMutex
+	onChange   func()
 }
 
 type job struct {
@@ -211,12 +215,7 @@ func (s *Service) processOne(ctx context.Context, j job) {
 		_ = s.log.Append(LogEntry{
 			Direction: "received", Source: j.source, Target: j.target, Status: StatusVerified,
 		})
-		s.onVerMu.RLock()
-		cb := s.onVerified
-		s.onVerMu.RUnlock()
-		if cb != nil {
-			cb()
-		}
+		s.fireOnChange()
 		return
 	}
 
@@ -233,6 +232,11 @@ func (s *Service) processOne(ctx context.Context, j job) {
 			LastError:  err.Error(),
 		}
 		_ = s.store.Upsert(jobCtx, m)
+		// Fire on rejection too: a previously-verified mention whose
+		// source dropped the link must disappear from the rendered
+		// page on the next build. The hash-skip absorbs the no-op
+		// case where the mention was never verified to begin with.
+		s.fireOnChange()
 	}
 	status := StatusRejected
 	if !errors.Is(err, ErrLinkNotFound) {
@@ -256,14 +260,26 @@ func (s *Service) AllVerified(ctx context.Context) ([]Mention, error) {
 	return s.store.AllVerified(ctx)
 }
 
-// OnVerified registers a callback invoked when a mention transitions
-// to Verified. Set by main.go to point at Pipeline.Enqueue so post
-// pages re-render with the new mention. Pass nil to clear. Safe to
-// call concurrently with the verifier worker.
-func (s *Service) OnVerified(cb func()) {
-	s.onVerMu.Lock()
-	s.onVerified = cb
-	s.onVerMu.Unlock()
+// OnMentionsChanged registers a callback invoked whenever a mention
+// reaches a terminal state (Verified or Rejected). main.go wires this
+// to Pipeline.Enqueue so post pages re-render with the new state —
+// crucially, this includes the Verified→Rejected transition that
+// happens when a previously-verified source removes the link and the
+// sender re-notifies us. Pass nil to clear. Safe to call concurrently
+// with the verifier worker.
+func (s *Service) OnMentionsChanged(cb func()) {
+	s.onChangeMu.Lock()
+	s.onChange = cb
+	s.onChangeMu.Unlock()
+}
+
+func (s *Service) fireOnChange() {
+	s.onChangeMu.RLock()
+	cb := s.onChange
+	s.onChangeMu.RUnlock()
+	if cb != nil {
+		cb()
+	}
 }
 
 // Recent passes through to the store. Used by the admin to list
