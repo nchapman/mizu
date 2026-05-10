@@ -395,6 +395,94 @@ func TestPipeline_PostHTMLCachedAcrossBuilds(t *testing.T) {
 	}
 }
 
+func TestPipeline_TemplateCacheInvalidatedOnAssetChange(t *testing.T) {
+	// Regression: loadTemplates' asset_url Liquid filter closes over
+	// snap.Assets at parse time. If we reuse the parsed templateSet
+	// across an asset change, every HTML page embeds the previous
+	// build's ?v=<hash> for /assets/style.css and operators silently
+	// serve stale CSS. The fix is to include the asset manifest in
+	// the template cache key.
+	tmp := t.TempDir()
+	contentDir := filepath.Join(tmp, "content")
+	if err := os.MkdirAll(filepath.Join(contentDir, "posts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	posts, err := post.NewStore(contentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := posts.Create("Hello", "body", nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	themeFS := fakeThemeFS()
+	if _, err := theme.Load("default", themeFS, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Site: config.Site{Title: "Test", BaseURL: "https://example.test"}}
+	cfg.ApplyDefaults()
+	publicDir := filepath.Join(tmp, "public")
+	p, err := NewPipeline(Options{
+		Sources: &SnapshotSources{
+			BootCfg:   cfg,
+			ThemesFS:  themeFS,
+			Posts:     posts,
+			MediaDir:  filepath.Join(tmp, "media"),
+			DraftSalt: []byte("salt-salt-salt-salt-salt-salt-aa"),
+		},
+		PublicDir: publicDir,
+		HashPath:  filepath.Join(tmp, "build.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	idx1, _ := os.ReadFile(filepath.Join(publicDir, "index.html"))
+	hash1 := extractAssetHash(string(idx1), "style.css")
+	if hash1 == "" {
+		t.Fatalf("first build's index.html has no style.css cachebust: %s", idx1)
+	}
+
+	// Mutate style.css. base.liquid is unchanged so the prior bug
+	// reused the cached templateSet and emitted the old hash.
+	themeFS["default/assets/style.css"].Data = []byte("body{color:#000}")
+
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	idx2, _ := os.ReadFile(filepath.Join(publicDir, "index.html"))
+	hash2 := extractAssetHash(string(idx2), "style.css")
+	if hash2 == "" {
+		t.Fatalf("second build's index.html has no style.css cachebust: %s", idx2)
+	}
+	if hash1 == hash2 {
+		t.Errorf("style.css cachebust unchanged after asset edit (%s) — templateSet was reused with stale asset_url closure", hash1)
+	}
+}
+
+// extractAssetHash returns the 8-char ?v=... value emitted next to
+// `name` in HTML, or "" if not found.
+func extractAssetHash(html, name string) string {
+	needle := name + "?v="
+	i := strings.Index(html, needle)
+	if i < 0 {
+		return ""
+	}
+	rest := html[i+len(needle):]
+	end := 0
+	for end < len(rest) {
+		c := rest[end]
+		isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+		if !isHex {
+			break
+		}
+		end++
+	}
+	return rest[:end]
+}
+
 func TestPipeline_TemplateCacheReuseAcrossBuilds(t *testing.T) {
 	// Two builds with the same theme bytes must reuse the same
 	// parsed templateSet — the cache hit is observable via pointer

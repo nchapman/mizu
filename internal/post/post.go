@@ -112,10 +112,16 @@ type Store struct {
 	draftFiles map[string]fileCache
 }
 
-// fileCache pins the mtime + parsed value for a single .md so reload
-// can stat-and-skip when nothing changed.
+// fileCache pins the mtime + size + parsed value for a single .md so
+// reload can stat-and-skip when nothing changed. Size is part of the
+// key because mtime resolution is filesystem-dependent (1 second on
+// NFS or some overlayfs setups) and git-restore-mtime workflows can
+// preserve a prior mtime across content changes; combining the two
+// catches every realistic edit short of a same-size content swap
+// with a forged mtime.
 type fileCache struct {
 	modTime time.Time
+	size    int64
 	post    *Post  // populated for posts dir
 	draft   *Draft // populated for drafts dir
 }
@@ -180,8 +186,9 @@ func (s *Store) reload() error {
 			return fmt.Errorf("stat %s: %w", e.Name(), err)
 		}
 		modTime := info.ModTime()
+		size := info.Size()
 		var p *Post
-		if cached, ok := s.postFiles[e.Name()]; ok && cached.post != nil && cached.modTime.Equal(modTime) {
+		if cached, ok := s.postFiles[e.Name()]; ok && cached.post != nil && cached.modTime.Equal(modTime) && cached.size == size {
 			p = cached.post
 		} else {
 			p, err = readFile(filepath.Join(s.dir, e.Name()))
@@ -189,7 +196,7 @@ func (s *Store) reload() error {
 				return fmt.Errorf("read %s: %w", e.Name(), err)
 			}
 		}
-		newCache[e.Name()] = fileCache{modTime: modTime, post: p}
+		newCache[e.Name()] = fileCache{modTime: modTime, size: size, post: p}
 		byID[p.ID] = p
 		if !p.IsNote() {
 			bySlug[slugKey(p)] = p
@@ -233,8 +240,9 @@ func (s *Store) loadDrafts() (map[string]*Draft, []*Draft, map[string]fileCache,
 			return nil, nil, nil, fmt.Errorf("stat draft %s: %w", e.Name(), err)
 		}
 		modTime := info.ModTime()
+		size := info.Size()
 		var d *Draft
-		if cached, ok := s.draftFiles[e.Name()]; ok && cached.draft != nil && cached.modTime.Equal(modTime) {
+		if cached, ok := s.draftFiles[e.Name()]; ok && cached.draft != nil && cached.modTime.Equal(modTime) && cached.size == size {
 			d = cached.draft
 		} else {
 			d, err = readDraftFile(filepath.Join(s.draftDir, e.Name()))
@@ -242,7 +250,7 @@ func (s *Store) loadDrafts() (map[string]*Draft, []*Draft, map[string]fileCache,
 				return nil, nil, nil, fmt.Errorf("read draft %s: %w", e.Name(), err)
 			}
 		}
-		newCache[e.Name()] = fileCache{modTime: modTime, draft: d}
+		newCache[e.Name()] = fileCache{modTime: modTime, size: size, draft: d}
 		byID[d.ID] = d
 		order = append(order, d)
 	}

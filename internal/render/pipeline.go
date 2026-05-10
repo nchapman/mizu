@@ -340,13 +340,20 @@ func (p *Pipeline) fillCaches(snap *Snapshot) error {
 		}
 	}
 
-	// Templates. Hash the three template file bytes; if the hash
-	// matches the prior build's, reuse the parse.
-	tplHash, err := themeTemplateHash(snap.Theme.FS)
+	// Templates. Hash the three template file bytes AND the asset
+	// manifest; if both match the prior build's, reuse the parse.
+	//
+	// The asset manifest is load-bearing for correctness: loadTemplates
+	// registers an `asset_url` Liquid filter whose closure captures
+	// snap.Assets at parse time. If we reused the parsed templateSet
+	// across an asset change, every HTML page would embed the previous
+	// build's ?v=<hash> cachebusters and operators would silently
+	// serve stale CSS until they edited a .liquid file.
+	tplKey, err := templateCacheKey(snap.Theme.FS, snap.Assets)
 	if err != nil {
 		return fmt.Errorf("hash theme templates: %w", err)
 	}
-	if p.tplCache != nil && p.tplCache.hash == tplHash {
+	if p.tplCache != nil && p.tplCache.hash == tplKey {
 		snap.Templates = p.tplCache.set
 	} else {
 		set, err := loadTemplates(snap.Theme.FS, themeAssetURL(snap))
@@ -354,15 +361,17 @@ func (p *Pipeline) fillCaches(snap *Snapshot) error {
 			return fmt.Errorf("load templates: %w", err)
 		}
 		snap.Templates = set
-		p.tplCache = &tplCacheEntry{hash: tplHash, set: set}
+		p.tplCache = &tplCacheEntry{hash: tplKey, set: set}
 	}
 	return nil
 }
 
-// themeTemplateHash returns the sha256 of the concatenated bytes of
-// the three required template files. The order is fixed; an
-// equivalent hash means an equivalent parse.
-func themeTemplateHash(themeFS fs.FS) (string, error) {
+// templateCacheKey returns a hash that changes whenever any input
+// to a parsed templateSet changes — the three template file bytes
+// and the asset manifest (name + content hash). The asset manifest
+// is included because loadTemplates' `asset_url` filter captures
+// the asset hash table at parse time.
+func templateCacheKey(themeFS fs.FS, assets map[string]AssetEntry) (string, error) {
 	h := sha256.New()
 	for _, name := range []string{"base.liquid", "index.liquid", "post.liquid"} {
 		body, err := fs.ReadFile(themeFS, name)
@@ -372,6 +381,20 @@ func themeTemplateHash(themeFS fs.FS) (string, error) {
 		h.Write([]byte(name))
 		h.Write([]byte{0})
 		h.Write(body)
+		h.Write([]byte{0})
+	}
+	// Sort asset names so the digest is stable across map-iteration
+	// orderings.
+	names := make([]string, 0, len(assets))
+	for name := range assets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	h.Write([]byte("\x00assets\x00"))
+	for _, name := range names {
+		h.Write([]byte(name))
+		h.Write([]byte{0})
+		h.Write([]byte(assets[name].Hash))
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
