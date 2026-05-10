@@ -7,7 +7,7 @@ import {
   useState,
 } from "react";
 import { flushSync } from "react-dom";
-import { FileText, Heading, ImagePlus, X } from "lucide-react";
+import { Code, FileText, Heading, ImagePlus, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -380,16 +380,14 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             >
               <ImagePlus />
             </ToolbarButton>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
+            <ToolbarButton
+              label={mode === "rich" ? "Edit raw Markdown source" : "Back to rich editor"}
+              ariaName="source"
               onClick={() => setEditorMode(mode === "rich" ? "md" : "rich")}
-              title={mode === "rich" ? "Edit raw Markdown source" : "Back to rich editor"}
-              className="text-muted-foreground"
+              active={mode === "md"}
             >
-              {mode === "rich" ? "source" : "rich"}
-            </Button>
+              <Code />
+            </ToolbarButton>
             {onOpenDrafts && draftsCount !== undefined && draftsCount > 0 && (
               <Button
                 type="button"
@@ -441,6 +439,7 @@ function ToolbarButton({
   ariaName,
   onClick,
   disabled,
+  active,
   children,
 }: {
   label: string;
@@ -449,6 +448,9 @@ function ToolbarButton({
   ariaName: string;
   onClick: () => void;
   disabled?: boolean;
+  // True when the button represents a currently-engaged mode (e.g. source
+  // editor active). Renders a subtle filled background as feedback.
+  active?: boolean;
   children: React.ReactNode;
 }) {
   return (
@@ -459,9 +461,13 @@ function ToolbarButton({
           variant="ghost"
           size="icon"
           aria-label={ariaName}
+          aria-pressed={active}
           onClick={onClick}
           disabled={disabled}
-          className="h-8 w-8 text-muted-foreground"
+          className={cn(
+            "h-8 w-8 text-muted-foreground",
+            active && "bg-accent text-foreground",
+          )}
         >
           {children}
         </Button>
