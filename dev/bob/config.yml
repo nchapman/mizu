@@ -1,0 +1,19 @@
+site:
+  title: Bob
+  author: Bob
+  base_url: http://bob:8080
+  description: Bob's dev instance.
+
+server:
+  addr: ":8080"
+
+paths:
+  content: /app/content
+  media: /app/media
+  cache: /app/cache
+  state: /app/state
+  subscriptions: /app/state/subscriptions.opml
+
+poller:
+  interval: 30s
+  user_agent: repeat-dev-bob/0.1

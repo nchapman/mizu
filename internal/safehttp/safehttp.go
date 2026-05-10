@@ -17,8 +17,25 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"time"
 )
+
+// allowPrivateHostsEnv is a development-only escape hatch. When set to
+// "1", "true", or "yes", IsBlockedIP returns false for everything, so a
+// dev docker-compose with two repeat instances on a private bridge
+// network can actually exchange feeds and webmentions. Never set this
+// in production — it disables the only line of defense against SSRF
+// against the host's metadata service, internal admin panels, etc.
+const allowPrivateHostsEnv = "REPEAT_ALLOW_PRIVATE_HOSTS"
+
+func allowPrivateHosts() bool {
+	switch os.Getenv(allowPrivateHostsEnv) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}
 
 // Default timeouts. Generous enough for slow-but-legitimate sites,
 // tight enough to bound a stuck request.
@@ -62,6 +79,9 @@ func NewClient() *http.Client {
 // loopback, link-local (incl. cloud metadata at 169.254.169.254),
 // private RFC-1918, ULA, multicast, and unspecified.
 func IsBlockedIP(ip net.IP) bool {
+	if allowPrivateHosts() {
+		return false
+	}
 	return ip.IsLoopback() ||
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||

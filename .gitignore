@@ -13,3 +13,12 @@
 /admin/node_modules/
 *.bak
 .DS_Store
+
+# Dev compose runtime state (configs and OPML files stay tracked).
+/dev/*/content/posts/*
+/dev/*/content/drafts/*
+/dev/*/media/*
+/dev/*/cache/*
+/dev/*/state/*
+!/dev/*/content/posts/.keep
+!/dev/*/content/drafts/.keep

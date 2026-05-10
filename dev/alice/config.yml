@@ -1,0 +1,19 @@
+site:
+  title: Alice
+  author: Alice
+  base_url: http://alice:8080
+  description: Alice's dev instance.
+
+server:
+  addr: ":8080"
+
+paths:
+  content: /app/content
+  media: /app/media
+  cache: /app/cache
+  state: /app/state
+  subscriptions: /app/state/subscriptions.opml
+
+poller:
+  interval: 30s
+  user_agent: repeat-dev-alice/0.1

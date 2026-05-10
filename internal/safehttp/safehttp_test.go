@@ -74,6 +74,15 @@ func TestNewClient_BlocksLiteralLoopback(t *testing.T) {
 	}
 }
 
+func TestIsBlockedIP_AllowPrivateHostsEnv(t *testing.T) {
+	t.Setenv(allowPrivateHostsEnv, "1")
+	for _, raw := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "::1"} {
+		if got := IsBlockedIP(net.ParseIP(raw)); got {
+			t.Errorf("IsBlockedIP(%s) = true with %s=1, want false", raw, allowPrivateHostsEnv)
+		}
+	}
+}
+
 func TestNewClient_BlocksLinkLocalMetadata(t *testing.T) {
 	// 169.254.169.254 is the cloud metadata endpoint — the most important
 	// thing this client must refuse.
