@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import { HomeView } from "./HomeView";
+import { MentionsView } from "./Mentions";
 import { SettingsView } from "./Settings";
 import { SubscriptionsView } from "./Subscriptions";
 import { TopBar } from "./TopBar";
@@ -37,6 +38,7 @@ export function Shell({ onLogout }: { onLogout: () => void }) {
           />
         )}
         {route === "subscriptions" && <SubscriptionsView onAuthLost={onLogout} />}
+        {route === "mentions" && <MentionsView onAuthLost={onLogout} />}
         {route === "settings" && <SettingsView />}
       </main>
     </div>

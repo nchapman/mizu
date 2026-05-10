@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -74,6 +75,8 @@ func (s *Server) Routes(r chi.Router) {
 			r.Delete("/items/{id}/read", s.markItemUnread)
 
 			r.Post("/media", s.uploadMedia)
+
+			r.Get("/mentions", s.listMentions)
 		})
 	})
 	r.Get("/*", s.serveSPA)
@@ -605,6 +608,91 @@ func (s *Server) uploadMedia(w http.ResponseWriter, r *http.Request) {
 		"size": saved.Size,
 		"mime": saved.MIME,
 	})
+}
+
+type mentionDTO struct {
+	ID          int64  `json:"id"`
+	Source      string `json:"source"`
+	SourceHost  string `json:"source_host"`
+	Target      string `json:"target"`
+	TargetPath  string `json:"target_path"`
+	TargetTitle string `json:"target_title,omitempty"`
+	ReceivedAt  string `json:"received_at"`
+	VerifiedAt  string `json:"verified_at,omitempty"`
+}
+
+func (s *Server) listMentions(w http.ResponseWriter, r *http.Request) {
+	ms, err := s.wm.Recent(r.Context(), 100)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := make([]mentionDTO, len(ms))
+	for i, m := range ms {
+		dto := mentionDTO{
+			ID:         m.ID,
+			Source:     m.Source,
+			SourceHost: hostOf(m.Source),
+			Target:     m.Target,
+			TargetPath: pathOf(m.Target),
+			ReceivedAt: m.ReceivedAt.UTC().Format(time.RFC3339),
+		}
+		if p := s.lookupPostByPath(dto.TargetPath); p != nil {
+			dto.TargetTitle = p.Title
+		}
+		if !m.VerifiedAt.IsZero() {
+			dto.VerifiedAt = m.VerifiedAt.UTC().Format(time.RFC3339)
+		}
+		out[i] = dto
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// lookupPostByPath finds the post that matches a target URL path. The
+// public-site routes are /notes/{id} (notes) and /YYYY/MM/DD/{slug}
+// (titled posts); both shapes are recognised so the admin can display
+// the post's title alongside an incoming mention.
+func (s *Server) lookupPostByPath(p string) *post.Post {
+	if p == "" {
+		return nil
+	}
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	if len(parts) == 2 && parts[0] == "notes" {
+		if pp, ok := s.posts.ByID(parts[1]); ok {
+			return pp
+		}
+		return nil
+	}
+	if len(parts) == 4 {
+		y, err1 := strconv.Atoi(parts[0])
+		mo, err2 := strconv.Atoi(parts[1])
+		d, err3 := strconv.Atoi(parts[2])
+		if err1 == nil && err2 == nil && err3 == nil {
+			if pp, ok := s.posts.BySlug(y, mo, d, parts[3]); ok {
+				return pp
+			}
+		}
+	}
+	return nil
+}
+
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	return u.Host
+}
+
+func pathOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if u.Path == "" {
+		return "/"
+	}
+	return u.Path
 }
 
 // serveSPA serves the built React admin out of an fs.FS. The default

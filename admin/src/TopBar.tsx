@@ -1,4 +1,4 @@
-import { LogOut, MoreHorizontal, Rss, Settings as SettingsIcon } from "lucide-react";
+import { AtSign, LogOut, MoreHorizontal, Rss, Settings as SettingsIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -37,6 +37,10 @@ export function TopBar({ onNavigate, onLogout }: Props) {
             <DropdownMenuItem onSelect={() => onNavigate("subscriptions")}>
               <Rss />
               Subscriptions
+            </DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => onNavigate("mentions")}>
+              <AtSign />
+              Mentions
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => onNavigate("settings")}>
               <SettingsIcon />

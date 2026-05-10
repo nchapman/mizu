@@ -211,6 +211,12 @@ func (s *Service) ForTarget(ctx context.Context, target string) ([]Mention, erro
 	return s.store.ForTarget(ctx, target)
 }
 
+// Recent passes through to the store. Used by the admin to list
+// incoming verified mentions across every target.
+func (s *Service) Recent(ctx context.Context, limit int) ([]Mention, error) {
+	return s.store.Recent(ctx, limit)
+}
+
 // --- Sending ---
 
 // Send notifies the webmention endpoint at endpoint that source has

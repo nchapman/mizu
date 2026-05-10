@@ -38,6 +38,7 @@ type harness struct {
 	feeds  *feeds.Service
 	media  *media.Store
 	wm     *webmention.Service
+	wmStr  *webmention.Store
 	cfg    *config.Config
 }
 
@@ -115,7 +116,7 @@ func newHarness(t *testing.T) *harness {
 
 	return &harness{
 		srv: srv, router: r, auth: a, posts: posts, feeds: feedSvc,
-		media: mediaStore, wm: wm, cfg: cfg,
+		media: mediaStore, wm: wm, wmStr: wmStore, cfg: cfg,
 	}
 }
 
@@ -276,6 +277,7 @@ func TestAuthGate_BlocksAllProtectedRoutes(t *testing.T) {
 		{"GET", "/admin/api/subscriptions"},
 		{"GET", "/admin/api/stream"},
 		{"POST", "/admin/api/media"},
+		{"GET", "/admin/api/mentions"},
 	} {
 		w := h.do(t, route.method, route.path, nil, nil)
 		if w.Code != http.StatusUnauthorized {
@@ -665,6 +667,111 @@ func buildMultipart(t *testing.T, field, filename string, data []byte) (io.Reade
 	fw.Write(data)
 	mw.Close()
 	return &buf, mw.FormDataContentType()
+}
+
+func TestMentions_ListReturnsVerifiedNewestFirst(t *testing.T) {
+	h := newHarness(t)
+	c := h.login(t)
+	now := nowUTC()
+	must := func(m webmention.Mention) {
+		if err := h.wmStr.Upsert(context.Background(), m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(webmention.Mention{
+		Source: "https://other.test/old", Target: "https://example.test/a",
+		Status:     webmention.StatusVerified,
+		ReceivedAt: now.Add(-2 * time.Hour), VerifiedAt: now.Add(-2 * time.Hour),
+	})
+	must(webmention.Mention{
+		Source: "https://other.test/new", Target: "https://example.test/b",
+		Status:     webmention.StatusVerified,
+		ReceivedAt: now.Add(-1 * time.Hour), VerifiedAt: now.Add(-1 * time.Hour),
+	})
+	// Pending entry should not appear.
+	must(webmention.Mention{
+		Source: "https://other.test/pending", Target: "https://example.test/c",
+		Status: webmention.StatusPending, ReceivedAt: now,
+	})
+
+	w := h.do(t, "GET", "/admin/api/mentions", nil, c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2 (only verified)", len(got))
+	}
+	if got[0]["source"] != "https://other.test/new" {
+		t.Errorf("got[0].source=%v, want newest first", got[0]["source"])
+	}
+	if got[0]["verified_at"] == "" || got[0]["verified_at"] == nil {
+		t.Errorf("verified_at missing on verified row: %v", got[0])
+	}
+	if got[0]["source_host"] != "other.test" {
+		t.Errorf("source_host=%v, want other.test", got[0]["source_host"])
+	}
+	if got[0]["target_path"] != "/b" {
+		t.Errorf("target_path=%v, want /b", got[0]["target_path"])
+	}
+}
+
+func TestMentions_ResolvesTargetTitleFromPostStore(t *testing.T) {
+	h := newHarness(t)
+	c := h.login(t)
+	// Create a real post so the URL path resolves to a known title.
+	p, err := h.posts.Create("Hello World", "body text", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := "https://example.test" + p.Path()
+	if err := h.wmStr.Upsert(context.Background(), webmention.Mention{
+		Source: "https://other.test/post", Target: target,
+		Status:     webmention.StatusVerified,
+		ReceivedAt: nowUTC(), VerifiedAt: nowUTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w := h.do(t, "GET", "/admin/api/mentions", nil, c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len=%d, want 1", len(got))
+	}
+	if got[0]["target_title"] != "Hello World" {
+		t.Errorf("target_title=%v, want Hello World", got[0]["target_title"])
+	}
+}
+
+func TestMentions_TargetTitleAbsentWhenPostUnknown(t *testing.T) {
+	h := newHarness(t)
+	c := h.login(t)
+	if err := h.wmStr.Upsert(context.Background(), webmention.Mention{
+		Source: "https://other.test/post", Target: "https://example.test/2026/01/01/missing",
+		Status:     webmention.StatusVerified,
+		ReceivedAt: nowUTC(), VerifiedAt: nowUTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w := h.do(t, "GET", "/admin/api/mentions", nil, c)
+	var got []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := got[0]["target_title"]; present {
+		t.Errorf("target_title should be omitted when unresolved, got %v", got[0]["target_title"])
+	}
+	if got[0]["target_path"] != "/2026/01/01/missing" {
+		t.Errorf("target_path=%v", got[0]["target_path"])
+	}
 }
 
 func nowUTC() time.Time { return time.Now().UTC() }

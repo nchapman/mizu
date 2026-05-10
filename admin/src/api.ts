@@ -131,3 +131,18 @@ export async function deleteDraft(id: string): Promise<void> {
 export async function publishDraft(id: string): Promise<Post> {
   return api<Post>(`/admin/api/drafts/${encodeURIComponent(id)}/publish`, { method: "POST" });
 }
+
+export type Mention = {
+  id: number;
+  source: string;
+  source_host: string;
+  target: string;
+  target_path: string;
+  target_title?: string;
+  received_at: string;
+  verified_at?: string;
+};
+
+export async function listMentions(): Promise<Mention[]> {
+  return api<Mention[]>("/admin/api/mentions");
+}

@@ -123,6 +123,46 @@ func (s *Store) ForTarget(ctx context.Context, target string) ([]Mention, error)
 	return out, rows.Err()
 }
 
+// Recent returns the most recent verified mentions across all targets,
+// newest first. Used by the admin to surface incoming activity. limit
+// is clamped to 1..200.
+func (s *Store) Recent(ctx context.Context, limit int) ([]Mention, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, source, target, status, received_at, verified_at, COALESCE(last_error, '')
+		FROM mentions
+		WHERE status = ?
+		ORDER BY COALESCE(verified_at, received_at) DESC
+		LIMIT ?
+	`, string(StatusVerified), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Mention
+	for rows.Next() {
+		var m Mention
+		var status string
+		var receivedAt int64
+		var verifiedAt sql.NullInt64
+		if err := rows.Scan(&m.ID, &m.Source, &m.Target, &status, &receivedAt, &verifiedAt, &m.LastError); err != nil {
+			return nil, err
+		}
+		m.Status = Status(status)
+		m.ReceivedAt = time.Unix(receivedAt, 0)
+		if verifiedAt.Valid {
+			m.VerifiedAt = time.Unix(verifiedAt.Int64, 0)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // PendingPair is a (source, target) row that's waiting for verification.
 type PendingPair struct {
 	Source string

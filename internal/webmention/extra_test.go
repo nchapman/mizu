@@ -3,6 +3,7 @@ package webmention
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -162,6 +163,64 @@ func TestStore_UpsertReplacesStatus(t *testing.T) {
 	}
 	if got[0].Status != StatusVerified {
 		t.Errorf("Status=%q, want verified", got[0].Status)
+	}
+}
+
+func TestStore_RecentVerifiedAcrossTargets(t *testing.T) {
+	st, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC()
+	must := func(m Mention) {
+		if err := st.Upsert(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two verified mentions across different targets, plus pending and
+	// rejected rows that must be excluded.
+	must(Mention{Source: "https://a/p", Target: "https://me/x", Status: StatusVerified, ReceivedAt: now.Add(-2 * time.Hour), VerifiedAt: now.Add(-2 * time.Hour)})
+	must(Mention{Source: "https://b/p", Target: "https://me/y", Status: StatusVerified, ReceivedAt: now.Add(-1 * time.Hour), VerifiedAt: now.Add(-1 * time.Hour)})
+	must(Mention{Source: "https://c/p", Target: "https://me/z", Status: StatusPending, ReceivedAt: now})
+	must(Mention{Source: "https://d/p", Target: "https://me/q", Status: StatusRejected, ReceivedAt: now})
+
+	got, err := st.Recent(ctx, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len=%d, want 2 verified", len(got))
+	}
+	if got[0].Source != "https://b/p" {
+		t.Errorf("got[0].Source=%q, want newest first", got[0].Source)
+	}
+}
+
+func TestStore_RecentRespectsLimit(t *testing.T) {
+	st, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for i := 0; i < 5; i++ {
+		if err := st.Upsert(ctx, Mention{
+			Source: fmt.Sprintf("https://a/%d", i), Target: "https://me/x",
+			Status: StatusVerified, ReceivedAt: now.Add(time.Duration(i) * time.Second),
+			VerifiedAt: now.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := st.Recent(ctx, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Errorf("len=%d, want 3", len(got))
 	}
 }
 
