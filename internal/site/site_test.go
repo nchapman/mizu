@@ -2,6 +2,7 @@ package site
 
 import (
 	"encoding/xml"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -26,7 +27,7 @@ import (
 // composes it in via `content_for_layout`.
 const (
 	tplBase = `<!doctype html><html><head><title>{{ page_title | default: site.Title | escape }}</title><style>:root{--accent:{{ theme.settings.accent_color | css_value }};}</style></head><body><link rel="stylesheet" href="/assets/style.css?v={{ theme.version }}">{{ content_for_layout }}</body></html>`
-	tplIdx  = `{% for p in posts %}<article data-id="{{ p.ID }}">{% if p.Title %}<h2><a href="{{ p.Path }}">{{ p.Title }}</a></h2>{% else %}<a href="{{ p.Path }}">note</a>{% endif %}<div class="body">{{ p.HTML }}</div></article>{% else %}<p>none</p>{% endfor %}`
+	tplIdx  = `{% for p in posts %}<article data-id="{{ p.ID }}">{% if p.Title %}<h2><a href="{{ p.Path }}">{{ p.Title }}</a></h2>{% else %}<a href="{{ p.Path }}">note</a>{% endif %}<div class="body">{{ p.HTML }}</div></article>{% else %}<p>none</p>{% endfor %}{% if pagination.total_pages > 1 %}<nav data-page="{{ pagination.page }}" data-total="{{ pagination.total_pages }}">{% if pagination.prev_url %}<a rel="prev" href="{{ pagination.prev_url }}">prev</a>{% endif %}{% if pagination.next_url %}<a rel="next" href="{{ pagination.next_url }}">next</a>{% endif %}</nav>{% endif %}`
 	tplPost = `<article>{% if post.Title %}<h2>{{ post.Title }}</h2>{% endif %}<div class="body">{{ post.HTML }}</div></article>{% if mentions %}<ul>{% for m in mentions %}<li>{{ m.Source | host_of }}</li>{% endfor %}</ul>{% endif %}`
 )
 
@@ -218,6 +219,138 @@ func TestSite_ArticleRoute(t *testing.T) {
 	r.ServeHTTP(w, httptest.NewRequest("GET", mismatch, nil))
 	if w.Code != 404 {
 		t.Errorf("mismatched date code=%d, want 404", w.Code)
+	}
+}
+
+// seedPosts creates n posts; first call is "Post-1" (oldest), last is
+// "Post-N" (newest, since Recent reverses creation order). Returns the
+// titles as they appear in newest-first order so tests can assert
+// page slices.
+func seedPosts(t *testing.T, posts *post.Store, n int) []string {
+	t.Helper()
+	titles := make([]string, n)
+	for i := 0; i < n; i++ {
+		title := fmt.Sprintf("Post-%d", i+1)
+		if _, err := posts.Create(title, "body", nil); err != nil {
+			t.Fatalf("create %s: %v", title, err)
+		}
+		titles[n-1-i] = title // newest-first ordering matches Recent/Page
+	}
+	return titles
+}
+
+func TestSite_PaginationFirstPageNoNav(t *testing.T) {
+	// With fewer than postsPerPage posts there is no second page, so
+	// the nav block should not render at all — keeps the homepage clean
+	// for new sites.
+	_, r, posts, _ := newSite(t)
+	posts.Create("only", "body", nil)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if w.Code != 200 {
+		t.Fatalf("code=%d", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "data-page=") {
+		t.Errorf("nav rendered with only one page: %s", w.Body.String())
+	}
+}
+
+func TestSite_PaginationListsCorrectSlice(t *testing.T) {
+	// Page 2 should contain the next postsPerPage posts in newest-first
+	// order. 25 posts → page 1 has Post-25..Post-6, page 2 has Post-5..Post-1.
+	_, r, posts, _ := newSite(t)
+	titles := seedPosts(t, posts, 25)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/?page=2", nil))
+	if w.Code != 200 {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range titles[20:] {
+		if !strings.Contains(body, want) {
+			t.Errorf("page 2 missing %s", want)
+		}
+	}
+	for _, gone := range titles[:20] {
+		if strings.Contains(body, gone) {
+			t.Errorf("page 2 leaked page-1 post %s", gone)
+		}
+	}
+	// Nav points back to /, not /?page=1 (canonical), and has no next.
+	if !strings.Contains(body, `rel="prev" href="/"`) {
+		t.Errorf("page 2 should link prev to /: %s", body)
+	}
+	if strings.Contains(body, `rel="next"`) {
+		t.Errorf("page 2 should not have a next link with 25 posts: %s", body)
+	}
+	// Title gets the page suffix on pages > 1 so search results don't
+	// look like duplicate homepages.
+	if !strings.Contains(body, "<title>Page 2 · Test Site</title>") {
+		t.Errorf("paginated title missing: %s", body)
+	}
+}
+
+func TestSite_PaginationMidRangeHasBothLinks(t *testing.T) {
+	_, r, posts, _ := newSite(t)
+	seedPosts(t, posts, 50) // 3 pages at 20/page
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/?page=2", nil))
+	body := w.Body.String()
+	if !strings.Contains(body, `rel="prev"`) || !strings.Contains(body, `rel="next" href="/?page=3"`) {
+		t.Errorf("middle page missing prev+next: %s", body)
+	}
+}
+
+func TestSite_PaginationOutOfRange404(t *testing.T) {
+	_, r, posts, _ := newSite(t)
+	seedPosts(t, posts, 5)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/?page=99", nil))
+	if w.Code != 404 {
+		t.Errorf("code=%d, want 404 for page past end", w.Code)
+	}
+}
+
+func TestSite_PaginationExactBoundary404(t *testing.T) {
+	// Exactly postsPerPage posts → only one page exists. Asking for
+	// page 2 must 404 rather than 200-with-empty-list.
+	_, r, posts, _ := newSite(t)
+	seedPosts(t, posts, postsPerPage)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/?page=2", nil))
+	if w.Code != 404 {
+		t.Errorf("code=%d, want 404 at exact-boundary page", w.Code)
+	}
+}
+
+func TestSite_PaginationCanonicalRedirect(t *testing.T) {
+	// /?page=1 is the same content as /; redirect so caches and search
+	// engines collapse them. Empty store still redirects — page is a
+	// URL property, not a content property.
+	_, r, _, _ := newSite(t)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/?page=1", nil))
+	if w.Code != http.StatusMovedPermanently {
+		t.Errorf("code=%d, want 301", w.Code)
+	}
+	if loc := w.Header().Get("Location"); loc != "/" {
+		t.Errorf("Location=%q, want /", loc)
+	}
+}
+
+func TestSite_PaginationMalformedPage404(t *testing.T) {
+	_, r, _, _ := newSite(t)
+	for _, bad := range []string{"abc", "-1", "0", "01", "1.5"} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("GET", "/?page="+bad, nil))
+		if w.Code != 404 {
+			t.Errorf("page=%q code=%d, want 404", bad, w.Code)
+		}
 	}
 }
 

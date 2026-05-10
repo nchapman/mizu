@@ -213,6 +213,36 @@ func (s *Store) Recent(limit int) []*Post {
 	return out
 }
 
+// Page returns one page of posts in reverse-chronological order plus
+// the total post count, computed atomically under a single lock so the
+// page slice and total can never disagree.
+//
+// page is 1-indexed; page <= 0 is treated as 1. perPage <= 0 is treated
+// as 1. An empty slice with total > 0 means the caller asked for a page
+// past the end and should 404.
+func (s *Store) Page(page, perPage int) (posts []*Post, total int) {
+	if page < 1 {
+		page = 1
+	}
+	if perPage < 1 {
+		perPage = 1
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	total = len(s.order)
+	start := (page - 1) * perPage
+	if start >= total {
+		return nil, total
+	}
+	end := start + perPage
+	if end > total {
+		end = total
+	}
+	out := make([]*Post, end-start)
+	copy(out, s.order[start:end])
+	return out, total
+}
+
 // Before returns up to limit posts strictly older than `t`, in the same
 // reverse-chronological order as Recent. Pass the zero time to start from
 // the newest post (equivalent to Recent for the first page). Used by the

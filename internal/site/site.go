@@ -243,17 +243,86 @@ func (s *Server) render(p *post.Post) renderedPost {
 	return renderedPost{Post: p, HTML: html}
 }
 
+// postsPerPage is the homepage page size. Hardcoded for now — a
+// single-operator microblog has no real reason to expose this as a knob.
+const postsPerPage = 20
+
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
-	recent := s.posts.Recent(50)
-	rendered := make([]renderedPost, len(recent))
-	for i, p := range recent {
+	page, ok := parsePage(r.URL.Query().Get("page"))
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	// Canonical: /?page=1 redirects to / so search engines and shares
+	// don't fragment between the two equivalent URLs.
+	if page == 1 && r.URL.Query().Has("page") {
+		http.Redirect(w, r, "/", http.StatusMovedPermanently)
+		return
+	}
+
+	posts, total := s.posts.Page(page, postsPerPage)
+	if len(posts) == 0 && page > 1 {
+		http.NotFound(w, r)
+		return
+	}
+
+	rendered := make([]renderedPost, len(posts))
+	for i, p := range posts {
 		rendered[i] = s.render(p)
 	}
-	s.exec(w, "index.liquid", "", map[string]any{
-		"site":  s.cfg.Site,
-		"theme": s.themeData,
-		"posts": rendered,
+
+	totalPages := (total + postsPerPage - 1) / postsPerPage
+	s.exec(w, "index.liquid", indexPageTitle(page, s.cfg.Site.Title), map[string]any{
+		"site":       s.cfg.Site,
+		"theme":      s.themeData,
+		"posts":      rendered,
+		"pagination": paginationView(page, totalPages),
 	})
+}
+
+// parsePage returns (1, true) for an empty query, the parsed integer
+// for a clean number, and (_, false) for anything malformed (negative,
+// non-numeric, leading zeros). Unparseable input 404s rather than
+// silently coercing to page 1 — a typo'd link should fail loudly.
+func parsePage(raw string) (int, bool) {
+	if raw == "" {
+		return 1, true
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 || strconv.Itoa(n) != raw {
+		return 0, false
+	}
+	return n, true
+}
+
+func indexPageTitle(page int, siteTitle string) string {
+	if page == 1 {
+		return ""
+	}
+	return fmt.Sprintf("Page %d · %s", page, siteTitle)
+}
+
+// paginationView is what templates see as `pagination`. The prev_url
+// and next_url keys are omitted entirely (not set to "") when there's
+// no link in that direction — Liquid considers empty strings truthy,
+// so a present-but-empty key would still render `{% if %}`. Snake_case
+// keys mirror the convention already used by `theme` and
+// `content_for_layout`.
+func paginationView(page, totalPages int) map[string]any {
+	v := map[string]any{
+		"page":        page,
+		"total_pages": totalPages,
+	}
+	switch {
+	case page == 2:
+		v["prev_url"] = "/"
+	case page > 2:
+		v["prev_url"] = fmt.Sprintf("/?page=%d", page-1)
+	}
+	if page < totalPages {
+		v["next_url"] = fmt.Sprintf("/?page=%d", page+1)
+	}
+	return v
 }
 
 func (s *Server) note(w http.ResponseWriter, r *http.Request) {
