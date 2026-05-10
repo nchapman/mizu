@@ -45,8 +45,9 @@ func newTestPipeline(t *testing.T) (*Pipeline, *post.Store, string) {
 		t.Fatal(err)
 	}
 	t.Chdir(t.TempDir())
-	th, err := theme.Load("default", fakeThemeFS(), nil)
-	if err != nil {
+	// Verify the theme parses cleanly at construction. The pipeline
+	// itself re-loads on every build via SnapshotSources.ThemesFS.
+	if _, err := theme.Load("default", fakeThemeFS(), nil); err != nil {
 		t.Fatal(err)
 	}
 	cfg := &config.Config{Site: config.Site{Title: "Test", BaseURL: "https://example.test"}}
@@ -58,9 +59,9 @@ func newTestPipeline(t *testing.T) (*Pipeline, *post.Store, string) {
 
 	p, err := NewPipeline(Options{
 		Sources: &SnapshotSources{
-			Cfg:       cfg,
+			BootCfg:   cfg,
+			ThemesFS:  fakeThemeFS(),
 			Posts:     posts,
-			Theme:     th,
 			MediaDir:  filepath.Join(tmp, "media"),
 			DraftSalt: salt,
 		},
@@ -242,6 +243,95 @@ func TestDraftSlug_StablePerInput(t *testing.T) {
 	}
 	if DraftSlug([]byte("other"), "draft1") == a {
 		t.Errorf("salt change did not change slug")
+	}
+}
+
+func TestPipeline_ConfigReloadAffectsNextBuild(t *testing.T) {
+	// Editing config.yml's site.title must show up in the next build
+	// without a process restart. Regression for an earlier shape where
+	// cfg was loaded once and the pipeline never re-read it.
+	p, posts, publicDir := newTestPipeline(t)
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "config.yml")
+	writeCfg := func(title string) {
+		body := "site:\n  title: " + title + "\n  base_url: https://example.test\npaths:\n  content: " + filepath.Join(tmp, "content") + "\n  media: " + filepath.Join(tmp, "media") + "\n  cache: " + filepath.Join(tmp, "cache") + "\n  state: " + filepath.Join(tmp, "state") + "\n"
+		if err := os.WriteFile(cfgPath, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCfg("First")
+	p.sources.ConfigPath = cfgPath
+	posts.Create("Hello", "body", nil)
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	idx, _ := os.ReadFile(filepath.Join(publicDir, "index.html"))
+	if !strings.Contains(string(idx), "<title>First</title>") {
+		t.Fatalf("first build missing initial title: %s", idx)
+	}
+
+	writeCfg("Second")
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	idx, _ = os.ReadFile(filepath.Join(publicDir, "index.html"))
+	if !strings.Contains(string(idx), "<title>Second</title>") {
+		t.Errorf("config edit not reflected after rebuild: %s", idx)
+	}
+}
+
+func TestPipeline_ThemeFSReloadsEveryBuild(t *testing.T) {
+	// Edits to the theme FS must propagate without a process restart.
+	// Use a mutable fstest.MapFS as the themes tree; mutate a template
+	// between builds and assert the second build picks up the change.
+	tmp := t.TempDir()
+	contentDir := filepath.Join(tmp, "content")
+	if err := os.MkdirAll(filepath.Join(contentDir, "posts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	posts, err := post.NewStore(contentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	themeFS := fakeThemeFS()
+	if _, err := theme.Load("default", themeFS, nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Site: config.Site{Title: "Test", BaseURL: "https://example.test"}}
+	cfg.ApplyDefaults()
+	publicDir := filepath.Join(tmp, "public")
+	p, err := NewPipeline(Options{
+		Sources: &SnapshotSources{
+			BootCfg:   cfg,
+			ThemesFS:  themeFS,
+			Posts:     posts,
+			MediaDir:  filepath.Join(tmp, "media"),
+			DraftSalt: []byte("salt-salt-salt-salt-salt-salt-aa"),
+		},
+		PublicDir: publicDir,
+		HashPath:  filepath.Join(tmp, "build.json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	idx, _ := os.ReadFile(filepath.Join(publicDir, "index.html"))
+	if strings.Contains(string(idx), "themed-marker-banner") {
+		t.Fatalf("baseline build already contains the post-edit marker: %s", idx)
+	}
+
+	// Mutate base.liquid in place. theme.Load on the next Build re-
+	// reads the MapFS, so the change should land.
+	themeFS["default/base.liquid"].Data = []byte(`<!doctype html><html><body><div class="themed-marker-banner">{{ content_for_layout }}</div></body></html>`)
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	idx, _ = os.ReadFile(filepath.Join(publicDir, "index.html"))
+	if !strings.Contains(string(idx), "themed-marker-banner") {
+		t.Errorf("theme edit not reflected after rebuild: %s", idx)
 	}
 }
 

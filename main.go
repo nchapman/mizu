@@ -72,8 +72,11 @@ func main() {
 	}
 	wmSvc := webmention.New(wmStore, wmLog, cfg.Site.BaseURL)
 
-	activeTheme, err := theme.Load(cfg.Theme.Name, themesFS(), cfg.Theme.Settings)
-	if err != nil {
+	// Boot-time sanity check: fail fast if the active theme is broken
+	// or missing, rather than letting the first render produce a 500.
+	// The pipeline reloads the theme on every build, so this value is
+	// discarded; the call is just for its error.
+	if _, err := theme.Load(cfg.Theme.Name, themesFS(), cfg.Theme.Settings); err != nil {
 		log.Fatalf("theme: %v", err)
 	}
 
@@ -84,12 +87,13 @@ func main() {
 
 	pipeline, err := render.NewPipeline(render.Options{
 		Sources: &render.SnapshotSources{
-			Cfg:       cfg,
-			Posts:     posts,
-			Theme:     activeTheme,
-			WM:        wmSvc,
-			MediaDir:  cfg.Paths.Media,
-			DraftSalt: draftSalt,
+			BootCfg:    cfg,
+			ConfigPath: *cfgPath,
+			ThemesFS:   themesFS(),
+			Posts:      posts,
+			WM:         wmSvc,
+			MediaDir:   cfg.Paths.Media,
+			DraftSalt:  draftSalt,
 		},
 		PublicDir: cfg.Paths.Public,
 		HashPath:  filepath.Join(cfg.Paths.State, "build.json"),

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,19 +64,49 @@ type Snapshot struct {
 
 // SnapshotSources holds the live sources a Pipeline reads to build a
 // Snapshot. Populated once at construction and reused for every build.
+//
+// The pieces that come from disk (config, active theme) are reloaded
+// at the start of every Build so an edit to config.yml or
+// themes/<name>/* takes effect on the next render cycle without a
+// process restart. The post store, webmention service, media dir, and
+// draft salt are stable for the process lifetime.
 type SnapshotSources struct {
-	Cfg       *config.Config
-	Posts     *post.Store
-	Theme     *theme.Theme
-	WM        *webmention.Service
-	MediaDir  string // path to media/, the parent of media/orig
-	DraftSalt []byte
+	BootCfg    *config.Config // boot-time defaults; used to fill fields the live config doesn't reload (rate limits, paths)
+	ConfigPath string         // path passed to config.Load on every build
+	ThemesFS   fs.FS          // embedded themes/ tree, used as the fallback floor by theme.Load
+	Posts      *post.Store
+	WM         *webmention.Service
+	MediaDir   string // path to media/, the parent of media/orig
+	DraftSalt  []byte
 }
 
-// Build assembles the Snapshot. The post store is reloaded so any
-// out-of-band edits (operator running vim, git pull) become visible
-// before the first stage queries it.
+// Build assembles the Snapshot. Disk-resident sources (config, theme,
+// posts) are reloaded so out-of-band edits become visible on the next
+// build without a restart.
 func (s *SnapshotSources) Build(ctx context.Context) (*Snapshot, error) {
+	// Live-reload config so edits to config.yml (site title, base URL,
+	// theme settings) propagate. Falls back to the boot config if the
+	// file is missing or unparseable — a config that's mid-edit
+	// shouldn't crash the renderer — but log loudly so a persistent
+	// problem is visible. A nil ConfigPath (test setups, never seen
+	// in production) skips the reload entirely.
+	cfg := s.BootCfg
+	if s.ConfigPath != "" {
+		if reloaded, err := config.Load(s.ConfigPath); err != nil {
+			log.Printf("render: config reload failed (%v) — using boot config", err)
+		} else {
+			cfg = reloaded
+		}
+	}
+
+	// Live-reload theme so disk theme edits propagate. theme.Load
+	// reopens the on-disk root (via os.OpenRoot) on every call, so a
+	// fresh Load picks up file changes.
+	activeTheme, err := theme.Load(cfg.Theme.Name, s.ThemesFS, cfg.Theme.Settings)
+	if err != nil {
+		return nil, fmt.Errorf("reload theme: %w", err)
+	}
+
 	if err := s.Posts.Reload(); err != nil {
 		return nil, fmt.Errorf("reload posts: %w", err)
 	}
@@ -92,24 +123,28 @@ func (s *SnapshotSources) Build(ctx context.Context) (*Snapshot, error) {
 			return nil, fmt.Errorf("load mentions: %w", err)
 		}
 		for _, m := range all {
-			mentions[m.Target] = append(mentions[m.Target], m)
+			// Normalize the target before keying: a sender that POSTs
+			// "https://site/post/" with a trailing slash would otherwise
+			// never match the lookup key the render side builds from
+			// snap.BaseURL + p.Path() (which never has a trailing slash).
+			// Silently dropping verified mentions from the rendered page
+			// is the worst possible failure mode for this feature.
+			key := strings.TrimRight(m.Target, "/")
+			mentions[key] = append(mentions[key], m)
 		}
 	}
 
-	baseURL := s.Cfg.Site.BaseURL
-	for len(baseURL) > 0 && baseURL[len(baseURL)-1] == '/' {
-		baseURL = baseURL[:len(baseURL)-1]
-	}
+	baseURL := strings.TrimRight(cfg.Site.BaseURL, "/")
 
-	assetHashes, err := hashThemeAssets(s.Theme.FS)
+	assetHashes, err := hashThemeAssets(activeTheme.FS)
 	if err != nil {
 		return nil, fmt.Errorf("hash theme assets: %w", err)
 	}
 
 	snap := &Snapshot{
-		Site:        s.Cfg.Site,
+		Site:        cfg.Site,
 		BaseURL:     baseURL,
-		Theme:       s.Theme,
+		Theme:       activeTheme,
 		Posts:       s.Posts.Recent(0),
 		Drafts:      s.Posts.ListDrafts(),
 		Mentions:    mentions,
@@ -117,12 +152,12 @@ func (s *SnapshotSources) Build(ctx context.Context) (*Snapshot, error) {
 		DraftSalt:   s.DraftSalt,
 		AssetHashes: assetHashes,
 		ThemeData: map[string]any{
-			"name":     s.Theme.Name,
-			"version":  s.Theme.Version,
-			"settings": s.Theme.Settings,
+			"name":     activeTheme.Name,
+			"version":  activeTheme.Version,
+			"settings": activeTheme.Settings,
 		},
 	}
-	tpl, err := loadTemplates(s.Theme.FS, themeAssetURL(snap))
+	tpl, err := loadTemplates(activeTheme.FS, themeAssetURL(snap))
 	if err != nil {
 		return nil, fmt.Errorf("load templates: %w", err)
 	}

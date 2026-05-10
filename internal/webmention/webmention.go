@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nchapman/mizu/internal/safehttp"
@@ -35,8 +36,9 @@ type Service struct {
 
 	// onVerified is invoked once per mention that flips to Verified.
 	// Used by the render pipeline to enqueue a rebuild so the target
-	// post's static page picks up the new mention. Optional: nil means
-	// "no notification."
+	// post's static page picks up the new mention. Read by the
+	// verifier goroutine, written by main wiring; guarded by onVerMu.
+	onVerMu    sync.RWMutex
 	onVerified func()
 }
 
@@ -209,8 +211,11 @@ func (s *Service) processOne(ctx context.Context, j job) {
 		_ = s.log.Append(LogEntry{
 			Direction: "received", Source: j.source, Target: j.target, Status: StatusVerified,
 		})
-		if s.onVerified != nil {
-			s.onVerified()
+		s.onVerMu.RLock()
+		cb := s.onVerified
+		s.onVerMu.RUnlock()
+		if cb != nil {
+			cb()
 		}
 		return
 	}
@@ -253,9 +258,12 @@ func (s *Service) AllVerified(ctx context.Context) ([]Mention, error) {
 
 // OnVerified registers a callback invoked when a mention transitions
 // to Verified. Set by main.go to point at Pipeline.Enqueue so post
-// pages re-render with the new mention. Pass nil to clear.
+// pages re-render with the new mention. Pass nil to clear. Safe to
+// call concurrently with the verifier worker.
 func (s *Service) OnVerified(cb func()) {
+	s.onVerMu.Lock()
 	s.onVerified = cb
+	s.onVerMu.Unlock()
 }
 
 // Recent passes through to the store. Used by the admin to list
