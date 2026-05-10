@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	CookieName     = "repeat_session"
+	CookieName     = "mizu_session"
 	sessionTTL     = 30 * 24 * time.Hour
 	MinPasswordLen = 8
 	bcryptCost     = 12
@@ -234,7 +234,7 @@ func (a *Auth) DestroySession(token string) {
 
 // SetCookie writes the session cookie. SameSite=Lax + HttpOnly are safe
 // defaults for a single-origin admin UI; Secure is left off so the cookie
-// works on plain-http localhost. Deployments behind TLS should put repeat
+// works on plain-http localhost. Deployments behind TLS should put mizu
 // behind a reverse proxy that enforces HTTPS.
 func SetCookie(w http.ResponseWriter, token string) {
 	http.SetCookie(w, &http.Cookie{

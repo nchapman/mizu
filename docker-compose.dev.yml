@@ -1,11 +1,11 @@
 # Two-instance development stack for exercising cross-instance flows
-# (webmentions, feed subscriptions) between two repeat servers.
+# (webmentions, feed subscriptions) between two mizu servers.
 #
 # Browser:    http://localhost:8081/admin   (Alice)
 #             http://localhost:8082/admin   (Bob)
 # Inter-pod:  http://alice:8080  /  http://bob:8080  (docker network DNS)
 #
-# Both instances run with REPEAT_ALLOW_PRIVATE_HOSTS=1 so safehttp will
+# Both instances run with MIZU_ALLOW_PRIVATE_HOSTS=1 so safehttp will
 # permit dialing the docker bridge network. Never set that variable in
 # production — it disables SSRF protection.
 #
@@ -23,10 +23,10 @@
 services:
   alice:
     build: .
-    container_name: repeat-alice
+    container_name: mizu-alice
     hostname: alice
     environment:
-      REPEAT_ALLOW_PRIVATE_HOSTS: "1"
+      MIZU_ALLOW_PRIVATE_HOSTS: "1"
     ports:
       - "8081:8080"
     volumes:
@@ -35,14 +35,14 @@ services:
       - ./dev/alice/media:/app/media
       - ./dev/alice/cache:/app/cache
       - ./dev/alice/state:/app/state
-    networks: [repeatnet]
+    networks: [mizunet]
 
   bob:
     build: .
-    container_name: repeat-bob
+    container_name: mizu-bob
     hostname: bob
     environment:
-      REPEAT_ALLOW_PRIVATE_HOSTS: "1"
+      MIZU_ALLOW_PRIVATE_HOSTS: "1"
     ports:
       - "8082:8080"
     volumes:
@@ -51,7 +51,7 @@ services:
       - ./dev/bob/media:/app/media
       - ./dev/bob/cache:/app/cache
       - ./dev/bob/state:/app/state
-    networks: [repeatnet]
+    networks: [mizunet]
 
 networks:
-  repeatnet:
+  mizunet:

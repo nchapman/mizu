@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/nchapman/repeat/internal/safehttp"
+	"github.com/nchapman/mizu/internal/safehttp"
 )
 
 // Service is the public face of the feeds package — it keeps the OPML file

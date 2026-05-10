@@ -18,12 +18,12 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/nchapman/repeat/internal/auth"
-	"github.com/nchapman/repeat/internal/config"
-	"github.com/nchapman/repeat/internal/feeds"
-	"github.com/nchapman/repeat/internal/media"
-	"github.com/nchapman/repeat/internal/post"
-	"github.com/nchapman/repeat/internal/webmention"
+	"github.com/nchapman/mizu/internal/auth"
+	"github.com/nchapman/mizu/internal/config"
+	"github.com/nchapman/mizu/internal/feeds"
+	"github.com/nchapman/mizu/internal/media"
+	"github.com/nchapman/mizu/internal/post"
+	"github.com/nchapman/mizu/internal/webmention"
 )
 
 type Server struct {
@@ -782,11 +782,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 const placeholderHTML = `<!doctype html>
-<html><head><meta charset="utf-8"><title>repeat admin</title>
+<html><head><meta charset="utf-8"><title>mizu admin</title>
 <style>body{font:14px/1.5 system-ui;max-width:640px;margin:4em auto;padding:0 1em;color:#222}
 code{background:#f3f3f3;padding:.1em .3em;border-radius:3px}</style></head>
 <body>
-<h1>repeat admin</h1>
+<h1>mizu admin</h1>
 <p>The admin app isn't available. The binary normally embeds it at build time —
 this page only appears if the binary was built without first running
 <code>npm run build</code>, or if <code>paths.admin_dist</code> in your config

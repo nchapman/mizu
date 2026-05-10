@@ -2,7 +2,7 @@ site:
   title: My Site
   author: Your Name
   base_url: http://localhost:8080
-  description: A repeat-powered site.
+  description: A mizu-powered site.
 
 server:
   addr: ":8080"
@@ -22,4 +22,4 @@ paths:
 
 poller:
   interval: 1h
-  user_agent: repeat/0.1 (+https://github.com/nchapman/repeat)
+  user_agent: mizu/0.1 (+https://github.com/nchapman/mizu)

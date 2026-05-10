@@ -29,15 +29,15 @@ COPY --from=admin /src/admin/dist ./admin/dist
 
 # CGO_ENABLED=0 because modernc.org/sqlite is pure Go and we want a
 # fully static binary that doesn't depend on libc.
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/repeat .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/mizu .
 
 # --- Stage 3: runtime ------------------------------------------------
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata wget && \
-    addgroup -S repeat && adduser -S -G repeat -h /app repeat
+    addgroup -S mizu && adduser -S -G mizu -h /app mizu
 WORKDIR /app
 
-COPY --from=go /out/repeat /app/repeat
+COPY --from=go /out/mizu /app/mizu
 COPY config.example.yml /app/config.example.yml
 
 # Pre-create the writable directories with the right ownership so
@@ -45,9 +45,9 @@ COPY config.example.yml /app/config.example.yml
 # because chown after dropping root would fail.
 RUN mkdir -p /app/content/posts /app/content/drafts \
         /app/media /app/cache /app/state && \
-    chown -R repeat:repeat /app
+    chown -R mizu:mizu /app
 
-USER repeat
+USER mizu
 
 # Mount these as volumes so user data survives container restarts.
 VOLUME ["/app/content", "/app/media", "/app/cache", "/app/state"]
@@ -61,4 +61,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
 
 # The container expects a config file at /app/config.yml — the
 # operator can either mount one or copy the example and edit it.
-ENTRYPOINT ["/app/repeat", "--config", "/app/config.yml"]
+ENTRYPOINT ["/app/mizu", "--config", "/app/config.yml"]

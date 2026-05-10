@@ -55,7 +55,7 @@ func Load(path string) (*Config, error) {
 		c.Poller.Interval = time.Hour
 	}
 	if c.Poller.UserAgent == "" {
-		c.Poller.UserAgent = "repeat/0.1"
+		c.Poller.UserAgent = "mizu/0.1"
 	}
 	if c.Paths.Subscriptions == "" {
 		c.Paths.Subscriptions = "./subscriptions.opml"

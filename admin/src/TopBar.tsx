@@ -25,7 +25,7 @@ export function TopBar({ onNavigate, onLogout }: Props) {
           onClick={() => onNavigate("home")}
           className="text-base font-semibold tracking-tight text-foreground transition-colors hover:text-foreground/80"
         >
-          repeat
+          mizu
         </button>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>

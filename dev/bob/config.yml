@@ -16,4 +16,4 @@ paths:
 
 poller:
   interval: 30s
-  user_agent: repeat-dev-bob/0.1
+  user_agent: mizu-dev-bob/0.1

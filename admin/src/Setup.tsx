@@ -40,7 +40,7 @@ export function Setup({ onDone, siteTitle }: { onDone: () => void; siteTitle?: s
     <div className="mx-auto mt-16 max-w-md px-4">
       <header className="mb-6 text-center">
         <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-          repeat
+          mizu
         </div>
         {siteTitle && (
           <div className="mt-1 text-base font-semibold tracking-tight text-foreground">
@@ -48,10 +48,10 @@ export function Setup({ onDone, siteTitle }: { onDone: () => void; siteTitle?: s
           </div>
         )}
       </header>
-      <h1 className="mb-2 text-lg font-semibold">Welcome to repeat</h1>
+      <h1 className="mb-2 text-lg font-semibold">Welcome to mizu</h1>
       <p className="mb-4 text-sm text-muted-foreground">
         Set a password to lock down the admin UI. The one-time setup token was printed to your
-        server log when repeat started — paste it below to prove you're the operator.
+        server log when mizu started — paste it below to prove you're the operator.
       </p>
       <form onSubmit={submit} className="space-y-3 rounded-xl border border-border bg-card p-4 shadow-sm">
         <div className="space-y-1.5">

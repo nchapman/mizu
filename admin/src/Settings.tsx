@@ -5,7 +5,7 @@ import { Separator } from "@/components/ui/separator";
 
 // Preferences live in localStorage for now; once we have a real backend
 // store this surface keeps working with a tiny adapter swap.
-const PREFS_KEY = "repeat:prefs";
+const PREFS_KEY = "mizu:prefs";
 
 interface Prefs {
   autoMarkRead: boolean;

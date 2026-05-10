@@ -11,7 +11,7 @@ import (
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/mmcdole/gofeed"
 
-	"github.com/nchapman/repeat/internal/safehttp"
+	"github.com/nchapman/mizu/internal/safehttp"
 )
 
 // MaxFeedBodyBytes caps the response body of a single feed fetch. A

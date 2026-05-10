@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/nchapman/repeat/internal/feeds"
-	"github.com/nchapman/repeat/internal/post"
+	"github.com/nchapman/mizu/internal/feeds"
+	"github.com/nchapman/mizu/internal/post"
 )
 
 // streamItemDTO is a tagged-union JSON entry for the unified stream.

@@ -28,7 +28,7 @@ describe("App auth screens", () => {
   it("renders the Setup screen when /me reports unconfigured", async () => {
     withMe({ configured: false, authenticated: false });
     render(<App />);
-    expect(await screen.findByRole("heading", { name: /Welcome to repeat/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /Welcome to mizu/i })).toBeInTheDocument();
     expect(screen.getByLabelText(/Setup token/i)).toBeInTheDocument();
   });
 
@@ -47,7 +47,7 @@ describe("App auth screens", () => {
     );
     render(<App />);
     // The brand button anchors the new top bar.
-    expect(await screen.findByRole("button", { name: "repeat" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "mizu" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /menu/i })).toBeInTheDocument();
   });
 
@@ -57,7 +57,7 @@ describe("App auth screens", () => {
     expect(await screen.findByText(/Could not reach the server/i)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Retry/i }));
     // After retry, the configured-false state means the Setup screen renders.
-    expect(await screen.findByRole("heading", { name: /Welcome to repeat/i })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /Welcome to mizu/i })).toBeInTheDocument();
   });
 });
 
@@ -77,7 +77,7 @@ describe("App route navigation", () => {
       { status: 200, body: [draft] },       // drawer-open refetch
     );
     render(<App />);
-    await screen.findByRole("button", { name: "repeat" });
+    await screen.findByRole("button", { name: "mizu" });
     // The pill only renders once the count fetch resolves with a non-zero list.
     await userEvent.click(await screen.findByRole("button", { name: /Drafts ·/i }));
     expect(await screen.findByRole("heading", { name: "Drafts" })).toBeInTheDocument();
@@ -92,7 +92,7 @@ describe("App route navigation", () => {
       { status: 200, body: [] },             // subs
     );
     render(<App />);
-    await screen.findByRole("button", { name: "repeat" });
+    await screen.findByRole("button", { name: "mizu" });
     await openMenu();
     await userEvent.click(await screen.findByRole("menuitem", { name: /Subscriptions/i }));
     expect(await screen.findByText(/No subscriptions yet/i)).toBeInTheDocument();
@@ -105,7 +105,7 @@ describe("App route navigation", () => {
       { status: 200, body: [] },             // drafts (count)
     );
     render(<App />);
-    await screen.findByRole("button", { name: "repeat" });
+    await screen.findByRole("button", { name: "mizu" });
     await openMenu();
     await userEvent.click(await screen.findByRole("menuitem", { name: /Settings/i }));
     expect(await screen.findByRole("heading", { name: /Settings/i })).toBeInTheDocument();
@@ -125,7 +125,7 @@ describe("App Login", () => {
     await screen.findByPlaceholderText("Password");
     await userEvent.type(screen.getByPlaceholderText("Password"), "hunter22pw");
     await userEvent.click(screen.getByRole("button", { name: /Sign in/i }));
-    expect(await screen.findByRole("button", { name: "repeat" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "mizu" })).toBeInTheDocument();
   });
 
   it("surfaces 'Wrong password.' on 401", async () => {
@@ -145,7 +145,7 @@ describe("App Setup", () => {
   it("validates token, password length, and password match before submitting", async () => {
     withMe({ configured: false, authenticated: false });
     render(<App />);
-    await screen.findByRole("heading", { name: /Welcome to repeat/i });
+    await screen.findByRole("heading", { name: /Welcome to mizu/i });
 
     // No token → error.
     await userEvent.click(screen.getByRole("button", { name: /Set password/i }));
@@ -177,13 +177,13 @@ describe("App Setup", () => {
       { status: 200, body: [] }, // /drafts (count)
     ]);
     render(<App />);
-    await screen.findByRole("heading", { name: /Welcome to repeat/i });
+    await screen.findByRole("heading", { name: /Welcome to mizu/i });
     await userEvent.type(screen.getByLabelText(/Setup token/i), "tok");
     const pwInputs = screen.getAllByLabelText(/password/i);
     await userEvent.type(pwInputs[0], "longenough");
     await userEvent.type(pwInputs[1], "longenough");
     await userEvent.click(screen.getByRole("button", { name: /Set password/i }));
-    expect(await screen.findByRole("button", { name: "repeat" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "mizu" })).toBeInTheDocument();
   });
 });
 
@@ -217,7 +217,7 @@ describe("App home view", () => {
       },
     );
     render(<App />);
-    await screen.findByRole("button", { name: "repeat" });
+    await screen.findByRole("button", { name: "mizu" });
 
     // Switch to source mode so we can drive the textarea (Lexical's
     // contenteditable is unreliable under jsdom).
@@ -251,7 +251,7 @@ describe("App home view", () => {
       { status: 200, body: { configured: true, authenticated: false } },     // re-load
     );
     render(<App />);
-    await screen.findByRole("button", { name: "repeat" });
+    await screen.findByRole("button", { name: "mizu" });
     await openMenu();
     await userEvent.click(await screen.findByRole("menuitem", { name: /Sign out/i }));
     expect(await screen.findByPlaceholderText("Password")).toBeInTheDocument();

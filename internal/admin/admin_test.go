@@ -22,12 +22,12 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/nchapman/repeat/internal/auth"
-	"github.com/nchapman/repeat/internal/config"
-	"github.com/nchapman/repeat/internal/feeds"
-	"github.com/nchapman/repeat/internal/media"
-	"github.com/nchapman/repeat/internal/post"
-	"github.com/nchapman/repeat/internal/webmention"
+	"github.com/nchapman/mizu/internal/auth"
+	"github.com/nchapman/mizu/internal/config"
+	"github.com/nchapman/mizu/internal/feeds"
+	"github.com/nchapman/mizu/internal/media"
+	"github.com/nchapman/mizu/internal/post"
+	"github.com/nchapman/mizu/internal/webmention"
 )
 
 type harness struct {
@@ -42,7 +42,7 @@ type harness struct {
 	cfg    *config.Config
 }
 
-const fixtureIndexHTML = `<!doctype html><html><body data-app="repeat"></body></html>`
+const fixtureIndexHTML = `<!doctype html><html><body data-app="mizu"></body></html>`
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
@@ -599,7 +599,7 @@ func TestSPA_ServesIndexForUnknown(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("code=%d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), `data-app="repeat"`) {
+	if !strings.Contains(w.Body.String(), `data-app="mizu"`) {
 		t.Errorf("SPA fallback didn't return index.html: %s", w.Body.String())
 	}
 }
@@ -637,7 +637,7 @@ func TestSPA_PlaceholderWhenNoAdmin(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("code=%d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "repeat admin") {
+	if !strings.Contains(w.Body.String(), "mizu admin") {
 		t.Errorf("placeholder missing: %s", w.Body.String())
 	}
 }

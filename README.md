@@ -1,4 +1,4 @@
-# repeat
+# mizu
 
 A self-hosted, single-user microblog and feed reader. One binary publishes
 your writing as HTML + RSS, and reads the feeds you subscribe to. Written
@@ -20,7 +20,7 @@ Requires Go 1.25+ and Node 20+.
 cp config.example.yml config.yml
 # edit config.yml — at minimum set site.base_url to where this will be served
 make build
-./repeat --config config.yml
+./mizu --config config.yml
 ```
 
 On first run the server prints a one-time setup token. Visit
@@ -30,7 +30,7 @@ On first run the server prints a one-time setup token. Visit
 
 ```sh
 # Backend on :8080 with the embedded admin
-./repeat --config config.yml
+./mizu --config config.yml
 
 # Admin with hot reload on :5173, proxying /admin/api → :8080
 cd admin && npm install && npm run dev
@@ -42,7 +42,7 @@ the test suite, and a full build. Run it before committing.
 ## Docker
 
 ```sh
-docker build -t repeat .
+docker build -t mizu .
 docker run -d \
   -p 8080:8080 \
   -v $PWD/config.yml:/app/config.yml:ro \
@@ -50,7 +50,7 @@ docker run -d \
   -v $PWD/data/media:/app/media \
   -v $PWD/data/cache:/app/cache \
   -v $PWD/data/state:/app/state \
-  repeat
+  mizu
 ```
 
 The image runs as a non-root user. Mount `config.yml` and the four data

@@ -23,11 +23,11 @@ import (
 
 // allowPrivateHostsEnv is a development-only escape hatch. When set to
 // "1", "true", or "yes", IsBlockedIP returns false for everything, so a
-// dev docker-compose with two repeat instances on a private bridge
+// dev docker-compose with two mizu instances on a private bridge
 // network can actually exchange feeds and webmentions. Never set this
 // in production — it disables the only line of defense against SSRF
 // against the host's metadata service, internal admin panels, etc.
-const allowPrivateHostsEnv = "REPEAT_ALLOW_PRIVATE_HOSTS"
+const allowPrivateHostsEnv = "MIZU_ALLOW_PRIVATE_HOSTS"
 
 func allowPrivateHosts() bool {
 	switch os.Getenv(allowPrivateHostsEnv) {

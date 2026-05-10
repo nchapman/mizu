@@ -14,7 +14,7 @@ import (
 // Watcher reloads the post store when markdown files in posts/ or
 // drafts/ change on disk. The intent is to support out-of-band edits
 // — running `vim content/posts/foo.md` should make changes show up
-// without restarting repeat.
+// without restarting mizu.
 //
 // Reloads are debounced because typical editor saves emit a burst of
 // events (rename, create, write) for a single user action; reloading

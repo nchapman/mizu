@@ -178,7 +178,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, Props>(function M
   // outside, so capturing the prop in the factory closure is safe.
   const initialConfig = useMemo(
     () => ({
-      namespace: "repeat-composer",
+      namespace: "mizu-composer",
       theme: editorTheme,
       nodes: [
         HeadingNode,

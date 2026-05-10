@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nchapman/repeat/internal/feeds"
+	"github.com/nchapman/mizu/internal/feeds"
 )
 
 // seedPost writes a markdown post file with frontmatter at the given date,

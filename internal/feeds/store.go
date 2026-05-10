@@ -1,11 +1,11 @@
-// Package feeds is the inbound side of repeat: feeds the user subscribes to,
+// Package feeds is the inbound side of mizu: feeds the user subscribes to,
 // items fetched from those feeds, and read state.
 //
 // Two storage layers cooperate:
 //
 //   - subscriptions.opml on disk is the durable, portable source of truth
 //     for the user's subscription list.
-//   - cache/repeat.db (SQLite) is a regeneratable cache of fetched items
+//   - cache/mizu.db (SQLite) is a regeneratable cache of fetched items
 //     and read state, indexed for timeline queries.
 //
 // The DB can be deleted at any time: the next poll will repopulate items
@@ -85,7 +85,7 @@ type Store struct {
 }
 
 func OpenStore(cacheDir string) (*Store, error) {
-	dsn := filepath.Join(cacheDir, "repeat.db") + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
+	dsn := filepath.Join(cacheDir, "mizu.db") + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)

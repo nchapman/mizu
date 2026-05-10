@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`repeat` is a self-hosted, single-user microblog and feed reader. One operator runs one instance: it publishes their writing as HTML + RSS at the public root, and acts as their feed reader at `/admin`. Stack: Go 1.25 backend (chi router, html/template, modernc.org/sqlite — pure Go, no cgo), React 18 + Vite + TS admin SPA.
+`mizu` is a self-hosted, single-user microblog and feed reader. One operator runs one instance: it publishes their writing as HTML + RSS at the public root, and acts as their feed reader at `/admin`. Stack: Go 1.25 backend (chi router, html/template, modernc.org/sqlite — pure Go, no cgo), React 18 + Vite + TS admin SPA.
 
 ## Commands
 
@@ -31,7 +31,7 @@ The system has two halves with deliberately different storage shapes. Understand
 
 **Inbound (feed reader — feeds the operator follows):**
 - `subscriptions.opml` is the durable, portable source of truth for the subscription list.
-- `cache/repeat.db` (SQLite) is a regeneratable cache of fetched items and read state. **Deleting the cache is safe** — the next poll repopulates from OPML.
+- `cache/mizu.db` (SQLite) is a regeneratable cache of fetched items and read state. **Deleting the cache is safe** — the next poll repopulates from OPML.
 
 **Webmentions** repeat the same pattern: `state/webmentions.log.jsonl` is the durable archive, `cache/webmentions.db` is the queryable index. The DB can be rebuilt from the log.
 
@@ -39,11 +39,11 @@ The system has two halves with deliberately different storage shapes. Understand
 
 **SSRF**: every fetch of an operator-supplied URL goes through `internal/safehttp.NewClient()`. It resolves DNS itself and pins the dial to the resolved IP, blocking loopback / RFC-1918 / link-local / multicast / unspecified at dial time. Use this client — never `http.DefaultClient` — for feed polls, webmention source/target fetches, oembed lookups, etc. DNS rebinding mitigation is partial; documented in `safehttp.go`.
 
-**Auth**: bcrypt hash on disk at `state/auth.json` (cost 12, atomic write, 0o600). Sessions live in memory; cookie is `repeat_session`, SameSite=Lax, HttpOnly, 30-day TTL. Public endpoints under `/admin/api/`: `me`, `setup`, `login`, `logout`. Everything else is gated by `auth.Middleware` via a `r.Group` in `internal/admin/admin.go`. First-run uses a one-time setup token printed to stdout, compared in constant time.
+**Auth**: bcrypt hash on disk at `state/auth.json` (cost 12, atomic write, 0o600). Sessions live in memory; cookie is `mizu_session`, SameSite=Lax, HttpOnly, 30-day TTL. Public endpoints under `/admin/api/`: `me`, `setup`, `login`, `logout`. Everything else is gated by `auth.Middleware` via a `r.Group` in `internal/admin/admin.go`. First-run uses a one-time setup token printed to stdout, compared in constant time.
 
 **Single-binary deploy**: `admin/dist/` (built React) and `templates/` are embedded via `go:embed` in `embed.go` at the project root (the embed directives are relative to the source file). Both have **disk overrides** via `cfg.Paths.AdminDist` / `cfg.Paths.Templates` — when the directory exists with the expected entry file (`index.html` or `base.html`), it wins; otherwise the embedded copy is served. This keeps the dev workflow flexible while making production a single self-contained binary.
 
-**fsnotify**: `internal/post/watcher.go` reloads the post store on `.md` changes in `posts/` or `drafts/`, debounced 200 ms. The watcher fires for repeat's own writes too — harmless, since `Reload()` is idempotent. The debounce uses a single-goroutine `time.After` loop in a `select`, **not** `time.AfterFunc + Reset` (which has a documented race where a queued fire can run concurrently with a reschedule). Don't reintroduce that pattern.
+**fsnotify**: `internal/post/watcher.go` reloads the post store on `.md` changes in `posts/` or `drafts/`, debounced 200 ms. The watcher fires for mizu's own writes too — harmless, since `Reload()` is idempotent. The debounce uses a single-goroutine `time.After` loop in a `select`, **not** `time.AfterFunc + Reset` (which has a documented race where a queued fire can run concurrently with a reschedule). Don't reintroduce that pattern.
 
 ## Architecture: package map
 

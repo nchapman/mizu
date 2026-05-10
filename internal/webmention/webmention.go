@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nchapman/repeat/internal/safehttp"
+	"github.com/nchapman/mizu/internal/safehttp"
 )
 
 // Service ties the store, log, and verifier together. One instance

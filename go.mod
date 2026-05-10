@@ -1,4 +1,4 @@
-module github.com/nchapman/repeat
+module github.com/nchapman/mizu
 
 go 1.25.0
 

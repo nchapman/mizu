@@ -35,7 +35,7 @@ export function Login({ onDone, siteTitle }: { onDone: () => void; siteTitle?: s
     <div className="mx-auto mt-16 max-w-sm px-4">
       <header className="mb-6 text-center">
         <div className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-          repeat
+          mizu
         </div>
         {siteTitle && (
           <div className="mt-1 text-base font-semibold tracking-tight text-foreground">

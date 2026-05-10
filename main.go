@@ -14,14 +14,14 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"github.com/nchapman/repeat/internal/admin"
-	"github.com/nchapman/repeat/internal/auth"
-	"github.com/nchapman/repeat/internal/config"
-	"github.com/nchapman/repeat/internal/feeds"
-	"github.com/nchapman/repeat/internal/media"
-	"github.com/nchapman/repeat/internal/post"
-	"github.com/nchapman/repeat/internal/site"
-	"github.com/nchapman/repeat/internal/webmention"
+	"github.com/nchapman/mizu/internal/admin"
+	"github.com/nchapman/mizu/internal/auth"
+	"github.com/nchapman/mizu/internal/config"
+	"github.com/nchapman/mizu/internal/feeds"
+	"github.com/nchapman/mizu/internal/media"
+	"github.com/nchapman/mizu/internal/post"
+	"github.com/nchapman/mizu/internal/site"
+	"github.com/nchapman/mizu/internal/webmention"
 )
 
 func main() {
@@ -124,7 +124,7 @@ func main() {
 
 	srv := &http.Server{Addr: cfg.Server.Addr, Handler: r}
 	go func() {
-		log.Printf("repeat listening on %s", cfg.Server.Addr)
+		log.Printf("mizu listening on %s", cfg.Server.Addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatal(err)
 		}

@@ -13,9 +13,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/nchapman/repeat/internal/config"
-	"github.com/nchapman/repeat/internal/post"
-	"github.com/nchapman/repeat/internal/webmention"
+	"github.com/nchapman/mizu/internal/config"
+	"github.com/nchapman/mizu/internal/post"
+	"github.com/nchapman/mizu/internal/webmention"
 )
 
 // minimal templates used by every site test. They cover all the blocks

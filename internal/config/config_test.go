@@ -88,7 +88,7 @@ paths:
 	if c.Poller.Interval != time.Hour {
 		t.Errorf("default interval=%v, want 1h", c.Poller.Interval)
 	}
-	if c.Poller.UserAgent != "repeat/0.1" {
+	if c.Poller.UserAgent != "mizu/0.1" {
 		t.Errorf("default ua=%q", c.Poller.UserAgent)
 	}
 	if c.Paths.Subscriptions != "./subscriptions.opml" {
