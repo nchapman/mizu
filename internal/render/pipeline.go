@@ -2,6 +2,8 @@ package render
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -30,6 +32,19 @@ type Pipeline struct {
 
 	mu      sync.Mutex // serializes Build calls; one builder at a time
 	pending chan struct{}
+
+	// mdCache memoizes goldmark renders across builds keyed by post
+	// ID + body hash. With this in place a "edit one post" rebuild
+	// runs goldmark exactly once instead of once per post — at 500
+	// posts that's the difference between ~500 ms of markdown work
+	// and a few ms of body hashing.
+	mdCache map[string]mdCacheEntry
+
+	// tplCache memoizes parsed Liquid templates across builds keyed
+	// by the concatenated hash of the three theme template files.
+	// Theme parsing isn't a bottleneck at 1× per build but it's
+	// pointless redundant work when the theme hasn't changed.
+	tplCache *tplCacheEntry
 
 	// LastBuild and LastError are populated after each build for the
 	// admin UI to surface status. Read under statusMu.
@@ -103,7 +118,24 @@ func NewPipeline(opts Options) (*Pipeline, error) {
 		debounce:  opts.Debounce,
 		hashes:    hashes,
 		pending:   make(chan struct{}, 1),
+		mdCache:   map[string]mdCacheEntry{},
 	}, nil
+}
+
+// mdCacheEntry pins a post's body hash to its rendered HTML so a
+// rebuild that doesn't change the body skips goldmark entirely.
+type mdCacheEntry struct {
+	BodyHash string
+	HTML     string
+}
+
+// tplCacheEntry pins the parsed templateSet to the hash of the three
+// theme template files it was parsed from. A theme reload that
+// produces identical bytes (e.g. fsnotify firing on a touch) reuses
+// the parse.
+type tplCacheEntry struct {
+	hash string
+	set  *templateSet
 }
 
 // Enqueue requests a build. Non-blocking, coalescing: a queued request
@@ -159,6 +191,10 @@ func (p *Pipeline) Build(ctx context.Context) error {
 
 	snap, err := p.sources.Build(ctx)
 	if err != nil {
+		p.recordStatus(err)
+		return err
+	}
+	if err := p.fillCaches(snap); err != nil {
 		p.recordStatus(err)
 		return err
 	}
@@ -270,6 +306,75 @@ func (p *Pipeline) Build(ctx context.Context) error {
 	}
 	p.recordStatus(nil)
 	return nil
+}
+
+// fillCaches populates the cross-build-cached fields on the snapshot:
+// PostHTML (via mdCache, keyed by post body hash) and Templates (via
+// tplCache, keyed by the concatenated hash of the three theme template
+// files). Called from Build under p.mu so the caches don't need
+// independent synchronization.
+func (p *Pipeline) fillCaches(snap *Snapshot) error {
+	// Post markdown.
+	snap.PostHTML = make(map[string]string, len(snap.Posts))
+	seen := make(map[string]struct{}, len(snap.Posts))
+	for _, post := range snap.Posts {
+		bodyHash := sha256Hex([]byte(post.Body))
+		seen[post.ID] = struct{}{}
+		if entry, ok := p.mdCache[post.ID]; ok && entry.BodyHash == bodyHash {
+			snap.PostHTML[post.ID] = entry.HTML
+			continue
+		}
+		html, err := post.RenderHTML()
+		if err != nil {
+			return fmt.Errorf("render markdown %s: %w", post.ID, err)
+		}
+		snap.PostHTML[post.ID] = html
+		p.mdCache[post.ID] = mdCacheEntry{BodyHash: bodyHash, HTML: html}
+	}
+	// Drop cache entries for posts that no longer exist so the cache
+	// can't grow unbounded over a long-running process that creates
+	// and deletes many drafts.
+	for id := range p.mdCache {
+		if _, ok := seen[id]; !ok {
+			delete(p.mdCache, id)
+		}
+	}
+
+	// Templates. Hash the three template file bytes; if the hash
+	// matches the prior build's, reuse the parse.
+	tplHash, err := themeTemplateHash(snap.Theme.FS)
+	if err != nil {
+		return fmt.Errorf("hash theme templates: %w", err)
+	}
+	if p.tplCache != nil && p.tplCache.hash == tplHash {
+		snap.Templates = p.tplCache.set
+	} else {
+		set, err := loadTemplates(snap.Theme.FS, themeAssetURL(snap))
+		if err != nil {
+			return fmt.Errorf("load templates: %w", err)
+		}
+		snap.Templates = set
+		p.tplCache = &tplCacheEntry{hash: tplHash, set: set}
+	}
+	return nil
+}
+
+// themeTemplateHash returns the sha256 of the concatenated bytes of
+// the three required template files. The order is fixed; an
+// equivalent hash means an equivalent parse.
+func themeTemplateHash(themeFS fs.FS) (string, error) {
+	h := sha256.New()
+	for _, name := range []string{"base.liquid", "index.liquid", "post.liquid"} {
+		body, err := fs.ReadFile(themeFS, name)
+		if err != nil {
+			return "", err
+		}
+		h.Write([]byte(name))
+		h.Write([]byte{0})
+		h.Write(body)
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (p *Pipeline) recordStatus(err error) {

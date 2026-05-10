@@ -340,31 +340,78 @@ func TestPipeline_ThemeFSReloadsEveryBuild(t *testing.T) {
 	}
 }
 
-func TestPipeline_PostHTMLPrerenderedOnce(t *testing.T) {
-	// snap.PostHTML must be populated and used by the HTML stages —
-	// each post body should hit goldmark exactly once per build,
-	// regardless of how many stages reference it.
+func TestPipeline_PostHTMLCachedAcrossBuilds(t *testing.T) {
+	// Editing one post in a corpus of N must run goldmark exactly
+	// once on the next build — for the post that changed. The
+	// untouched posts come from the markdown cache.
+	//
+	// We can't easily count goldmark calls without instrumentation,
+	// so the contract is asserted indirectly: after the first build,
+	// p.mdCache holds an entry for each post whose body hash matches
+	// what was rendered. Editing a post invalidates exactly one
+	// entry; the rest survive untouched (same pointer is reused via
+	// the cache hit path).
 	p, posts, _ := newTestPipeline(t)
-	posts.Create("Hello", "body **bold**", nil)
+	a, _ := posts.Create("First", "body one", nil)
+	b, _ := posts.Create("Second", "body two", nil)
 	if err := p.Build(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// Indirect assertion: confirm the snapshot fixture is actually
-	// being consumed by examining the rendered HTML — bold survives
-	// goldmark, so its presence proves the prerender ran. Direct
-	// counting would require touching internals; this is the
-	// behavior we care about.
-	snap, err := p.sources.Build(context.Background())
-	if err != nil {
+	if len(p.mdCache) != 2 {
+		t.Fatalf("mdCache size after first build = %d, want 2", len(p.mdCache))
+	}
+	beforeA := p.mdCache[a.ID]
+	beforeB := p.mdCache[b.ID]
+
+	// Edit only post B. Cache entry for A must be byte-identical
+	// (same pointer to the same string is fine; we compare values).
+	if _, err := posts.Update(b.ID, b.Title, "body two — edited", b.Tags); err != nil {
 		t.Fatal(err)
 	}
-	posts.Reload()
-	all := posts.Recent(0)
-	if len(all) != 1 {
-		t.Fatalf("expected 1 post, got %d", len(all))
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
 	}
-	if got, ok := snap.PostHTML[all[0].ID]; !ok || !strings.Contains(got, "<strong>bold</strong>") {
-		t.Errorf("PostHTML[%s]=%q (ok=%v); want pre-rendered HTML containing <strong>bold</strong>", all[0].ID, got, ok)
+	if got := p.mdCache[a.ID]; got != beforeA {
+		t.Errorf("post A's cache entry was rewritten despite no edit: %+v vs %+v", beforeA, got)
+	}
+	if got := p.mdCache[b.ID]; got == beforeB {
+		t.Errorf("post B's cache entry survived an edit: %+v", got)
+	}
+	if !strings.Contains(p.mdCache[b.ID].HTML, "edited") {
+		t.Errorf("post B's cache entry missing post-edit content: %+v", p.mdCache[b.ID])
+	}
+
+	// Deleting a post must purge its cache entry — otherwise a long-
+	// running process accumulates cruft for every published-then-
+	// deleted post.
+	if err := posts.Delete(a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, still := p.mdCache[a.ID]; still {
+		t.Errorf("deleted post's cache entry leaked: %+v", p.mdCache[a.ID])
+	}
+}
+
+func TestPipeline_TemplateCacheReuseAcrossBuilds(t *testing.T) {
+	// Two builds with the same theme bytes must reuse the same
+	// parsed templateSet — the cache hit is observable via pointer
+	// identity on p.tplCache.set.
+	p, _, _ := newTestPipeline(t)
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first := p.tplCache
+	if first == nil {
+		t.Fatal("tplCache not populated after first build")
+	}
+	if err := p.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if p.tplCache != first {
+		t.Errorf("tplCache replaced despite no template change: prev=%p now=%p", first, p.tplCache)
 	}
 }
 

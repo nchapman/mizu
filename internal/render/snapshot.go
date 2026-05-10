@@ -162,38 +162,27 @@ func (s *SnapshotSources) Build(ctx context.Context) (*Snapshot, error) {
 		return nil, fmt.Errorf("walk theme assets: %w", err)
 	}
 
-	posts := s.Posts.Recent(0)
-	postHTML := make(map[string]string, len(posts))
-	for _, p := range posts {
-		html, err := p.RenderHTML()
-		if err != nil {
-			return nil, fmt.Errorf("render markdown %s: %w", p.ID, err)
-		}
-		postHTML[p.ID] = html
-	}
-
+	// Snapshot is returned without PostHTML or Templates populated.
+	// The pipeline fills those via fillCaches so it can reuse parsed
+	// templates and rendered post markdown across builds — both of
+	// which are expensive to redo from scratch and cheap to dedupe by
+	// content hash.
 	snap := &Snapshot{
 		Site:      cfg.Site,
 		BaseURL:   baseURL,
 		Theme:     activeTheme,
-		Posts:     posts,
+		Posts:     s.Posts.Recent(0),
 		Drafts:    s.Posts.ListDrafts(),
 		Mentions:  mentions,
 		Media:     media,
 		DraftSalt: s.DraftSalt,
 		Assets:    assets,
-		PostHTML:  postHTML,
 		ThemeData: map[string]any{
 			"name":     activeTheme.Name,
 			"version":  activeTheme.Version,
 			"settings": activeTheme.Settings,
 		},
 	}
-	tpl, err := loadTemplates(activeTheme.FS, themeAssetURL(snap))
-	if err != nil {
-		return nil, fmt.Errorf("load templates: %w", err)
-	}
-	snap.Templates = tpl
 	return snap, nil
 }
 

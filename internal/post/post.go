@@ -93,16 +93,31 @@ func (p *Post) Excerpt(max int) string {
 // everything lives in memory. Drafts and published posts are tracked
 // in separate maps because they have separate URL spaces and lifecycle
 // rules — a draft has no public URL until it's published.
+//
+// Reload caches per-file mtimes so a no-change reload (the common case
+// when a watcher fires for an unrelated tree) skips parsing entirely.
+// At a thousand posts that's the difference between ~50 ms of YAML
+// work and a handful of stat syscalls.
 type Store struct {
 	dir      string // posts directory
 	draftDir string
 
-	mu       sync.RWMutex
-	byID     map[string]*Post
-	bySlug   map[string]*Post // key: "YYYY/MM/DD/slug" — articles only
-	order    []*Post          // newest first
-	drafts   map[string]*Draft
-	draftIdx []*Draft // newest-Created first
+	mu         sync.RWMutex
+	byID       map[string]*Post
+	bySlug     map[string]*Post // key: "YYYY/MM/DD/slug" — articles only
+	order      []*Post          // newest first
+	drafts     map[string]*Draft
+	draftIdx   []*Draft // newest-Created first
+	postFiles  map[string]fileCache
+	draftFiles map[string]fileCache
+}
+
+// fileCache pins the mtime + parsed value for a single .md so reload
+// can stat-and-skip when nothing changed.
+type fileCache struct {
+	modTime time.Time
+	post    *Post  // populated for posts dir
+	draft   *Draft // populated for drafts dir
 }
 
 func slugKey(p *Post) string {
@@ -138,9 +153,12 @@ func (s *Store) Reload() error {
 // reload re-reads everything from disk under the write lock. The
 // disk reads happen inside the lock so a concurrent Create/Update/
 // Publish can't write to the old maps and then have its insert
-// silently dropped when reload swaps in fresh ones. Cost: writers
-// and readers block while reload runs. Acceptable at single-user
-// scale (≤hundreds of posts → tens of milliseconds).
+// silently dropped when reload swaps in fresh ones.
+//
+// Files whose mtime matches the last reload's snapshot are reused
+// without re-parsing. At single-user scale even a full re-parse runs
+// in tens of ms; the cache mostly saves work when a no-op signal
+// fires (e.g. a media upload triggers reload but no .md changed).
 func (s *Store) reload() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -152,14 +170,26 @@ func (s *Store) reload() error {
 	byID := make(map[string]*Post)
 	bySlug := make(map[string]*Post)
 	var order []*Post
+	newCache := make(map[string]fileCache, len(entries))
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
 		}
-		p, err := readFile(filepath.Join(s.dir, e.Name()))
+		info, err := e.Info()
 		if err != nil {
-			return fmt.Errorf("read %s: %w", e.Name(), err)
+			return fmt.Errorf("stat %s: %w", e.Name(), err)
 		}
+		modTime := info.ModTime()
+		var p *Post
+		if cached, ok := s.postFiles[e.Name()]; ok && cached.post != nil && cached.modTime.Equal(modTime) {
+			p = cached.post
+		} else {
+			p, err = readFile(filepath.Join(s.dir, e.Name()))
+			if err != nil {
+				return fmt.Errorf("read %s: %w", e.Name(), err)
+			}
+		}
+		newCache[e.Name()] = fileCache{modTime: modTime, post: p}
 		byID[p.ID] = p
 		if !p.IsNote() {
 			bySlug[slugKey(p)] = p
@@ -168,7 +198,7 @@ func (s *Store) reload() error {
 	}
 	sort.Slice(order, func(i, j int) bool { return order[i].Date.After(order[j].Date) })
 
-	drafts, draftIdx, err := s.loadDrafts()
+	drafts, draftIdx, draftCache, err := s.loadDrafts()
 	if err != nil {
 		return err
 	}
@@ -178,32 +208,46 @@ func (s *Store) reload() error {
 	s.order = order
 	s.drafts = drafts
 	s.draftIdx = draftIdx
+	s.postFiles = newCache
+	s.draftFiles = draftCache
 	return nil
 }
 
-func (s *Store) loadDrafts() (map[string]*Draft, []*Draft, error) {
+func (s *Store) loadDrafts() (map[string]*Draft, []*Draft, map[string]fileCache, error) {
 	entries, err := os.ReadDir(s.draftDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return map[string]*Draft{}, nil, nil
+			return map[string]*Draft{}, nil, map[string]fileCache{}, nil
 		}
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	byID := make(map[string]*Draft)
 	var order []*Draft
+	newCache := make(map[string]fileCache, len(entries))
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
 		}
-		d, err := readDraftFile(filepath.Join(s.draftDir, e.Name()))
+		info, err := e.Info()
 		if err != nil {
-			return nil, nil, fmt.Errorf("read draft %s: %w", e.Name(), err)
+			return nil, nil, nil, fmt.Errorf("stat draft %s: %w", e.Name(), err)
 		}
+		modTime := info.ModTime()
+		var d *Draft
+		if cached, ok := s.draftFiles[e.Name()]; ok && cached.draft != nil && cached.modTime.Equal(modTime) {
+			d = cached.draft
+		} else {
+			d, err = readDraftFile(filepath.Join(s.draftDir, e.Name()))
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("read draft %s: %w", e.Name(), err)
+			}
+		}
+		newCache[e.Name()] = fileCache{modTime: modTime, draft: d}
 		byID[d.ID] = d
 		order = append(order, d)
 	}
 	sort.Slice(order, func(i, j int) bool { return order[i].Created.After(order[j].Created) })
-	return byID, order, nil
+	return byID, order, newCache, nil
 }
 
 func (s *Store) Recent(limit int) []*Post {
