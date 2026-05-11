@@ -43,21 +43,26 @@ type Server struct {
 }
 
 // TLS controls automatic HTTPS via CertMagic. When Enabled is false the
-// binary serves plain HTTP on Server.Addr (the legacy behavior). When
-// enabled, the binary binds Addr (HTTPS) and HTTPAddr (ACME challenge +
-// redirect) and obtains certificates from Let's Encrypt for Domains.
+// binary serves plain HTTP on Server.Addr. When enabled, the binary
+// additionally binds Addr for HTTPS and grows ACME challenge + redirect
+// behavior on the existing plain-HTTP listener.
+//
+// Addr is an internal port: in the standard Docker deployment the host
+// maps 443 -> Addr (e.g. :8443) so the container can run unprivileged
+// without CAP_NET_BIND_SERVICE. ACME HTTP-01 challenges and the HTTP
+// to HTTPS redirect ride on Server.Addr (internally :8080, host-mapped
+// to :80) -- there is no separate :80 listener inside the container.
 //
 // Email is required by the ACME terms of service. Staging swaps in the
 // Let's Encrypt staging endpoint, which has higher rate limits and
-// issues certs that browsers don't trust — useful for end-to-end
+// issues certs that browsers don't trust -- useful for end-to-end
 // testing without burning the production rate-limit budget.
 type TLS struct {
-	Enabled  bool     `yaml:"enabled"`
-	Domains  []string `yaml:"domains"`
-	Email    string   `yaml:"email"`
-	Addr     string   `yaml:"addr"`
-	HTTPAddr string   `yaml:"http_addr"`
-	Staging  bool     `yaml:"staging"`
+	Enabled bool     `yaml:"enabled"`
+	Domains []string `yaml:"domains"`
+	Email   string   `yaml:"email"`
+	Addr    string   `yaml:"addr"`
+	Staging bool     `yaml:"staging"`
 }
 
 type Paths struct {
@@ -189,10 +194,7 @@ func (c *Config) ApplyDefaults() {
 		c.Paths.DB = filepath.Join(c.Paths.State, "mizu.db")
 	}
 	if c.Server.TLS.Addr == "" {
-		c.Server.TLS.Addr = ":443"
-	}
-	if c.Server.TLS.HTTPAddr == "" {
-		c.Server.TLS.HTTPAddr = ":80"
+		c.Server.TLS.Addr = ":8443"
 	}
 	if c.Theme.Name == "" {
 		c.Theme.Name = "default"

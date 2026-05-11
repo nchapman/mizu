@@ -94,8 +94,8 @@ paths:
 	if c.Paths.Certs != filepath.Join(dir, "state", "certs") {
 		t.Errorf("default certs=%q", c.Paths.Certs)
 	}
-	if c.Server.TLS.Addr != ":443" || c.Server.TLS.HTTPAddr != ":80" {
-		t.Errorf("default tls addrs: %q / %q", c.Server.TLS.Addr, c.Server.TLS.HTTPAddr)
+	if c.Server.TLS.Addr != ":8443" {
+		t.Errorf("default tls addr=%q, want :8443", c.Server.TLS.Addr)
 	}
 	if c.Limits.ReadHeaderTimeout != 10*time.Second {
 		t.Errorf("default read_header_timeout=%v", c.Limits.ReadHeaderTimeout)

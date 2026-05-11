@@ -32,32 +32,36 @@ type TLSStatus struct {
 	Error string `json:"error,omitempty"`
 }
 
-// TLSManager owns the certmagic.Config and the two listeners (HTTPS +
-// ACME-challenge/redirect). It can be brought up at boot (if the
-// loaded config has tls.enabled = true) or live from the setup wizard
-// via Enable.
+// TLSManager owns the certmagic.Config and the HTTPS listener. It can
+// be brought up at boot (if the loaded config has tls.enabled = true)
+// or live from the setup wizard via Enable.
 //
-// The plain-HTTP listener bound on cfg.Server.Addr (e.g. :8080) is
-// left running in parallel: the wizard finishes over that listener,
-// and once TLS is up the SPA redirects clients to https://.
+// There is no separate :80 listener inside the container. ACME HTTP-01
+// challenges and the HTTP→HTTPS redirect ride on the always-on plain
+// listener that main.go owns on cfg.Server.Addr (an internal port,
+// host-mapped to :80 by Docker). When Enable succeeds, the manager
+// hands main.go a wrapped handler that adds ACME and redirect behavior
+// in front of the chi router; main.go installs it via the callback
+// registered with OnPlainHandlerChange.
 type TLSManager struct {
 	cfg     *config.Config
 	handler http.Handler
 	wg      *sync.WaitGroup
 
-	mu        sync.Mutex
-	state     string
-	lastErr   error
-	onEnabled func(domains []string, email string, staging bool)
+	mu               sync.Mutex
+	state            string
+	lastErr          error
+	onEnabled        func(domains []string, email string, staging bool)
+	setPlainHandler  func(http.Handler)
+	plainHandlerBase http.Handler
 
 	// magic is retained on the struct so its certificate cache + the
 	// maintenance goroutine the cache spawns stay alive for the process
 	// lifetime. Renewals fire automatically off that goroutine — there's
 	// nothing else to schedule.
-	magic    *certmagic.Config
-	cache    *certmagic.Cache
-	main     *http.Server
-	redirect *http.Server
+	magic *certmagic.Config
+	cache *certmagic.Cache
+	main  *http.Server
 }
 
 // NewTLSManager constructs an idle manager. handler is the same chi
@@ -88,6 +92,17 @@ func (m *TLSManager) OnEnabled(fn func(domains []string, email string, staging b
 	m.onEnabled = fn
 }
 
+// OnPlainHandlerChange registers the callback the manager fires to
+// swap the plain-HTTP listener's handler in main.go. base is the
+// untreated chi router used when TLS is off; the manager wraps it with
+// ACME + redirect when Enable succeeds. Must be called before Enable.
+func (m *TLSManager) OnPlainHandlerChange(base http.Handler, fn func(http.Handler)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.plainHandlerBase = base
+	m.setPlainHandler = fn
+}
+
 // EnableFromConfig brings TLS up using whatever's already in cfg.
 // Used at boot when the operator has TLS pre-configured. Returns
 // after listeners are bound; issuance runs in the background via
@@ -97,10 +112,11 @@ func (m *TLSManager) EnableFromConfig(ctx context.Context) error {
 	return m.Enable(ctx, t.Domains, t.Email, t.Staging)
 }
 
-// Enable binds the HTTPS + ACME listeners and hands the domain off to
-// CertMagic. CertMagic handles DNS-not-ready, transient ACME errors,
-// rate-limit backoff, and renewals on its own — we just need to start
-// it once and stay out of the way.
+// Enable binds the HTTPS listener, wraps the plain-HTTP handler with
+// ACME-challenge + redirect-to-HTTPS behavior, and hands the domain
+// off to CertMagic. CertMagic handles DNS-not-ready, transient ACME
+// errors, rate-limit backoff, and renewals on its own — we just need
+// to start it once and stay out of the way.
 //
 // Returns synchronously after listeners are bound. Cert issuance is
 // asynchronous; subscribe to Status() to watch the state transition
@@ -122,31 +138,24 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 		// instead of erroring loudly. Fail fast.
 		return errors.New("tls: handler not set; call SetHandler before Enable")
 	}
+	if m.setPlainHandler == nil || m.plainHandlerBase == nil {
+		m.mu.Unlock()
+		return errors.New("tls: plain handler swap not wired; call OnPlainHandlerChange before Enable")
+	}
 	if m.state == "issuing" || m.state == "ready" {
 		m.mu.Unlock()
 		return errors.New("tls: already enabled")
 	}
 	handler := m.handler
+	plainBase := m.plainHandlerBase
+	setPlain := m.setPlainHandler
 	m.state = "issuing"
 	m.lastErr = nil
 	m.mu.Unlock()
 
 	addr := m.cfg.Server.TLS.Addr
 	if addr == "" {
-		addr = ":443"
-	}
-	httpAddr := m.cfg.Server.TLS.HTTPAddr
-	if httpAddr == "" {
-		httpAddr = ":80"
-	}
-	// Catch the most common boot-time misconfig early: the plain HTTP
-	// listener can't share a port with the TLS or ACME listener. Without
-	// this the conflict would surface as an "address already in use"
-	// from inside a goroutine and the UI would just see state="error"
-	// with a cryptic message.
-	if m.cfg.Server.Addr == addr || m.cfg.Server.Addr == httpAddr {
-		m.recordError(fmt.Errorf("tls: server.addr (%s) conflicts with the TLS listener; move the plain HTTP listener to a different port", m.cfg.Server.Addr))
-		return fmt.Errorf("tls: server.addr (%s) overlaps the TLS port; pick a different server.addr (e.g. :8080)", m.cfg.Server.Addr)
+		addr = ":8443"
 	}
 
 	ca := certmagic.LetsEncryptProductionCA
@@ -212,22 +221,17 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 		IdleTimeout:       m.cfg.Limits.IdleTimeout,
 		MaxHeaderBytes:    m.cfg.Limits.MaxHeaderBytes,
 	}
-	redirect := &http.Server{
-		Addr:              httpAddr,
-		Handler:           buildHTTPHandler(magic, domains),
-		ReadHeaderTimeout: m.cfg.Limits.ReadHeaderTimeout,
-		ReadTimeout:       m.cfg.Limits.ReadTimeout,
-		WriteTimeout:      m.cfg.Limits.WriteTimeout,
-		IdleTimeout:       m.cfg.Limits.IdleTimeout,
-		MaxHeaderBytes:    m.cfg.Limits.MaxHeaderBytes,
-	}
 
 	m.mu.Lock()
 	m.magic = magic
 	m.cache = cache
 	m.main = mainSrv
-	m.redirect = redirect
 	m.mu.Unlock()
+
+	// Install the wrapped handler on the plain listener BEFORE the
+	// HTTPS listener starts so ACME HTTP-01 challenges (which Let's
+	// Encrypt fires inside ManageAsync) hit the challenge handler.
+	setPlain(buildPlainHandler(magic, domains, plainBase))
 
 	m.wg.Add(1)
 	go func() {
@@ -238,29 +242,18 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 			m.recordError(fmt.Errorf("https listener: %w", err))
 		}
 	}()
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		log.Printf("mizu listening on %s (http: ACME + redirect)", redirect.Addr)
-		if err := redirect.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("http redirect server: %v", err)
-			m.recordError(fmt.Errorf("http redirect listener: %w", err))
-		}
-	}()
 
 	if err := magic.ManageAsync(ctx, domains); err != nil {
-		// ManageAsync failed but the two listener goroutines are
-		// already running on :80 and :443. Releasing those ports here
-		// matters: without the shutdown, a Retry from the UI would
-		// call Enable again and fail with "address already in use"
-		// because the prior listeners still hold the sockets.
+		// ManageAsync failed but the HTTPS listener goroutine is
+		// already running. Shut it down so a Retry from the UI can call
+		// Enable again without "address already in use", and swap the
+		// plain handler back to the bare router.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = mainSrv.Shutdown(shutdownCtx)
-		_ = redirect.Shutdown(shutdownCtx)
 		cancel()
+		setPlain(plainBase)
 		m.mu.Lock()
 		m.main = nil
-		m.redirect = nil
 		m.mu.Unlock()
 		m.recordError(err)
 		return err
@@ -298,16 +291,13 @@ func (m *TLSManager) Status() TLSStatus {
 	return s
 }
 
-// Shutdown stops the redirect server, the HTTPS server, and the
-// CertMagic cache's maintenance goroutine. The process-wide WaitGroup
-// drains the listener goroutines; this just signals them.
+// Shutdown stops the HTTPS server and the CertMagic cache's maintenance
+// goroutine. The process-wide WaitGroup drains the listener goroutine;
+// this just signals it.
 func (m *TLSManager) Shutdown(ctx context.Context) {
 	m.mu.Lock()
-	main, redirect, cache := m.main, m.redirect, m.cache
+	main, cache := m.main, m.cache
 	m.mu.Unlock()
-	if redirect != nil {
-		_ = redirect.Shutdown(ctx)
-	}
 	if main != nil {
 		_ = main.Shutdown(ctx)
 	}
@@ -316,24 +306,31 @@ func (m *TLSManager) Shutdown(ctx context.Context) {
 	}
 }
 
-// buildHTTPHandler returns the handler for port 80: it serves ACME
-// HTTP-01 challenges and 308-redirects everything else to the
-// canonical HTTPS URL. The Host header is validated against the
-// configured domain list to avoid reflecting an attacker-supplied
-// hostname back as an open redirect.
-func buildHTTPHandler(magic *certmagic.Config, domains []string) http.Handler {
+// buildPlainHandler wraps the bare router with ACME HTTP-01 challenge
+// passthrough and HTTP→HTTPS redirect for requests whose Host matches
+// the configured domains. Requests with any other Host (raw IP, LAN
+// hostnames) fall through to the base handler so:
+//   - the wizard session that just enabled HTTPS doesn't 308 itself to a
+//     domain that hasn't propagated yet,
+//   - LAN clients hitting the box by IP keep working,
+//   - and the Host header is never reflected into the redirect target
+//     (an attacker-supplied Host gets passed to the chi router instead).
+func buildPlainHandler(magic *certmagic.Config, domains []string, base http.Handler) http.Handler {
 	allowed := make(map[string]struct{}, len(domains))
 	for _, d := range domains {
 		allowed[strings.ToLower(strings.TrimSuffix(d, "."))] = struct{}{}
 	}
-	redirect := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	core := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
 		if i := strings.IndexByte(host, ':'); i >= 0 {
 			host = host[:i]
 		}
 		host = strings.ToLower(strings.TrimSuffix(host, "."))
 		if _, ok := allowed[host]; !ok {
-			http.NotFound(w, r)
+			// Not a configured domain — pass through to the app. This
+			// preserves bootstrap and LAN access without ever sending a
+			// caller-supplied Host into a redirect.
+			base.ServeHTTP(w, r)
 			return
 		}
 		w.Header().Set("Connection", "close")
@@ -341,8 +338,8 @@ func buildHTTPHandler(magic *certmagic.Config, domains []string) http.Handler {
 	})
 	for _, iss := range magic.Issuers {
 		if am, ok := iss.(*certmagic.ACMEIssuer); ok {
-			return am.HTTPChallengeHandler(redirect)
+			return am.HTTPChallengeHandler(core)
 		}
 	}
-	return redirect
+	return core
 }

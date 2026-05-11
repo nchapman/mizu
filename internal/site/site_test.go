@@ -95,8 +95,7 @@ func TestSite_UnconfiguredServesPlaceholderHTML(t *testing.T) {
 	if strings.Contains(w.Body.String(), "real site") {
 		t.Error("unconfigured site leaked the baked homepage")
 	}
-	if !strings.Contains(w.Body.String(), "awaiting setup") &&
-		!strings.Contains(strings.ToLower(w.Body.String()), "being set up") {
+	if !strings.Contains(strings.ToLower(w.Body.String()), "under construction") {
 		t.Errorf("body=%s", w.Body.String())
 	}
 	if got := w.Header().Get("X-Robots-Tag"); !strings.Contains(got, "noindex") {

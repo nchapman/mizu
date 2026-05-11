@@ -96,31 +96,34 @@ func TestSetup_RefusesAfterWindowExpires(t *testing.T) {
 	}
 }
 
-func TestWindow_FirstBootPersistsAcrossReopen(t *testing.T) {
+func TestWindow_ResetsOnRestart(t *testing.T) {
+	// The window is intentionally in-memory: a process restart reopens
+	// it. Recovery for an operator who misses the window is to restart
+	// the server, which is a strong "I have host access" signal — and
+	// an attacker who can restart already has root and wins anyway.
 	path := filepath.Join(t.TempDir(), "test.db")
 	conn, err := db.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(conn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w1, _ := s.Window(context.Background())
-	_ = conn.Close()
+	defer conn.Close()
 
-	conn2, err := db.Open(path)
+	s1, err := New(conn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close()
-	s2, err := New(conn2)
+	w1, _ := s1.Window(context.Background())
+
+	// Simulate a restart by walking forward past the original window
+	// and constructing a new Service over the same DB.
+	time.Sleep(2 * time.Millisecond)
+	s2, err := New(conn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	w2, _ := s2.Window(context.Background())
-	if !w2.ExpiresAt.Equal(w1.ExpiresAt) {
-		t.Errorf("first_boot_at not stable across reopen: %v vs %v", w1.ExpiresAt, w2.ExpiresAt)
+	if !w2.ExpiresAt.After(w1.ExpiresAt) {
+		t.Errorf("window did not advance across restart: %v vs %v", w1.ExpiresAt, w2.ExpiresAt)
 	}
 }
 

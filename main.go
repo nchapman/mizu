@@ -159,7 +159,13 @@ func main() {
 	// TLSController interface so the wizard's enable-tls handler can
 	// flip the runner without main.go re-wiring. CertMagic handles all
 	// retry / backoff / DNS-not-ready logic on its own — we just need
-	// to call Enable once.
+	// to call Enable once. The container always binds the plain
+	// listener on cfg.Server.Addr (internal port, host-mapped to :80);
+	// there is no separate internal :80 listener. Once TLS is enabled,
+	// the TLSManager swaps the plain handler in place (via the
+	// SwapHandler below) to add ACME-challenge passthrough and
+	// HTTP→HTTPS redirect behavior, and adds its own HTTPS listener on
+	// cfg.Server.TLS.Addr (host-mapped to :443).
 	tlsMgr := mizuserver.NewTLSManager(nil, cfg, &bg)
 	adminSrv := admin.New(ctx, cfg, *cfgPath, posts, feedSvc, poller, authSvc, mediaStore, wmSvc, ipCache, tlsMgr, adminDistFS())
 	// Persist tls.* to config.yml only once CertMagic fires
@@ -200,9 +206,14 @@ func main() {
 	siteSrv := site.New(cfg, wmSvc, cfg.Paths.Public, authSvc.Configured)
 	siteSrv.Routes(r)
 
+	// The plain listener serves through a SwapHandler so the TLS
+	// manager can wrap the chi router with ACME-challenge + redirect
+	// behavior in place once HTTPS is enabled, without tearing down
+	// the listener that the wizard's own session is sitting on.
+	plain := mizuserver.NewSwapHandler(r)
 	srv := &http.Server{
 		Addr:              cfg.Server.Addr,
-		Handler:           r,
+		Handler:           plain,
 		ReadHeaderTimeout: cfg.Limits.ReadHeaderTimeout,
 		ReadTimeout:       cfg.Limits.ReadTimeout,
 		WriteTimeout:      cfg.Limits.WriteTimeout,
@@ -210,19 +221,15 @@ func main() {
 		MaxHeaderBytes:    cfg.Limits.MaxHeaderBytes,
 	}
 
-	// Hand the router to the TLS manager now that it exists. The
-	// plain-HTTP listener on srv keeps running regardless; TLSManager
-	// adds the :80/:443 listeners on top when Enable fires (either now
-	// from config or later from the wizard).
 	tlsMgr.SetHandler(r)
+	tlsMgr.OnPlainHandlerChange(r, plain.Set)
 
-	// Plain listener always runs — it's the bootstrap path the wizard
-	// uses (operator visits http://host:8080/admin), and also a LAN
-	// fallback once TLS is up.
+	// Plain listener always runs. Docker maps host :80 -> this internal
+	// port, so the operator types http://<host>/ (no port number).
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
-		log.Printf("mizu listening on %s", cfg.Server.Addr)
+		log.Printf("mizu listening on %s (plain http; docker maps host :80 -> here)", cfg.Server.Addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("http server: %v", err)
 		}

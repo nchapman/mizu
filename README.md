@@ -22,17 +22,18 @@ make build
 ```
 
 That's it. The first time you boot with no `config.yml` on disk, mizu runs in
-fresh-install mode: open `http://<this-host>:8080/admin` in a browser and the
-setup wizard walks you through account creation, site basics, an optional DNS
-preflight, and optional Let's Encrypt issuance. The wizard writes `config.yml`
-on its way through.
+fresh-install mode: open `http://<this-host>:8080/admin` in a browser (the
+binary, when run directly, listens on port 8080 — the Docker image below
+maps host :80 to it) and the setup wizard walks you through account creation,
+site basics, an optional DNS preflight, and optional Let's Encrypt issuance.
+The wizard writes `config.yml` on its way through.
 
 **First-run claim window.** The wizard accepts the first account creation for
-30 minutes after the binary first boots with zero users. After that the wizard
-refuses to claim the instance — a guardrail against a stranger on the open
-internet racing you to setup. If you miss the window, stop the binary, delete
-`state/mizu.db`, and restart; posts, drafts, and media live on disk and are
-unaffected.
+one hour after the server starts. After that the wizard refuses to claim the
+instance — a guardrail against a stranger on the open internet racing you to
+setup. If you miss the window, restart the server: the window resets on every
+process start, and host-restart access is a strong "I'm the operator" signal
+that costs an attacker who'd already need root nothing extra.
 
 For advanced deployments — hand-tuned ports, paths, rate limits — start from
 `config.example.yml` and pass `--config`.
@@ -55,7 +56,8 @@ the test suite, and a full build. Run it before committing.
 ```sh
 docker build -t mizu .
 docker run -d \
-  -p 8080:8080 \
+  -p 80:8080 \
+  -p 443:8443 \
   -v $PWD/data/content:/app/content \
   -v $PWD/data/media:/app/media \
   -v $PWD/data/cache:/app/cache \
@@ -77,7 +79,7 @@ polls GHCR hourly and auto-updates on new stable tags).
 Paste the contents of `deploy/cloud-init.yaml` as the user-data on any
 cloud-init-supporting VPS (Hetzner, DigitalOcean, Oracle ARM, Lightsail,
 etc.). Once it boots, point your domain's A record at the VPS IP and
-open `http://<that-ip>:8080/admin` — the setup wizard handles the rest.
+open `http://<that-ip>/admin` — the setup wizard handles the rest.
 
 ## Configuration
 

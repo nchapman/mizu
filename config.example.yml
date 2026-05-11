@@ -12,21 +12,25 @@ site:
   description: A mizu-powered site.
 
 server:
+  # addr is the internal port the plain-HTTP listener binds. In the
+  # standard Docker deployment the host maps :80 -> this port. Pick
+  # something above 1024 so the container can run unprivileged.
   addr: ":8080"
   # tls:
   #   enabled: true
   #   domains: [mizu.fyi]
   #   email: ops@mizu.fyi
-  #   addr: ":443"
-  #   http_addr: ":80"
+  #   addr: ":8443"
   #   staging: false
   # ^ Optional. Easiest path: skip this block, run the wizard's
   # "Enable HTTPS" step, and the wizard will write it for you. When
   # enabled, mizu obtains certificates from Let's Encrypt automatically
-  # (via CertMagic), serves HTTPS on `addr`, and runs an HTTP listener
-  # on `http_addr` that solves ACME challenges and redirects everything
-  # else to HTTPS. Set staging: true to test against the LE staging
-  # endpoint (untrusted certs, friendlier rate limits) before going live.
+  # (via CertMagic) and serves HTTPS on `addr` (internal port; the
+  # host maps :443 -> here). ACME HTTP-01 challenges and the plain
+  # HTTP -> HTTPS redirect ride on `server.addr` -- there is no
+  # separate :80 listener inside the binary. Set staging: true to
+  # test against the LE staging endpoint (untrusted certs, friendlier
+  # rate limits) before going live.
   #
   # Heads-up: when TLS is on, mizu emits HSTS with includeSubdomains
   # for one year. If you ever serve a sibling subdomain over plain

@@ -16,7 +16,6 @@ import (
 	"log"
 	"net/http"
 	"net/mail"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,21 +39,17 @@ const (
 	maxFailedAttempts = 5
 	lockoutDuration   = 15 * time.Minute
 
-	// SetupWindowDuration is how long after first boot anyone reaching
-	// /admin can claim the instance by creating the first account. The
-	// window is the only first-run safeguard — there is no out-of-band
-	// token to copy. The trade-off: an operator who walks away from a
-	// public IP for over half an hour without finishing setup can be
-	// raced by a stranger who finds the host. For the consumer-grade
-	// "open admin, follow the wizard" flow we accept this; harden by
-	// (a) finishing setup promptly or (b) keeping the host firewalled
-	// off the public internet until you're ready.
-	SetupWindowDuration = 30 * time.Minute
-
-	// firstBootKey is the app_meta key that records when the install
-	// first booted with zero users. Persisted so the window survives
-	// restarts and an attacker can't reset it by triggering a reboot.
-	firstBootKey = "first_boot_at"
+	// SetupWindowDuration is how long after process start anyone
+	// reaching /admin can claim the instance by creating the first
+	// account. The window is the only first-run safeguard — there is
+	// no out-of-band token to copy. The trade-off: an operator who
+	// walks away from a public IP for over an hour without finishing
+	// setup can be raced by a stranger who finds the host. The window
+	// resets on every process restart: a real operator who misses the
+	// window just restarts the server (a strong "I have host access"
+	// signal), and an attacker who can restart the server already has
+	// root and wins anyway.
+	SetupWindowDuration = 1 * time.Hour
 )
 
 var (
@@ -64,7 +59,7 @@ var (
 	ErrInvalidEmail      = errors.New("invalid email address")
 	ErrInvalidLogin      = errors.New("invalid email or password")
 	ErrInvalidPassword   = errors.New("invalid password")
-	ErrSetupWindowClosed = errors.New("setup window has closed; see the README for recovery instructions")
+	ErrSetupWindowClosed = errors.New("setup window has closed; restart the server to reopen it")
 	ErrEmailTaken        = errors.New("email already in use")
 	ErrUserNotFound      = errors.New("user not found")
 	ErrLastUser          = errors.New("cannot delete the last remaining user")
@@ -85,6 +80,12 @@ type User struct {
 // db.W (serialized, immediate-locking).
 type Service struct {
 	db *mizudb.DB
+
+	// firstBootAt is when this process started; the setup window is
+	// open until firstBootAt+SetupWindowDuration. Intentionally
+	// in-memory: a restart resets the window, which is the recovery
+	// path for an operator who misses it.
+	firstBootAt time.Time
 
 	// setupMu serializes Setup() so two concurrent valid first-run
 	// claims can't race past the Window() check and both insert.
@@ -118,46 +119,17 @@ func init() {
 	dummyHash = h
 }
 
-// New constructs a Service over the given DB. If the users table is
-// empty it records the boot time so the time-based claim window opens
-// from this moment. Subsequent boots reuse the original timestamp so
-// an attacker can't reset the window by triggering a reboot.
+// New constructs a Service over the given DB and stamps the start of
+// this process's setup window. The window resets on every restart by
+// design (see SetupWindowDuration).
 func New(db *mizudb.DB) (*Service, error) {
-	s := &Service{db: db, now: time.Now}
-	if err := s.recordFirstBoot(context.Background()); err != nil {
-		return nil, err
-	}
-	return s, nil
-}
-
-// recordFirstBoot writes a first_boot_at marker the first time an
-// unconfigured install boots. INSERT OR IGNORE makes it idempotent —
-// any subsequent boot with the row already present is a no-op.
-// Configured installs skip the write entirely since the window only
-// matters before setup.
-func (s *Service) recordFirstBoot(ctx context.Context) error {
-	configured, err := s.Configured(ctx)
-	if err != nil {
-		return err
-	}
-	if configured {
-		return nil
-	}
-	_, err = s.db.W.ExecContext(ctx,
-		`INSERT INTO app_meta(key, value) VALUES(?, ?)
-		   ON CONFLICT(key) DO NOTHING`,
-		firstBootKey, strconv.FormatInt(s.now().UTC().Unix(), 10),
-	)
-	if err != nil {
-		return fmt.Errorf("record first_boot_at: %w", err)
-	}
-	return nil
+	now := time.Now
+	return &Service{db: db, firstBootAt: now(), now: now}, nil
 }
 
 // Window returns the current state of the first-run claim window.
-// Closed when any user exists, when the window has elapsed since first
-// boot, or when no first-boot marker is recorded (e.g. the row was
-// hand-deleted to reopen setup — that path also clears users).
+// Closed when any user exists or when the window has elapsed since
+// this process started.
 func (s *Service) Window(ctx context.Context) (SetupWindow, error) {
 	configured, err := s.Configured(ctx)
 	if err != nil {
@@ -166,21 +138,7 @@ func (s *Service) Window(ctx context.Context) (SetupWindow, error) {
 	if configured {
 		return SetupWindow{Open: false}, nil
 	}
-	var raw string
-	err = s.db.R.QueryRowContext(ctx,
-		`SELECT value FROM app_meta WHERE key = ?`, firstBootKey,
-	).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return SetupWindow{Open: false}, nil
-	}
-	if err != nil {
-		return SetupWindow{}, fmt.Errorf("read first_boot_at: %w", err)
-	}
-	ts, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return SetupWindow{}, fmt.Errorf("parse first_boot_at %q: %w", raw, err)
-	}
-	expires := time.Unix(ts, 0).UTC().Add(SetupWindowDuration)
+	expires := s.firstBootAt.UTC().Add(SetupWindowDuration)
 	return SetupWindow{Open: s.now().Before(expires), ExpiresAt: expires}, nil
 }
 

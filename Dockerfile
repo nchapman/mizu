@@ -63,23 +63,18 @@ USER mizu
 # Mount these as volumes so user data survives container restarts.
 VOLUME ["/app/content", "/app/media", "/app/cache", "/app/state"]
 
-# 80 + 443 are the production ports: mizu terminates its own TLS via
-# CertMagic, with 80 serving the ACME http-01 challenge plus an HTTPS
-# redirect. 8080 is exposed for non-TLS dev/test setups (see
-# docker-compose.dev.yml). Compose files publish whichever ones apply.
-EXPOSE 80 443 8080
+# 8080 is the always-on plain-HTTP listener (host maps :80 here).
+# 8443 is bound by the in-process TLS manager once HTTPS is enabled
+# (host maps :443 here). Both internal ports are above 1024 so the
+# container runs unprivileged. Compose files publish them as needed.
+EXPOSE 8080 8443
 
 # Liveness check: the public site root is served from the same
 # binary, so a 200 here means the process is up and the site server
-# is responding. Tries :80 first (production TLS-redirect listener)
-# and falls back to :8080 (dev/non-TLS mode) so the same Dockerfile
-# works in both setups without compose having to override.
-# Per-wget `-T 2` connect timeout keeps a half-open port from hanging
-# the probe past the HEALTHCHECK --timeout window, which would otherwise
-# leak wget processes on every interval.
+# is responding. Per-wget `-T 2` connect timeout keeps a half-open
+# port from hanging the probe past the HEALTHCHECK --timeout window.
 HEALTHCHECK --interval=30s --timeout=6s --start-period=10s \
-    CMD wget -qO- -T 2 http://localhost/ >/dev/null 2>&1 || \
-        wget -qO- -T 2 http://localhost:8080/ >/dev/null 2>&1 || exit 1
+    CMD wget -qO- -T 2 http://localhost:8080/ >/dev/null 2>&1 || exit 1
 
 # The container expects a config file at /app/config.yml — the
 # operator can either mount one or copy the example and edit it.

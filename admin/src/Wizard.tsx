@@ -589,9 +589,8 @@ export function SetupWindowClosed() {
       </div>
       <h1 className="mb-2 text-lg font-semibold">Setup window has closed</h1>
       <p className="text-sm text-muted-foreground">
-        For safety, this binary only accepts first-run setup for the first 30
-        minutes after boot. To reopen the window, stop the server, delete the
-        SQLite cache, and restart. See the README for details.
+        For safety, this binary only accepts first-run setup for the first hour
+        after the server starts. Restart the server to reopen the window.
       </p>
     </div>
   );

@@ -13,8 +13,15 @@ import (
 	"github.com/nchapman/mizu/internal/config"
 )
 
-func TestBuildHTTPHandler_RedirectsAllowedHost(t *testing.T) {
-	h := buildHTTPHandler(&certmagic.Config{}, []string{"mizu.fyi"})
+// passthroughBase is the bare app handler buildPlainHandler falls
+// through to for unknown-Host requests. The tests use a sentinel body
+// to assert the fallthrough actually happened.
+var passthroughBase = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	_, _ = w.Write([]byte("base-passthrough"))
+})
+
+func TestBuildPlainHandler_RedirectsAllowedHost(t *testing.T) {
+	h := buildPlainHandler(&certmagic.Config{}, []string{"mizu.fyi"}, passthroughBase)
 	req := httptest.NewRequest("GET", "http://mizu.fyi/notes/abc?x=1", nil)
 	req.Host = "mizu.fyi"
 	w := httptest.NewRecorder()
@@ -28,20 +35,24 @@ func TestBuildHTTPHandler_RedirectsAllowedHost(t *testing.T) {
 	}
 }
 
-func TestBuildHTTPHandler_RejectsUnknownHost(t *testing.T) {
-	h := buildHTTPHandler(&certmagic.Config{}, []string{"mizu.fyi"})
-	// Attacker-controlled Host header — must not be reflected into
-	// the redirect target.
+func TestBuildPlainHandler_FallsThroughForUnknownHost(t *testing.T) {
+	// Attacker-controlled Host header must never be reflected into a
+	// redirect target. Pre-redesign, unknown hosts got a 404; now they
+	// pass through to the base handler so LAN/IP access keeps working.
+	h := buildPlainHandler(&certmagic.Config{}, []string{"mizu.fyi"}, passthroughBase)
 	req := httptest.NewRequest("GET", "http://evil.example/", nil)
 	req.Host = "evil.example"
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 
-	if w.Code != http.StatusNotFound {
-		t.Errorf("code=%d, want 404", w.Code)
+	if w.Code != http.StatusOK {
+		t.Errorf("code=%d, want 200 (fallthrough)", w.Code)
 	}
 	if got := w.Header().Get("Location"); got != "" {
-		t.Errorf("unexpected Location header on rejection: %q", got)
+		t.Errorf("unexpected Location header on fallthrough: %q", got)
+	}
+	if got := w.Body.String(); got != "base-passthrough" {
+		t.Errorf("body=%q, want base-passthrough (proves fallthrough)", got)
 	}
 }
 
@@ -49,8 +60,9 @@ func newTestManager() *TLSManager {
 	cfg := &config.Config{}
 	cfg.ApplyDefaults()
 	var wg sync.WaitGroup
-	// Stub the handler so Enable's nil-handler guard doesn't trip.
 	m := NewTLSManager(http.NotFoundHandler(), cfg, &wg)
+	// Stub the plain-handler swap so Enable's guard doesn't trip.
+	m.OnPlainHandlerChange(http.NotFoundHandler(), func(http.Handler) {})
 	return m
 }
 
@@ -68,18 +80,15 @@ func TestTLSManager_NilHandlerGuard(t *testing.T) {
 	}
 }
 
-func TestTLSManager_EnableRejectsPortConflict(t *testing.T) {
-	m := newTestManager()
-	// Force the plain HTTP listener to overlap the default :443 — the
-	// guard inside Enable should refuse rather than letting the
-	// listener goroutine die mid-bind.
-	m.cfg.Server.Addr = ":443"
+func TestTLSManager_PlainHandlerSwapGuard(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.ApplyDefaults()
+	var wg sync.WaitGroup
+	m := NewTLSManager(http.NotFoundHandler(), cfg, &wg)
+	// Deliberately skip OnPlainHandlerChange.
 	err := m.Enable(t.Context(), []string{"x.example"}, "ops@example.com", true)
-	if err == nil || !strings.Contains(err.Error(), "overlaps the TLS port") {
-		t.Errorf("expected port-conflict guard, got %v", err)
-	}
-	if s := m.Status(); s.State != "error" {
-		t.Errorf("state=%q after conflict, want error", s.State)
+	if err == nil || !strings.Contains(err.Error(), "plain handler swap not wired") {
+		t.Errorf("expected plain-swap guard, got %v", err)
 	}
 }
 
@@ -87,12 +96,12 @@ func TestTLSManager_RecordErrorAfterReadyDoesNotDowngrade(t *testing.T) {
 	m := newTestManager()
 	// Simulate a clean "issuing → ready" arrival from a cert_obtained
 	// event, then have a listener goroutine exit with an error after
-	// the fact (e.g. port 80 wobble). State should stay "ready" so the
-	// UI doesn't flap into a red error banner over a working site.
+	// the fact. State should stay "ready" so the UI doesn't flap into
+	// a red error banner over a working site.
 	m.mu.Lock()
 	m.state = "ready"
 	m.mu.Unlock()
-	m.recordError(errors.New("redirect listener wobbled"))
+	m.recordError(errors.New("https listener wobbled"))
 	s := m.Status()
 	if s.State != "ready" {
 		t.Errorf("state downgraded to %q after ready, want ready", s.State)
@@ -113,8 +122,8 @@ func TestTLSManager_RecordErrorFromIssuingFlipsToError(t *testing.T) {
 	}
 }
 
-func TestBuildHTTPHandler_StripsPortAndCase(t *testing.T) {
-	h := buildHTTPHandler(&certmagic.Config{}, []string{"mizu.fyi"})
+func TestBuildPlainHandler_StripsPortAndCase(t *testing.T) {
+	h := buildPlainHandler(&certmagic.Config{}, []string{"mizu.fyi"}, passthroughBase)
 	req := httptest.NewRequest("GET", "http://Mizu.FYI:8080/x", nil)
 	req.Host = "Mizu.FYI:8080"
 	w := httptest.NewRecorder()
