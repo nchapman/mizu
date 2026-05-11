@@ -110,6 +110,7 @@ export function SettingsView({
 function HTTPSPanel({ status, onChanged }: { status?: TLSStatus; onChanged?: () => void }) {
   const enabled = status?.state === "ready";
   const issuing = status?.state === "issuing";
+  const errored = status?.state === "error";
   const [domain, setDomain] = useState("");
   const [email, setEmail] = useState("");
   const [staging, setStaging] = useState(false);
@@ -176,6 +177,11 @@ function HTTPSPanel({ status, onChanged }: { status?: TLSStatus; onChanged?: () 
           <p className="mb-4 text-sm text-muted-foreground">
             HTTPS isn't enabled yet. Point your domain's A record at this server, verify with the DNS check, then enable Let's Encrypt.
           </p>
+          {errored && status?.error && (
+            <div role="alert" className="mb-3 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+              Last attempt failed: {status.error}. Fix the underlying issue (usually DNS), then enable again.
+            </div>
+          )}
           <div className="space-y-3 rounded-md border border-border bg-card p-4">
             <div className="space-y-1.5">
               <Label htmlFor="https-domain">Domain</Label>

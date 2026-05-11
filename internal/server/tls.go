@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/caddyserver/certmagic"
 
@@ -113,6 +114,14 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 	}
 
 	m.mu.Lock()
+	if m.handler == nil {
+		m.mu.Unlock()
+		// Belt-and-braces guard. If main.go ever forgets to wire
+		// SetHandler before Enable, net/http would silently fall back
+		// to DefaultServeMux and serve a confusing empty 404 over HTTPS
+		// instead of erroring loudly. Fail fast.
+		return errors.New("tls: handler not set; call SetHandler before Enable")
+	}
 	if m.state == "issuing" || m.state == "ready" {
 		m.mu.Unlock()
 		return errors.New("tls: already enabled")
@@ -240,17 +249,41 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 	}()
 
 	if err := magic.ManageAsync(ctx, domains); err != nil {
+		// ManageAsync failed but the two listener goroutines are
+		// already running on :80 and :443. Releasing those ports here
+		// matters: without the shutdown, a Retry from the UI would
+		// call Enable again and fail with "address already in use"
+		// because the prior listeners still hold the sockets.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = mainSrv.Shutdown(shutdownCtx)
+		_ = redirect.Shutdown(shutdownCtx)
+		cancel()
+		m.mu.Lock()
+		m.main = nil
+		m.redirect = nil
+		m.mu.Unlock()
 		m.recordError(err)
 		return err
 	}
 	return nil
 }
 
+// recordError surfaces a failure to the UI. The state transition is
+// asymmetric on purpose: from "off" or "issuing" we flip to "error"
+// (operator needs to intervene), but from "ready" we only update
+// lastErr and log — a transient listener wobble or a renewal-window
+// challenge failure shouldn't downgrade a working install to a red
+// "error" state. If the cert truly stops working the operator will
+// see it in the browser long before this matters, and the next
+// renewal attempt's cert_obtained / cert_failed event will refresh
+// lastErr cleanly.
 func (m *TLSManager) recordError(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.state = "error"
 	m.lastErr = err
+	if m.state != "ready" {
+		m.state = "error"
+	}
 }
 
 // Status reports the current state for the wizard's poll loop and the
