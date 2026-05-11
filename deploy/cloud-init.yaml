@@ -1,0 +1,104 @@
+#cloud-config
+# Turnkey cloud-init user-data for a single-host mizu deployment.
+#
+# Provision a VPS (Hetzner CAX, Oracle ARM, DigitalOcean droplet, AWS
+# Lightsail, anything that takes cloud-init), paste this as the
+# user-data, and at first boot:
+#
+#   1. Docker Engine installs from the official repo.
+#   2. /opt/mizu/docker-compose.yml is dropped into place.
+#   3. Compose pulls ghcr.io/nchapman/mizu:latest and Watchtower.
+#   4. Mizu listens on :80 / :443 / :8080.
+#
+# Then in a browser:
+#   - Point your domain's A record at the VPS's public IP.
+#   - Visit http://<that-ip>:8080/admin (DNS isn't propagated yet,
+#     so use the raw IP for this first hop).
+#   - The setup wizard walks you through account, site basics, the
+#     DNS preflight, and Let's Encrypt issuance.
+#
+# The 30-minute first-run claim window starts the moment cloud-init
+# brings the container up. If you miss it, SSH in and run:
+#   docker compose -f /opt/mizu/docker-compose.yml down
+#   docker volume rm mizu_state
+#   docker compose -f /opt/mizu/docker-compose.yml up -d
+# (posts, drafts, and media live in the `content` and `media`
+# volumes — only `state` holds the user table and the first-boot
+# marker.)
+#
+# Watchtower polls GHCR hourly. New `vX.Y.Z` tags published from the
+# mizu repo move the `:latest` tag, which Watchtower picks up and
+# rolls in. Pre-release tags (e.g. `v1.0.0-rc1`) do NOT move :latest,
+# so production hosts only auto-update on stable releases.
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - ufw
+
+write_files:
+  - path: /opt/mizu/docker-compose.yml
+    permissions: "0644"
+    owner: root:root
+    content: |
+      services:
+        mizu:
+          image: ghcr.io/nchapman/mizu:latest
+          container_name: mizu
+          restart: unless-stopped
+          entrypoint: ["/app/mizu", "--config", "/app/state/config.yml"]
+          ports:
+            - "8080:8080"
+            - "80:80"
+            - "443:443"
+          volumes:
+            - content:/app/content
+            - media:/app/media
+            - cache:/app/cache
+            - state:/app/state
+
+        watchtower:
+          image: containrrr/watchtower:latest
+          container_name: watchtower
+          restart: unless-stopped
+          environment:
+            WATCHTOWER_LABEL_ENABLE: "true"
+            WATCHTOWER_CLEANUP: "true"
+            WATCHTOWER_POLL_INTERVAL: "3600"
+            WATCHTOWER_ROLLING_RESTART: "true"
+          volumes:
+            - /var/run/docker.sock:/var/run/docker.sock
+
+      volumes:
+        content:
+        media:
+        cache:
+        state:
+
+runcmd:
+  # Install Docker Engine from the official repository. The
+  # convenience script is the supported install path for fresh VMs;
+  # it handles repo setup and signing keys for whichever distro
+  # cloud-init landed us on.
+  - curl -fsSL https://get.docker.com | sh
+  - systemctl enable --now docker
+
+  # Minimal firewall: SSH plus the three ports mizu binds. ufw is
+  # opt-in (cloud-init's package list above installed it but didn't
+  # enable it) so operators who already have a hosting-level firewall
+  # can comment this block out without conflict.
+  - ufw allow OpenSSH
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw allow 8080/tcp
+  - ufw --force enable
+
+  # Bring mizu up. `docker compose` (no hyphen) is the v2 plugin
+  # shipped by get.docker.com on supported distros.
+  - docker compose -f /opt/mizu/docker-compose.yml up -d
+
+final_message: "mizu is up. Open http://<this-host>:8080/admin to finish setup."

@@ -1,0 +1,74 @@
+# Production compose for a single-host mizu deployment with
+# Watchtower auto-updates. Paired with deploy/cloud-init.yaml for
+# turnkey VPS provisioning, but works standalone too:
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# On first boot, with no config.yml on disk, mizu enters fresh-install
+# mode. Open http://<host>:8080/admin in a browser and the setup wizard
+# walks you through account creation, site basics, DNS preflight, and
+# Let's Encrypt issuance. The wizard writes config.yml inside the
+# `state` volume on its way through.
+#
+# The 30-minute first-run claim window starts the moment the binary
+# first runs with zero users; finish setup before then, or stop the
+# container, `docker volume rm mizu_state`, and restart to reopen it.
+
+services:
+  mizu:
+    image: ghcr.io/nchapman/mizu:latest
+    container_name: mizu
+    restart: unless-stopped
+    # Override the entrypoint's default --config path so config.yml
+    # lives inside the durable `state` volume. Without this, the
+    # wizard would write the file inside the container's writable
+    # layer and Watchtower's rolling replacement would lose it.
+    entrypoint: ["/app/mizu", "--config", "/app/state/config.yml"]
+    ports:
+      # 8080 is the wizard's bootstrap entry point — operators visit
+      # http://<host>:8080/admin before DNS or TLS are wired up. After
+      # the wizard enables HTTPS it stays available as a LAN fallback.
+      - "8080:8080"
+      # 80 + 443 are bound by the in-process TLSManager once the
+      # wizard's "Enable HTTPS" step fires. Publishing them here means
+      # the operator doesn't need to redeploy after enabling TLS.
+      - "80:80"
+      - "443:443"
+    volumes:
+      - content:/app/content
+      - media:/app/media
+      - cache:/app/cache
+      - state:/app/state
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    environment:
+      # Label-scoped: only updates containers whose image carries
+      # com.centurylinklabs.watchtower.enable=true. The mizu image
+      # sets that label in its Dockerfile, so Watchtower won't
+      # accidentally update unrelated services on the same host.
+      WATCHTOWER_LABEL_ENABLE: "true"
+      # Remove the old image after a successful update so the disk
+      # doesn't fill up with stale layers.
+      WATCHTOWER_CLEANUP: "true"
+      # Poll once an hour. Tagged releases (Watchtower watches :latest)
+      # are infrequent; more aggressive polling just burns the GHCR
+      # rate-limit budget for no real-world benefit.
+      WATCHTOWER_POLL_INTERVAL: "3600"
+      # Roll one at a time so a botched update doesn't take down
+      # everything Watchtower manages on this host at once.
+      WATCHTOWER_ROLLING_RESTART: "true"
+    volumes:
+      # The docker socket is the entire trust boundary — Watchtower
+      # uses it to stop/pull/start the managed containers. Keep this
+      # host firewalled accordingly; anyone who can reach the socket
+      # has full root-equivalent access to the box.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  content:
+  media:
+  cache:
+  state:

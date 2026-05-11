@@ -56,7 +56,6 @@ the test suite, and a full build. Run it before committing.
 docker build -t mizu .
 docker run -d \
   -p 8080:8080 \
-  -v $PWD/config.yml:/app/config.yml:ro \
   -v $PWD/data/content:/app/content \
   -v $PWD/data/media:/app/media \
   -v $PWD/data/cache:/app/cache \
@@ -64,8 +63,21 @@ docker run -d \
   mizu
 ```
 
-The image runs as a non-root user. Mount `config.yml` and the four data
-directories as volumes so user data survives container restarts.
+The image runs as a non-root user. The four data directories as volumes
+so user data survives container restarts; the wizard writes `config.yml`
+into `state` on its way through.
+
+## VPS deploy with cloud-init + Watchtower
+
+For a turnkey single-host deployment, `deploy/cloud-init.yaml` provisions
+a fresh VPS end-to-end: it installs Docker, drops in
+`deploy/docker-compose.yml`, and starts mizu alongside Watchtower (which
+polls GHCR hourly and auto-updates on new stable tags).
+
+Paste the contents of `deploy/cloud-init.yaml` as the user-data on any
+cloud-init-supporting VPS (Hetzner, DigitalOcean, Oracle ARM, Lightsail,
+etc.). Once it boots, point your domain's A record at the VPS IP and
+open `http://<that-ip>:8080/admin` — the setup wizard handles the rest.
 
 ## Configuration
 
