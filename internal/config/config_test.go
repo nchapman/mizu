@@ -151,10 +151,23 @@ server:
 	}
 }
 
-func TestLoad_MissingFile(t *testing.T) {
-	_, err := Load(filepath.Join(t.TempDir(), "nope.yaml"))
-	if err == nil {
-		t.Fatal("expected error for missing file")
+func TestLoad_MissingFile_StartsFreshInstall(t *testing.T) {
+	// A missing config.yml is now a legal "fresh install" state — Load
+	// returns a defaulted Config so the binary can boot and the admin
+	// wizard can write the real file at the end of onboarding.
+	dir := t.TempDir()
+	// Anchor relative defaults inside the temp dir so MkdirAll doesn't
+	// scribble into the test's cwd.
+	t.Chdir(dir)
+	c, err := Load("nope.yaml")
+	if err != nil {
+		t.Fatalf("Load missing file: %v", err)
+	}
+	if c.Server.Addr == "" || c.Paths.State == "" {
+		t.Errorf("defaults not applied: %+v", c)
+	}
+	if c.Server.TLS.Enabled {
+		t.Error("TLS unexpectedly enabled in fresh-install defaults")
 	}
 }
 

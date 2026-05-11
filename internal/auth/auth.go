@@ -9,7 +9,6 @@ package auth
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -17,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"net/mail"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +39,22 @@ const (
 	// behavior.
 	maxFailedAttempts = 5
 	lockoutDuration   = 15 * time.Minute
+
+	// SetupWindowDuration is how long after first boot anyone reaching
+	// /admin can claim the instance by creating the first account. The
+	// window is the only first-run safeguard — there is no out-of-band
+	// token to copy. The trade-off: an operator who walks away from a
+	// public IP for over half an hour without finishing setup can be
+	// raced by a stranger who finds the host. For the consumer-grade
+	// "open admin, follow the wizard" flow we accept this; harden by
+	// (a) finishing setup promptly or (b) keeping the host firewalled
+	// off the public internet until you're ready.
+	SetupWindowDuration = 30 * time.Minute
+
+	// firstBootKey is the app_meta key that records when the install
+	// first booted with zero users. Persisted so the window survives
+	// restarts and an attacker can't reset it by triggering a reboot.
+	firstBootKey = "first_boot_at"
 )
 
 var (
@@ -48,7 +64,7 @@ var (
 	ErrInvalidEmail      = errors.New("invalid email address")
 	ErrInvalidLogin      = errors.New("invalid email or password")
 	ErrInvalidPassword   = errors.New("invalid password")
-	ErrBadSetupToken     = errors.New("invalid setup token")
+	ErrSetupWindowClosed = errors.New("setup window has closed; see the README for recovery instructions")
 	ErrEmailTaken        = errors.New("email already in use")
 	ErrUserNotFound      = errors.New("user not found")
 	ErrLastUser          = errors.New("cannot delete the last remaining user")
@@ -70,11 +86,20 @@ type User struct {
 type Service struct {
 	db *mizudb.DB
 
-	mu         sync.Mutex
-	setupToken string // non-empty only while no users exist
+	// setupMu serializes Setup() so two concurrent valid first-run
+	// claims can't race past the Window() check and both insert.
+	setupMu sync.Mutex
 
 	// Overridable for tests; production uses time.Now.
 	now func() time.Time
+}
+
+// SetupWindow describes the first-run claim window. The SPA polls
+// /admin/api/me at boot to render the wizard or the closed-window
+// page based on Open.
+type SetupWindow struct {
+	Open      bool      `json:"open"`
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
 
 type ctxKey struct{}
@@ -94,23 +119,69 @@ func init() {
 }
 
 // New constructs a Service over the given DB. If the users table is
-// empty it generates a one-time setup token and logs it via the
-// caller (caller checks SetupToken() after New). The token lives in
-// memory only — restarting before setup just mints a fresh one.
+// empty it records the boot time so the time-based claim window opens
+// from this moment. Subsequent boots reuse the original timestamp so
+// an attacker can't reset the window by triggering a reboot.
 func New(db *mizudb.DB) (*Service, error) {
 	s := &Service{db: db, now: time.Now}
-	configured, err := s.Configured(context.Background())
-	if err != nil {
+	if err := s.recordFirstBoot(context.Background()); err != nil {
 		return nil, err
 	}
-	if !configured {
-		tok, err := randomToken()
-		if err != nil {
-			return nil, err
-		}
-		s.setupToken = tok
-	}
 	return s, nil
+}
+
+// recordFirstBoot writes a first_boot_at marker the first time an
+// unconfigured install boots. INSERT OR IGNORE makes it idempotent —
+// any subsequent boot with the row already present is a no-op.
+// Configured installs skip the write entirely since the window only
+// matters before setup.
+func (s *Service) recordFirstBoot(ctx context.Context) error {
+	configured, err := s.Configured(ctx)
+	if err != nil {
+		return err
+	}
+	if configured {
+		return nil
+	}
+	_, err = s.db.W.ExecContext(ctx,
+		`INSERT INTO app_meta(key, value) VALUES(?, ?)
+		   ON CONFLICT(key) DO NOTHING`,
+		firstBootKey, strconv.FormatInt(s.now().UTC().Unix(), 10),
+	)
+	if err != nil {
+		return fmt.Errorf("record first_boot_at: %w", err)
+	}
+	return nil
+}
+
+// Window returns the current state of the first-run claim window.
+// Closed when any user exists, when the window has elapsed since first
+// boot, or when no first-boot marker is recorded (e.g. the row was
+// hand-deleted to reopen setup — that path also clears users).
+func (s *Service) Window(ctx context.Context) (SetupWindow, error) {
+	configured, err := s.Configured(ctx)
+	if err != nil {
+		return SetupWindow{}, err
+	}
+	if configured {
+		return SetupWindow{Open: false}, nil
+	}
+	var raw string
+	err = s.db.R.QueryRowContext(ctx,
+		`SELECT value FROM app_meta WHERE key = ?`, firstBootKey,
+	).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SetupWindow{Open: false}, nil
+	}
+	if err != nil {
+		return SetupWindow{}, fmt.Errorf("read first_boot_at: %w", err)
+	}
+	ts, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return SetupWindow{}, fmt.Errorf("parse first_boot_at %q: %w", raw, err)
+	}
+	expires := time.Unix(ts, 0).UTC().Add(SetupWindowDuration)
+	return SetupWindow{Open: s.now().Before(expires), ExpiresAt: expires}, nil
 }
 
 // Configured returns true if at least one user exists. The SPA hits
@@ -123,26 +194,14 @@ func (s *Service) Configured(ctx context.Context) (bool, error) {
 	return n > 0, nil
 }
 
-// SetupToken returns the one-time first-run token, or "" if any user
-// already exists. Print this at startup so the operator can paste it
-// into the setup form — without it, a stranger who beats the operator
-// to /setup can lock them out by creating their own first account.
-func (s *Service) SetupToken() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.setupToken
-}
-
-// Setup creates the first user from the one-time token. Refuses if
-// any user already exists. Subsequent users are added via CreateUser
-// behind the authenticated /api/users endpoint.
+// Setup creates the first user. Refuses if any user already exists or
+// if the time-based claim window has closed. Subsequent users are
+// added via CreateUser behind the authenticated /api/users endpoint.
 //
-// The token is *claimed* (zeroed) under the lock before the slow
-// bcrypt path runs, so two concurrent Setup calls with the same valid
-// token can't both pass the check. If insertUser fails (e.g. email
-// invalid at the DB layer), the token is restored so the operator can
-// try again without restarting the process.
-func (s *Service) Setup(ctx context.Context, token, email, password, displayName string) (*User, error) {
+// The whole flow runs under setupMu so two concurrent first-run
+// requests serialize: the second sees Configured()==true after the
+// first commits and falls through to ErrAlreadyConfigured.
+func (s *Service) Setup(ctx context.Context, email, password, displayName string) (*User, error) {
 	if err := validatePassword(password); err != nil {
 		return nil, err
 	}
@@ -151,33 +210,21 @@ func (s *Service) Setup(ctx context.Context, token, email, password, displayName
 		return nil, err
 	}
 
-	s.mu.Lock()
-	expected := s.setupToken
-	if expected == "" {
-		s.mu.Unlock()
-		return nil, ErrAlreadyConfigured
-	}
-	if subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
-		s.mu.Unlock()
-		return nil, ErrBadSetupToken
-	}
-	s.setupToken = "" // claim before releasing the lock
-	s.mu.Unlock()
+	s.setupMu.Lock()
+	defer s.setupMu.Unlock()
 
-	user, err := s.insertUser(ctx, email, password, displayName)
+	win, err := s.Window(ctx)
 	if err != nil {
-		// Restore the token so the operator can retry. Skip if another
-		// goroutine has already won the race and inserted a user — at
-		// that point Configured() is true and Setup must refuse anyway.
-		configured, cerr := s.Configured(ctx)
-		if cerr == nil && !configured {
-			s.mu.Lock()
-			s.setupToken = expected
-			s.mu.Unlock()
-		}
 		return nil, err
 	}
-	return user, nil
+	if !win.Open {
+		configured, cerr := s.Configured(ctx)
+		if cerr == nil && configured {
+			return nil, ErrAlreadyConfigured
+		}
+		return nil, ErrSetupWindowClosed
+	}
+	return s.insertUser(ctx, email, password, displayName)
 }
 
 // CreateUser adds a new account. Called from the authenticated

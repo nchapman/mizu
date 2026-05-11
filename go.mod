@@ -10,6 +10,7 @@ require (
 	github.com/gorilla/feeds v1.2.0
 	github.com/microcosm-cc/bluemonday v1.0.27
 	github.com/mmcdole/gofeed v1.3.0
+	github.com/nchapman/go-liquid v0.0.0-20260511032621-74c3a8437a2e
 	github.com/unrolled/secure v1.17.0
 	github.com/yuin/goldmark v1.7.8
 	golang.org/x/crypto v0.51.0
@@ -37,7 +38,6 @@ require (
 	github.com/mmcdole/goxpp v1.1.1-0.20240225020742-a0c311522b23 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
-	github.com/nchapman/go-liquid v0.0.0-20260510155923-6a0e9e2d5b99 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect

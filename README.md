@@ -17,14 +17,25 @@ Features:
 Requires Go 1.25+ and Node 20+.
 
 ```sh
-cp config.example.yml config.yml
-# edit config.yml — at minimum set site.base_url to where this will be served
 make build
-./mizu --config config.yml
+./mizu
 ```
 
-On first run the server prints a one-time setup token. Visit
-`http://localhost:8080/admin` and paste it to set your password.
+That's it. The first time you boot with no `config.yml` on disk, mizu runs in
+fresh-install mode: open `http://<this-host>:8080/admin` in a browser and the
+setup wizard walks you through account creation, site basics, an optional DNS
+preflight, and optional Let's Encrypt issuance. The wizard writes `config.yml`
+on its way through.
+
+**First-run claim window.** The wizard accepts the first account creation for
+30 minutes after the binary first boots with zero users. After that the wizard
+refuses to claim the instance — a guardrail against a stranger on the open
+internet racing you to setup. If you miss the window, stop the binary, delete
+`state/mizu.db`, and restart; posts, drafts, and media live on disk and are
+unaffected.
+
+For advanced deployments — hand-tuned ports, paths, rate limits — start from
+`config.example.yml` and pass `--config`.
 
 ## Development
 

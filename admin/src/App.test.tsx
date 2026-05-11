@@ -20,16 +20,34 @@ async function openMenu() {
 
 // withMe shortcuts the app's initial GET /admin/api/me. Anything passed
 // after is the rest of the staged response queue.
-function withMe(me: { configured: boolean; authenticated: boolean }, ...rest: { status: number; body?: unknown }[]) {
-  return queueFetch([{ status: 200, body: me }, ...rest]);
+type MeFixture = {
+  configured: boolean;
+  authenticated: boolean;
+  setup_window?: { open: boolean; expires_at?: string };
+};
+function withMe(me: MeFixture, ...rest: { status: number; body?: unknown }[]) {
+  // The /me payload now includes setup_window for unconfigured installs;
+  // tests that pass {configured:false} without specifying one get an
+  // open window by default so the wizard renders.
+  const enriched: MeFixture =
+    me.configured || me.setup_window !== undefined
+      ? me
+      : { ...me, setup_window: { open: true } };
+  return queueFetch([{ status: 200, body: enriched }, ...rest]);
 }
 
 describe("App auth screens", () => {
-  it("renders the Setup screen when /me reports unconfigured", async () => {
+  it("renders the Wizard welcome when /me reports unconfigured", async () => {
     withMe({ configured: false, authenticated: false });
     render(<App />);
     expect(await screen.findByRole("heading", { name: /Welcome to mizu/i })).toBeInTheDocument();
-    expect(screen.getByLabelText(/Setup token/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Get started/i })).toBeInTheDocument();
+  });
+
+  it("renders the closed-window page when the setup window has expired", async () => {
+    withMe({ configured: false, authenticated: false, setup_window: { open: false } });
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: /Setup window has closed/i })).toBeInTheDocument();
   });
 
   it("renders the Login screen when configured but not authenticated", async () => {
@@ -52,11 +70,14 @@ describe("App auth screens", () => {
   });
 
   it("shows a retry banner when /me fails", async () => {
-    queueFetch([{ status: 500 }, { status: 200, body: { configured: false, authenticated: false } }]);
+    queueFetch([
+      { status: 500 },
+      { status: 200, body: { configured: false, authenticated: false, setup_window: { open: true } } },
+    ]);
     render(<App />);
     expect(await screen.findByText(/Could not reach the server/i)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Retry/i }));
-    // After retry, the configured-false state means the Setup screen renders.
+    // After retry, the configured-false state means the wizard renders.
     expect(await screen.findByRole("heading", { name: /Welcome to mizu/i })).toBeInTheDocument();
   });
 });
@@ -144,29 +165,26 @@ describe("App Login", () => {
   });
 });
 
-describe("App Setup", () => {
-  it("validates token, email, password length, and password match before submitting", async () => {
+describe("App Wizard", () => {
+  async function advanceToAccount() {
+    await userEvent.click(await screen.findByRole("button", { name: /Get started/i }));
+  }
+
+  it("validates email, password length, and match before POSTing /setup", async () => {
     withMe({ configured: false, authenticated: false });
     render(<App />);
-    await screen.findByRole("heading", { name: /Welcome to mizu/i });
+    await advanceToAccount();
 
-    // No token → token error.
-    await userEvent.click(screen.getByRole("button", { name: /Create account/i }));
-    expect(await screen.findByText(/Setup token required/i)).toBeInTheDocument();
-
-    // Token, no email.
-    await userEvent.type(screen.getByLabelText(/Setup token/i), "tok");
+    // Empty email.
     await userEvent.click(screen.getByRole("button", { name: /Create account/i }));
     expect(await screen.findByText(/Email required/i)).toBeInTheDocument();
 
-    // Email + short password.
     await userEvent.type(screen.getByLabelText("Email"), "a@b.com");
     await userEvent.type(screen.getByLabelText("New password"), "short");
     await userEvent.type(screen.getByLabelText(/Confirm password/i), "short");
     await userEvent.click(screen.getByRole("button", { name: /Create account/i }));
     expect(await screen.findByText(/at least 8 characters/i)).toBeInTheDocument();
 
-    // Mismatched.
     await userEvent.clear(screen.getByLabelText("New password"));
     await userEvent.clear(screen.getByLabelText(/Confirm password/i));
     await userEvent.type(screen.getByLabelText("New password"), "longenough");
@@ -175,22 +193,18 @@ describe("App Setup", () => {
     expect(await screen.findByText(/Passwords don't match/i)).toBeInTheDocument();
   });
 
-  it("calls onDone (which triggers /me reload) on successful setup", async () => {
+  it("advances from account to site step on successful /setup", async () => {
     queueFetch([
-      { status: 200, body: { configured: false, authenticated: false } },
+      { status: 200, body: { configured: false, authenticated: false, setup_window: { open: true } } },
       { status: 204 }, // POST /setup
-      { status: 200, body: { configured: true, authenticated: true } },
-      { status: 200, body: { items: [] } }, // /stream
-      { status: 200, body: [] }, // /drafts (count)
     ]);
     render(<App />);
-    await screen.findByRole("heading", { name: /Welcome to mizu/i });
-    await userEvent.type(screen.getByLabelText(/Setup token/i), "tok");
+    await advanceToAccount();
     await userEvent.type(screen.getByLabelText("Email"), "alice@example.com");
     await userEvent.type(screen.getByLabelText("New password"), "longenough");
     await userEvent.type(screen.getByLabelText(/Confirm password/i), "longenough");
     await userEvent.click(screen.getByRole("button", { name: /Create account/i }));
-    expect(await screen.findByRole("button", { name: "mizu" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /About your site/i })).toBeInTheDocument();
   });
 });
 

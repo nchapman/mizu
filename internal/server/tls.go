@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -12,101 +14,218 @@ import (
 	"github.com/nchapman/mizu/internal/config"
 )
 
-// TLSRunner manages the two-listener setup needed for automatic HTTPS:
-// the main HTTPS server on tls.Addr and a small HTTP server on
-// tls.HTTPAddr that solves ACME HTTP-01 challenges and redirects
-// everything else to HTTPS. CertMagic itself handles certificate
-// issuance, OCSP stapling, and renewal.
-type TLSRunner struct {
+// TLSStatus is the small read-model the admin wizard polls while
+// CertMagic issues a certificate. State transitions are one-way
+// off → issuing → ready (or → error). The wizard surfaces Error
+// verbatim, so it should be operator-readable.
+type TLSStatus struct {
+	State string `json:"state"`
+	Error string `json:"error,omitempty"`
+}
+
+// TLSManager owns the certmagic.Config and the two listeners (HTTPS +
+// ACME-challenge/redirect). It can be brought up at boot (if the
+// loaded config has tls.enabled = true) or live from the setup
+// wizard via Enable.
+//
+// The plain-HTTP listener bound on cfg.Server.Addr (e.g. :8080) is
+// left running in parallel: the wizard finishes over that listener,
+// and once TLS is up the SPA redirects clients to https://. We do not
+// shut down :8080 here because doing so mid-request would close the
+// wizard's own connection. Operators who want HTTPS-only can drop the
+// plain listener via a graceful restart after setup completes.
+type TLSManager struct {
+	cfg     *config.Config
+	handler http.Handler
+	wg      *sync.WaitGroup
+
+	mu       sync.Mutex
+	state    string // "off", "issuing", "ready", "error"
+	lastErr  error
 	main     *http.Server
 	redirect *http.Server
 }
 
-// StartTLS wires CertMagic against cfg and starts both listeners.
-// The returned runner's Shutdown should be called during graceful
-// shutdown alongside main.Shutdown for the main server.
+// NewTLSManager constructs an idle manager. The caller wires this in
+// during boot and then either:
 //
-// The caller's main *http.Server is mutated: its TLSConfig is set
-// from the CertMagic configuration. The caller should call neither
-// ListenAndServe nor ListenAndServeTLS on it — StartTLS handles that.
+//   - calls EnableFromConfig() if cfg.Server.TLS.Enabled is true at
+//     startup (legacy path: TLS pre-configured before this process
+//     ever ran), or
+//   - leaves it idle and lets the wizard call Enable() once setup
+//     completes.
 //
-// Listener ordering matters. We bind port 80 (with the ACME challenge
-// handler installed) and port 443 *before* asking CertMagic to obtain
-// certificates. ManageAsync then drives issuance in the background:
-// during cold-start issuance, the first HTTPS request stalls briefly
-// on the handshake, but the process never deadlocks waiting for ACME
-// to finish before listeners exist. ManageSync would invert that and
-// race CertMagic's own ephemeral :80 listener with anything else on
-// the box.
-func StartTLS(ctx context.Context, mainSrv *http.Server, cfg *config.Config, wg *sync.WaitGroup) (*TLSRunner, error) {
-	tlsCfg := cfg.Server.TLS
-	certmagic.DefaultACME.Email = tlsCfg.Email
+// handler is the same chi router the plain HTTP listener serves —
+// TLS just terminates in front of it.
+func NewTLSManager(handler http.Handler, cfg *config.Config, wg *sync.WaitGroup) *TLSManager {
+	return &TLSManager{cfg: cfg, handler: handler, wg: wg, state: "off"}
+}
+
+// SetHandler swaps the chi router after construction so main.go can
+// hand the manager an early reference (nil) and fill it in once the
+// router is built. Safe to call once before Enable; calling after
+// Enable has no effect on already-bound listeners.
+func (m *TLSManager) SetHandler(h http.Handler) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.handler = h
+}
+
+// EnableFromConfig brings TLS up using whatever's already in cfg.
+// Used at boot when the operator has TLS pre-configured. Returns
+// after listeners are bound; issuance runs in the background.
+func (m *TLSManager) EnableFromConfig(ctx context.Context) error {
+	t := m.cfg.Server.TLS
+	return m.Enable(ctx, t.Domains, t.Email, t.Staging)
+}
+
+// Enable persists no state itself (the caller is responsible for
+// writing the new tls.* block to config.yml before calling); it just
+// binds the listeners and kicks off CertMagic. Idempotent in the
+// sense that calling Enable a second time with the same state returns
+// an error rather than re-binding.
+func (m *TLSManager) Enable(ctx context.Context, domains []string, email string, staging bool) error {
+	if len(domains) == 0 {
+		return errors.New("tls: at least one domain required")
+	}
+	if strings.TrimSpace(email) == "" {
+		return errors.New("tls: ACME contact email required")
+	}
+	m.mu.Lock()
+	if m.state == "issuing" || m.state == "ready" {
+		m.mu.Unlock()
+		return errors.New("tls: already enabled")
+	}
+	m.state = "issuing"
+	m.lastErr = nil
+	m.mu.Unlock()
+
+	certmagic.DefaultACME.Email = email
 	certmagic.DefaultACME.Agreed = true
-	if tlsCfg.Staging {
+	if staging {
 		certmagic.DefaultACME.CA = certmagic.LetsEncryptStagingCA
 	} else {
 		certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
 	}
-	certmagic.Default.Storage = &certmagic.FileStorage{Path: cfg.Paths.Certs}
-
+	certmagic.Default.Storage = &certmagic.FileStorage{Path: m.cfg.Paths.Certs}
 	magic := certmagic.NewDefault()
-
 	tc := magic.TLSConfig()
 	tc.NextProtos = append([]string{"h2", "http/1.1"}, tc.NextProtos...)
-	mainSrv.Addr = tlsCfg.Addr
-	mainSrv.TLSConfig = tc
 
-	redirect := &http.Server{
-		Addr:              tlsCfg.HTTPAddr,
-		Handler:           buildHTTPHandler(magic, tlsCfg.Domains),
-		ReadHeaderTimeout: cfg.Limits.ReadHeaderTimeout,
-		ReadTimeout:       cfg.Limits.ReadTimeout,
-		WriteTimeout:      cfg.Limits.WriteTimeout,
-		IdleTimeout:       cfg.Limits.IdleTimeout,
-		MaxHeaderBytes:    cfg.Limits.MaxHeaderBytes,
+	addr := m.cfg.Server.TLS.Addr
+	if addr == "" {
+		addr = ":443"
+	}
+	httpAddr := m.cfg.Server.TLS.HTTPAddr
+	if httpAddr == "" {
+		httpAddr = ":80"
+	}
+	// Catch the most common boot-time misconfig early, with a clear
+	// message — otherwise the conflict surfaces as an "address already
+	// in use" from a goroutine and the wizard's enable-tls handler is
+	// stuck waiting for the listener to come up.
+	if m.cfg.Server.Addr == addr || m.cfg.Server.Addr == httpAddr {
+		m.recordError(fmt.Errorf("tls: server.addr (%s) conflicts with the TLS listener; move the plain HTTP listener to a different port", m.cfg.Server.Addr))
+		return fmt.Errorf("tls: server.addr (%s) overlaps the TLS port; pick a different server.addr (e.g. :8080)", m.cfg.Server.Addr)
 	}
 
-	wg.Add(1)
+	mainSrv := &http.Server{
+		Addr:              addr,
+		Handler:           m.handler,
+		TLSConfig:         tc,
+		ReadHeaderTimeout: m.cfg.Limits.ReadHeaderTimeout,
+		ReadTimeout:       m.cfg.Limits.ReadTimeout,
+		WriteTimeout:      m.cfg.Limits.WriteTimeout,
+		IdleTimeout:       m.cfg.Limits.IdleTimeout,
+		MaxHeaderBytes:    m.cfg.Limits.MaxHeaderBytes,
+	}
+	redirect := &http.Server{
+		Addr:              httpAddr,
+		Handler:           buildHTTPHandler(magic, domains),
+		ReadHeaderTimeout: m.cfg.Limits.ReadHeaderTimeout,
+		ReadTimeout:       m.cfg.Limits.ReadTimeout,
+		WriteTimeout:      m.cfg.Limits.WriteTimeout,
+		IdleTimeout:       m.cfg.Limits.IdleTimeout,
+		MaxHeaderBytes:    m.cfg.Limits.MaxHeaderBytes,
+	}
+
+	m.mu.Lock()
+	m.main = mainSrv
+	m.redirect = redirect
+	m.mu.Unlock()
+
+	m.wg.Add(1)
 	go func() {
-		defer wg.Done()
-		log.Printf("mizu listening on %s (https) for %v", mainSrv.Addr, tlsCfg.Domains)
+		defer m.wg.Done()
+		log.Printf("mizu listening on %s (https) for %v", mainSrv.Addr, domains)
 		if err := mainSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 			log.Printf("https server: %v", err)
+			m.recordError(fmt.Errorf("https listener: %w", err))
 		}
 	}()
-
-	wg.Add(1)
+	m.wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer m.wg.Done()
 		log.Printf("mizu listening on %s (http: ACME + redirect)", redirect.Addr)
 		if err := redirect.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("http redirect server: %v", err)
+			m.recordError(fmt.Errorf("http redirect listener: %w", err))
 		}
 	}()
 
-	// Listeners are live; now drive issuance in the background. ACME
-	// HTTP-01 challenges arrive at the port-80 handler we just bound,
-	// where HTTPChallengeHandler intercepts them before the redirect
-	// fallthrough.
-	if err := magic.ManageAsync(ctx, tlsCfg.Domains); err != nil {
-		return nil, err
+	// ManageAsync drives issuance in the background. We can't reliably
+	// detect "issued and trusted" without polling the certmagic cache,
+	// so we flip to "ready" optimistically once ManageAsync returns:
+	// the listener is bound, the cert will materialize when ACME
+	// resolves. A real-world miss (e.g. DNS misconfigured) surfaces as
+	// a TLS handshake error when the user follows the wizard's redirect.
+	if err := magic.ManageAsync(ctx, domains); err != nil {
+		m.recordError(err)
+		return err
 	}
-
-	return &TLSRunner{main: mainSrv, redirect: redirect}, nil
+	m.mu.Lock()
+	if m.state == "issuing" {
+		m.state = "ready"
+	}
+	m.mu.Unlock()
+	return nil
 }
 
-// Shutdown stops the redirect server. The main HTTPS server is owned
-// by the caller and shut down separately so that drain timeouts are
-// applied uniformly across both code paths.
-func (r *TLSRunner) Shutdown(ctx context.Context) {
-	if r == nil || r.redirect == nil {
-		return
-	}
-	_ = r.redirect.Shutdown(ctx)
+func (m *TLSManager) recordError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.state = "error"
+	m.lastErr = err
 }
 
-// buildHTTPHandler returns the handler for port 80: it serves
-// ACME HTTP-01 challenges and 308-redirects everything else to the
+// Status reports the current state for the wizard's poll loop.
+func (m *TLSManager) Status() TLSStatus {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := TLSStatus{State: m.state}
+	if m.lastErr != nil {
+		s.Error = m.lastErr.Error()
+	}
+	return s
+}
+
+// Shutdown stops the redirect server and the main HTTPS server. The
+// process-wide WaitGroup the caller passed at construction is what
+// actually drains the goroutines; this just signals them.
+func (m *TLSManager) Shutdown(ctx context.Context) {
+	m.mu.Lock()
+	main, redirect := m.main, m.redirect
+	m.mu.Unlock()
+	if redirect != nil {
+		_ = redirect.Shutdown(ctx)
+	}
+	if main != nil {
+		_ = main.Shutdown(ctx)
+	}
+}
+
+// buildHTTPHandler returns the handler for port 80: it serves ACME
+// HTTP-01 challenges and 308-redirects everything else to the
 // canonical HTTPS URL. The Host header is validated against the
 // configured domain list to avoid reflecting an attacker-supplied
 // hostname back as an open redirect.

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Awaiting setup</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #1c1c1e;
+        --muted: #6b7280;
+        --bg: #fafaf7;
+        --accent: #2563eb;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root { --fg: #f5f5f4; --muted: #a1a1aa; --bg: #0c0c0d; --accent: #93c5fd; }
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; padding: 0; height: 100%; }
+      body {
+        background: var(--bg);
+        color: var(--fg);
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        line-height: 1.55;
+        display: grid;
+        place-items: center;
+      }
+      main {
+        max-width: 32rem;
+        padding: 2rem 1.5rem;
+        text-align: center;
+      }
+      h1 {
+        margin: 0 0 0.5rem;
+        font-size: 1.5rem;
+        letter-spacing: -0.01em;
+      }
+      p { color: var(--muted); margin: 0 0 1rem; }
+      a.button {
+        display: inline-block;
+        margin-top: 0.75rem;
+        padding: 0.6rem 1rem;
+        border-radius: 9999px;
+        background: var(--accent);
+        color: white;
+        text-decoration: none;
+        font-weight: 500;
+      }
+      a.button:hover { filter: brightness(1.05); }
+      .brand {
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        margin-bottom: 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="brand">mizu</div>
+      <h1>This site is being set up</h1>
+      <p>You've reached a freshly-installed mizu instance. The operator hasn't finished onboarding yet.</p>
+      <p>If that's you, head into the admin to pick up where you left off.</p>
+      <a class="button" href="/admin">Open admin</a>
+    </main>
+  </body>
+</html>

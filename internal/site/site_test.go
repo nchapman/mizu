@@ -1,6 +1,7 @@
 package site
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -34,7 +35,7 @@ func newSite(t *testing.T) (*Server, http.Handler, string) {
 	t.Cleanup(func() { _ = conn.Close() })
 	wm := webmention.New(webmention.NewStore(conn), "https://example.test")
 
-	srv := New(cfg, wm, publicDir)
+	srv := New(cfg, wm, publicDir, nil)
 	r := chi.NewRouter()
 	srv.Routes(r)
 	return srv, r, publicDir
@@ -70,6 +71,46 @@ func TestSite_ServesBakedHomepage(t *testing.T) {
 	}
 	if got := w.Header().Get("Link"); !strings.Contains(got, `rel="webmention"`) {
 		t.Errorf("Link=%q, want webmention rel", got)
+	}
+}
+
+func TestSite_UnconfiguredServesPlaceholderHTML(t *testing.T) {
+	publicDir := t.TempDir()
+	cfg := &config.Config{}
+	cfg.ApplyDefaults()
+	conn, _ := mizudb.Open(filepath.Join(t.TempDir(), "test.db"))
+	t.Cleanup(func() { _ = conn.Close() })
+	wm := webmention.New(webmention.NewStore(conn), "https://example.test")
+	srv := New(cfg, wm, publicDir, func(context.Context) (bool, error) { return false, nil })
+	r := chi.NewRouter()
+	srv.Routes(r)
+
+	writePublic(t, publicDir, "index.html", "<h1>real site</h1>")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "real site") {
+		t.Error("unconfigured site leaked the baked homepage")
+	}
+	if !strings.Contains(w.Body.String(), "awaiting setup") &&
+		!strings.Contains(strings.ToLower(w.Body.String()), "being set up") {
+		t.Errorf("body=%s", w.Body.String())
+	}
+	if got := w.Header().Get("X-Robots-Tag"); !strings.Contains(got, "noindex") {
+		t.Errorf("X-Robots-Tag=%q, want noindex", got)
+	}
+
+	// feed.xml gets a 503 with Retry-After so aggregators back off.
+	wf := httptest.NewRecorder()
+	r.ServeHTTP(wf, httptest.NewRequest("GET", "/feed.xml", nil))
+	if wf.Code != http.StatusServiceUnavailable {
+		t.Errorf("feed.xml code=%d, want 503", wf.Code)
+	}
+	if wf.Header().Get("Retry-After") == "" {
+		t.Error("feed.xml missing Retry-After")
 	}
 }
 

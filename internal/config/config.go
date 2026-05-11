@@ -1,7 +1,10 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -114,13 +117,22 @@ type RateSpec struct {
 }
 
 func Load(path string) (*Config, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
-	}
 	var c Config
-	if err := yaml.Unmarshal(b, &c); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+	b, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// Fresh install: no config on disk yet. Boot with defaults so
+		// the operator can complete setup through the admin wizard,
+		// which writes a real config.yml at the end. TLS stays off in
+		// this mode — validate() only complains about TLS misconfig,
+		// so falling through to it is safe.
+		log.Printf("config: %s not found; starting in fresh-install mode", path)
+	case err != nil:
+		return nil, fmt.Errorf("read config: %w", err)
+	default:
+		if err := yaml.Unmarshal(b, &c); err != nil {
+			return nil, fmt.Errorf("parse config: %w", err)
+		}
 	}
 	c.ApplyDefaults()
 	if err := c.validate(); err != nil {
@@ -146,6 +158,18 @@ func Load(path string) (*Config, error) {
 // Config in-memory should call it as well so the resulting struct
 // behaves like one parsed from YAML.
 func (c *Config) ApplyDefaults() {
+	if c.Server.Addr == "" {
+		c.Server.Addr = ":8080"
+	}
+	if c.Paths.Content == "" {
+		c.Paths.Content = "./content"
+	}
+	if c.Paths.Media == "" {
+		c.Paths.Media = "./media"
+	}
+	if c.Paths.State == "" {
+		c.Paths.State = "./state"
+	}
 	if c.Poller.Interval == 0 {
 		c.Poller.Interval = time.Hour
 	}

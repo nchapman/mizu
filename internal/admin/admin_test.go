@@ -104,7 +104,7 @@ func newHarness(t *testing.T) *harness {
 		"index.html":    &fstest.MapFile{Data: []byte(fixtureIndexHTML)},
 		"assets/app.js": &fstest.MapFile{Data: []byte("console.log('hi')")},
 	}
-	srv := New(context.Background(), cfg, posts, feedSvc, poller, a, mediaStore, wm, dist)
+	srv := New(context.Background(), cfg, "", posts, feedSvc, poller, a, mediaStore, wm, nil, nil, dist)
 	r := chi.NewRouter()
 	r.Route("/admin", func(r chi.Router) { srv.Routes(r) })
 
@@ -118,8 +118,7 @@ func newHarness(t *testing.T) *harness {
 // a session cookie ready to attach to subsequent requests.
 func (h *harness) login(t *testing.T) *http.Cookie {
 	t.Helper()
-	tok := h.auth.SetupToken()
-	u, err := h.auth.Setup(context.Background(), tok, "alice@example.com", "hunter22pw", "Alice")
+	u, err := h.auth.Setup(context.Background(), "alice@example.com", "hunter22pw", "Alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,13 +182,11 @@ func TestMe_FreshIsUnconfigured(t *testing.T) {
 
 func TestSetup_HappyPath(t *testing.T) {
 	h := newHarness(t)
-	tok := h.auth.SetupToken()
 	w := h.do(t, "POST", "/admin/api/setup",
 		map[string]string{
 			"email":        "alice@example.com",
 			"password":     "hunter22pw",
 			"display_name": "Alice",
-			"token":        tok,
 		}, nil)
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
@@ -217,19 +214,10 @@ func TestSetup_HappyPath(t *testing.T) {
 	}
 }
 
-func TestSetup_RejectsBadToken(t *testing.T) {
-	h := newHarness(t)
-	w := h.do(t, "POST", "/admin/api/setup",
-		map[string]string{"email": "a@b.com", "password": "hunter22pw", "token": "wrong"}, nil)
-	if w.Code != http.StatusForbidden {
-		t.Errorf("code=%d, want 403", w.Code)
-	}
-}
-
 func TestSetup_RejectsShortPassword(t *testing.T) {
 	h := newHarness(t)
 	w := h.do(t, "POST", "/admin/api/setup",
-		map[string]string{"email": "a@b.com", "password": "x", "token": h.auth.SetupToken()}, nil)
+		map[string]string{"email": "a@b.com", "password": "x"}, nil)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("code=%d, want 400", w.Code)
 	}
@@ -238,7 +226,7 @@ func TestSetup_RejectsShortPassword(t *testing.T) {
 func TestSetup_RejectsInvalidEmail(t *testing.T) {
 	h := newHarness(t)
 	w := h.do(t, "POST", "/admin/api/setup",
-		map[string]string{"email": "not an email", "password": "hunter22pw", "token": h.auth.SetupToken()}, nil)
+		map[string]string{"email": "not an email", "password": "hunter22pw"}, nil)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("code=%d, want 400", w.Code)
 	}

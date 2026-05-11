@@ -21,6 +21,7 @@ import (
 	mizudb "github.com/nchapman/mizu/internal/db"
 	"github.com/nchapman/mizu/internal/feeds"
 	"github.com/nchapman/mizu/internal/media"
+	"github.com/nchapman/mizu/internal/netinfo"
 	"github.com/nchapman/mizu/internal/post"
 	"github.com/nchapman/mizu/internal/render"
 	mizuserver "github.com/nchapman/mizu/internal/server"
@@ -140,9 +141,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("auth: %v", err)
 	}
-	if t := authSvc.SetupToken(); t != "" {
-		log.Printf("first-run setup required — visit %s/admin and use this one-time token: %s",
-			cfg.Site.BaseURL, t)
+	if win, err := authSvc.Window(ctx); err == nil && win.Open {
+		log.Printf("first-run setup required — open /admin in a browser within %s to claim this instance",
+			auth.SetupWindowDuration)
 	}
 	bg.Add(1)
 	go func() {
@@ -153,7 +154,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("media: %v", err)
 	}
-	adminSrv := admin.New(ctx, cfg, posts, feedSvc, poller, authSvc, mediaStore, wmSvc, adminDistFS())
+	ipCache := netinfo.NewPublicIPCache()
+	// TLSManager is wired below; admin holds it through the
+	// TLSController interface so the wizard's enable-tls handler can
+	// flip the runner without main.go re-wiring.
+	tlsMgr := mizuserver.NewTLSManager(nil, cfg, &bg)
+	adminSrv := admin.New(ctx, cfg, *cfgPath, posts, feedSvc, poller, authSvc, mediaStore, wmSvc, ipCache, tlsMgr, adminDistFS())
 
 	r := chi.NewRouter()
 	// Deliberately NOT using middleware.RealIP. mizu binds the public
@@ -185,10 +191,11 @@ func main() {
 		mediaFS.ServeHTTP(w, req)
 	}))
 
-	siteSrv := site.New(cfg, wmSvc, cfg.Paths.Public)
+	siteSrv := site.New(cfg, wmSvc, cfg.Paths.Public, authSvc.Configured)
 	siteSrv.Routes(r)
 
 	srv := &http.Server{
+		Addr:              cfg.Server.Addr,
 		Handler:           r,
 		ReadHeaderTimeout: cfg.Limits.ReadHeaderTimeout,
 		ReadTimeout:       cfg.Limits.ReadTimeout,
@@ -197,22 +204,28 @@ func main() {
 		MaxHeaderBytes:    cfg.Limits.MaxHeaderBytes,
 	}
 
-	var tlsRunner *mizuserver.TLSRunner
+	// Hand the router to the TLS manager now that it exists. The
+	// plain-HTTP listener on srv keeps running regardless; TLSManager
+	// adds the :80/:443 listeners on top when Enable fires (either now
+	// from config or later from the wizard).
+	tlsMgr.SetHandler(r)
+
+	// Plain listener always runs — it's the bootstrap path the wizard
+	// uses (operator visits http://host:8080/admin), and also a LAN
+	// fallback once TLS is up.
+	bg.Add(1)
+	go func() {
+		defer bg.Done()
+		log.Printf("mizu listening on %s", cfg.Server.Addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("http server: %v", err)
+		}
+	}()
+
 	if cfg.Server.TLS.Enabled {
-		tlsRunner, err = mizuserver.StartTLS(ctx, srv, cfg, &bg)
-		if err != nil {
+		if err := tlsMgr.EnableFromConfig(ctx); err != nil {
 			log.Fatalf("tls: %v", err)
 		}
-	} else {
-		srv.Addr = cfg.Server.Addr
-		bg.Add(1)
-		go func() {
-			defer bg.Done()
-			log.Printf("mizu listening on %s", cfg.Server.Addr)
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Printf("http server: %v", err)
-			}
-		}()
 	}
 
 	<-ctx.Done()
@@ -227,7 +240,7 @@ func main() {
 	}()
 	go func() {
 		defer shutWG.Done()
-		tlsRunner.Shutdown(shutCtx)
+		tlsMgr.Shutdown(shutCtx)
 	}()
 	shutWG.Wait()
 	bg.Wait()

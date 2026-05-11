@@ -67,10 +67,8 @@ github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd h1:TRLaZ9cD/w
 github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
 github.com/modern-go/reflect2 v1.0.2 h1:xBagoLtFs94CBntxluKeaWgTMpvLxC4ur3nMaC9Gz0M=
 github.com/modern-go/reflect2 v1.0.2/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
-github.com/nchapman/go-liquid v0.0.0-20260510051900-eabcc15e9c4a h1:UYGeoLWBItdt+kxxdc3yjM99u9qDEUL5cy+dBC1hsTM=
-github.com/nchapman/go-liquid v0.0.0-20260510051900-eabcc15e9c4a/go.mod h1:0EyoBvUxDpLYN5TK7LOeRSZnXFW3I9lliTxaQSxCQiQ=
-github.com/nchapman/go-liquid v0.0.0-20260510155923-6a0e9e2d5b99 h1:SuSOtN5fVh4cPzZuOohKAmmPpwAqrwwo8atFBchuws8=
-github.com/nchapman/go-liquid v0.0.0-20260510155923-6a0e9e2d5b99/go.mod h1:0EyoBvUxDpLYN5TK7LOeRSZnXFW3I9lliTxaQSxCQiQ=
+github.com/nchapman/go-liquid v0.0.0-20260511032621-74c3a8437a2e h1:nfyufkQB6J+NicR3iAX/RTu2PS+TkNlFZ7+uIao9sT8=
+github.com/nchapman/go-liquid v0.0.0-20260511032621-74c3a8437a2e/go.mod h1:0EyoBvUxDpLYN5TK7LOeRSZnXFW3I9lliTxaQSxCQiQ=
 github.com/ncruces/go-strftime v0.1.9 h1:bY0MQC28UADQmHmaF5dgpLmImcShSi2kHU9XLdhx/f4=
 github.com/ncruces/go-strftime v0.1.9/go.mod h1:Fwc5htZGVVkseilnfgOVb9mKy6w1naJmn9CehxcKcls=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=

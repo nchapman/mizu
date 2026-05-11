@@ -26,28 +26,27 @@ func newSvc(t *testing.T) (*Service, *db.DB) {
 	return s, conn
 }
 
-func TestNew_FirstRunGeneratesSetupToken(t *testing.T) {
+func TestNew_FirstRunOpensSetupWindow(t *testing.T) {
 	s, _ := newSvc(t)
 	ok, err := s.Configured(context.Background())
 	if err != nil || ok {
 		t.Errorf("Configured=(%v,%v), want (false,nil)", ok, err)
 	}
-	if s.SetupToken() == "" {
-		t.Error("SetupToken empty on first run")
+	win, err := s.Window(context.Background())
+	if err != nil {
+		t.Fatalf("Window: %v", err)
 	}
-}
-
-func TestSetup_RequiresToken(t *testing.T) {
-	s, _ := newSvc(t)
-	_, err := s.Setup(context.Background(), "wrong-token", "a@b.com", "hunter22pw", "Alice")
-	if !errors.Is(err, ErrBadSetupToken) {
-		t.Errorf("err=%v, want ErrBadSetupToken", err)
+	if !win.Open {
+		t.Error("Window.Open=false on first run")
+	}
+	if win.ExpiresAt.IsZero() {
+		t.Error("Window.ExpiresAt zero on first run")
 	}
 }
 
 func TestSetup_RejectsShortPassword(t *testing.T) {
 	s, _ := newSvc(t)
-	_, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "short", "Alice")
+	_, err := s.Setup(context.Background(), "a@b.com", "short", "Alice")
 	if !errors.Is(err, ErrPasswordTooShort) {
 		t.Errorf("err=%v, want ErrPasswordTooShort", err)
 	}
@@ -55,7 +54,7 @@ func TestSetup_RejectsShortPassword(t *testing.T) {
 
 func TestSetup_RejectsInvalidEmail(t *testing.T) {
 	s, _ := newSvc(t)
-	_, err := s.Setup(context.Background(), s.SetupToken(), "not an email", "hunter22pw", "")
+	_, err := s.Setup(context.Background(), "not an email", "hunter22pw", "")
 	if !errors.Is(err, ErrInvalidEmail) {
 		t.Errorf("err=%v, want ErrInvalidEmail", err)
 	}
@@ -63,8 +62,7 @@ func TestSetup_RejectsInvalidEmail(t *testing.T) {
 
 func TestSetup_HappyPathThenLocked(t *testing.T) {
 	s, _ := newSvc(t)
-	tok := s.SetupToken()
-	u, err := s.Setup(context.Background(), tok, "Alice@example.COM", "hunter22pw", "Alice")
+	u, err := s.Setup(context.Background(), "Alice@example.COM", "hunter22pw", "Alice")
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
@@ -74,13 +72,55 @@ func TestSetup_HappyPathThenLocked(t *testing.T) {
 	if u.DisplayName != "Alice" {
 		t.Errorf("display name=%q", u.DisplayName)
 	}
-	if s.SetupToken() != "" {
-		t.Error("SetupToken should clear after Setup")
+	win, err := s.Window(context.Background())
+	if err != nil {
+		t.Fatalf("Window after setup: %v", err)
+	}
+	if win.Open {
+		t.Error("Window.Open=true after first user created")
 	}
 	// Second Setup must fail.
-	_, err = s.Setup(context.Background(), tok, "b@example.com", "hunter22pw", "")
+	_, err = s.Setup(context.Background(), "b@example.com", "hunter22pw", "")
 	if !errors.Is(err, ErrAlreadyConfigured) {
 		t.Errorf("second Setup err=%v, want ErrAlreadyConfigured", err)
+	}
+}
+
+func TestSetup_RefusesAfterWindowExpires(t *testing.T) {
+	s, _ := newSvc(t)
+	fakeNow := time.Now().Add(SetupWindowDuration + time.Minute)
+	s.now = func() time.Time { return fakeNow }
+	_, err := s.Setup(context.Background(), "a@b.com", "hunter22pw", "")
+	if !errors.Is(err, ErrSetupWindowClosed) {
+		t.Errorf("err=%v, want ErrSetupWindowClosed", err)
+	}
+}
+
+func TestWindow_FirstBootPersistsAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	conn, err := db.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w1, _ := s.Window(context.Background())
+	_ = conn.Close()
+
+	conn2, err := db.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	s2, err := New(conn2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2, _ := s2.Window(context.Background())
+	if !w2.ExpiresAt.Equal(w1.ExpiresAt) {
+		t.Errorf("first_boot_at not stable across reopen: %v vs %v", w1.ExpiresAt, w2.ExpiresAt)
 	}
 }
 
@@ -94,7 +134,7 @@ func TestPersistence_AcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
+	if _, err := s.Setup(context.Background(), "a@b.com", "hunter22pw", ""); err != nil {
 		t.Fatal(err)
 	}
 	_ = conn.Close()
@@ -113,8 +153,9 @@ func TestPersistence_AcrossReopen(t *testing.T) {
 	if !configured {
 		t.Error("Configured=false after reopen")
 	}
-	if s2.SetupToken() != "" {
-		t.Error("SetupToken should be empty after reopen with existing user")
+	win, _ := s2.Window(context.Background())
+	if win.Open {
+		t.Error("Window should be closed after reopen with existing user")
 	}
 	u, _, err := s2.Login(context.Background(), "a@b.com", "hunter22pw")
 	if err != nil {
@@ -127,7 +168,7 @@ func TestPersistence_AcrossReopen(t *testing.T) {
 
 func TestLogin_WrongPasswordReturnsGenericError(t *testing.T) {
 	s, _ := newSvc(t)
-	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
+	if _, err := s.Setup(context.Background(), "a@b.com", "hunter22pw", ""); err != nil {
 		t.Fatal(err)
 	}
 	_, until, err := s.Login(context.Background(), "a@b.com", "nope")
@@ -150,7 +191,7 @@ func TestLogin_UnknownEmailReturnsSameError(t *testing.T) {
 
 func TestLogin_HappyPathClearsFailures(t *testing.T) {
 	s, _ := newSvc(t)
-	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "A"); err != nil {
+	if _, err := s.Setup(context.Background(), "a@b.com", "hunter22pw", "A"); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < maxFailedAttempts-1; i++ {
@@ -179,7 +220,7 @@ func TestLogin_HappyPathClearsFailures(t *testing.T) {
 
 func TestLogin_LocksAfterMaxFailures(t *testing.T) {
 	s, _ := newSvc(t)
-	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
+	if _, err := s.Setup(context.Background(), "a@b.com", "hunter22pw", ""); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < maxFailedAttempts-1; i++ {
@@ -204,7 +245,7 @@ func TestLogin_LocksAfterMaxFailures(t *testing.T) {
 
 func TestLogin_LockoutKeyedByEmail(t *testing.T) {
 	s, _ := newSvc(t)
-	if _, err := s.Setup(context.Background(), s.SetupToken(), "alice@example.com", "hunter22pw", ""); err != nil {
+	if _, err := s.Setup(context.Background(), "alice@example.com", "hunter22pw", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateUser(context.Background(), "bob@example.com", "hunter22pw", ""); err != nil {
@@ -229,7 +270,7 @@ func TestLogin_LockoutKeyedByEmail(t *testing.T) {
 // permanently locked with one probe per lockoutDuration window.
 func TestLogin_LockoutResetsCounterAfterExpiry(t *testing.T) {
 	s, _ := newSvc(t)
-	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
+	if _, err := s.Setup(context.Background(), "a@b.com", "hunter22pw", ""); err != nil {
 		t.Fatal(err)
 	}
 	fakeNow := time.Now()
@@ -249,7 +290,7 @@ func TestLogin_LockoutResetsCounterAfterExpiry(t *testing.T) {
 
 func TestLogin_UnlocksAfterDuration(t *testing.T) {
 	s, _ := newSvc(t)
-	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
+	if _, err := s.Setup(context.Background(), "a@b.com", "hunter22pw", ""); err != nil {
 		t.Fatal(err)
 	}
 	fakeNow := time.Now()
@@ -270,7 +311,7 @@ func TestLogin_UnlocksAfterDuration(t *testing.T) {
 
 func TestCreateUser_DuplicateEmail(t *testing.T) {
 	s, _ := newSvc(t)
-	if _, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", ""); err != nil {
+	if _, err := s.Setup(context.Background(), "a@b.com", "hunter22pw", ""); err != nil {
 		t.Fatal(err)
 	}
 	_, err := s.CreateUser(context.Background(), "A@B.COM", "hunter22pw", "")
@@ -283,7 +324,7 @@ func TestListUsers_OrderedByCreated(t *testing.T) {
 	s, _ := newSvc(t)
 	fakeNow := time.Unix(1_700_000_000, 0)
 	s.now = func() time.Time { return fakeNow }
-	if _, err := s.Setup(context.Background(), s.SetupToken(), "first@example.com", "hunter22pw", "First"); err != nil {
+	if _, err := s.Setup(context.Background(), "first@example.com", "hunter22pw", "First"); err != nil {
 		t.Fatal(err)
 	}
 	fakeNow = fakeNow.Add(time.Hour)
@@ -301,7 +342,7 @@ func TestListUsers_OrderedByCreated(t *testing.T) {
 
 func TestDeleteUser_RefusesLastUser(t *testing.T) {
 	s, _ := newSvc(t)
-	u, err := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "")
+	u, err := s.Setup(context.Background(), "a@b.com", "hunter22pw", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +353,7 @@ func TestDeleteUser_RefusesLastUser(t *testing.T) {
 
 func TestDeleteUser_CascadesSessions(t *testing.T) {
 	s, _ := newSvc(t)
-	a, _ := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "")
+	a, _ := s.Setup(context.Background(), "a@b.com", "hunter22pw", "")
 	b, err := s.CreateUser(context.Background(), "b@b.com", "hunter22pw", "")
 	if err != nil {
 		t.Fatal(err)
@@ -338,7 +379,7 @@ func TestDeleteUser_CascadesSessions(t *testing.T) {
 
 func TestChangePassword(t *testing.T) {
 	s, _ := newSvc(t)
-	u, _ := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "")
+	u, _ := s.Setup(context.Background(), "a@b.com", "hunter22pw", "")
 	if err := s.ChangePassword(context.Background(), u.ID, "wrong", "newpassword22"); !errors.Is(err, ErrInvalidPassword) {
 		t.Errorf("wrong old: err=%v", err)
 	}
@@ -358,7 +399,7 @@ func TestChangePassword(t *testing.T) {
 
 func TestSessions_LifecycleAndReap(t *testing.T) {
 	s, conn := newSvc(t)
-	u, _ := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "")
+	u, _ := s.Setup(context.Background(), "a@b.com", "hunter22pw", "")
 	t1, err := s.CreateSession(context.Background(), u.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -417,7 +458,7 @@ func TestSessions_LifecycleAndReap(t *testing.T) {
 
 func TestMiddleware(t *testing.T) {
 	s, _ := newSvc(t)
-	u, _ := s.Setup(context.Background(), s.SetupToken(), "a@b.com", "hunter22pw", "Alice")
+	u, _ := s.Setup(context.Background(), "a@b.com", "hunter22pw", "Alice")
 	var seen *User
 	h := s.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = UserFrom(r.Context())

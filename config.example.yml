@@ -1,4 +1,11 @@
+# Most of what's in this file is written for you by the admin setup
+# wizard the first time you visit /admin. Hand-editing is fine and
+# preserved across wizard runs (comments and ordering survive the
+# round-trip), but on a fresh install you can skip this file entirely
+# — boot the binary, open /admin, follow the wizard.
+
 site:
+  # Written by the wizard's "About your site" step.
   title: My Site
   author: Your Name
   base_url: http://localhost:8080
@@ -13,12 +20,13 @@ server:
   #   addr: ":443"
   #   http_addr: ":80"
   #   staging: false
-  # ^ Optional. When enabled, mizu obtains certificates from
-  # Let's Encrypt automatically (via CertMagic), serves HTTPS on `addr`,
-  # and runs an HTTP listener on `http_addr` that solves ACME
-  # challenges and redirects everything else to HTTPS. Set staging:
-  # true to test against the LE staging endpoint (issues untrusted
-  # certs but has friendlier rate limits) before going live.
+  # ^ Optional. Easiest path: skip this block, run the wizard's
+  # "Enable HTTPS" step, and the wizard will write it for you. When
+  # enabled, mizu obtains certificates from Let's Encrypt automatically
+  # (via CertMagic), serves HTTPS on `addr`, and runs an HTTP listener
+  # on `http_addr` that solves ACME challenges and redirects everything
+  # else to HTTPS. Set staging: true to test against the LE staging
+  # endpoint (untrusted certs, friendlier rate limits) before going live.
   #
   # Heads-up: when TLS is on, mizu emits HSTS with includeSubdomains
   # for one year. If you ever serve a sibling subdomain over plain

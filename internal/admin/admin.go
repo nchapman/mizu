@@ -14,6 +14,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -22,25 +23,47 @@ import (
 	"github.com/nchapman/mizu/internal/config"
 	"github.com/nchapman/mizu/internal/feeds"
 	"github.com/nchapman/mizu/internal/media"
+	"github.com/nchapman/mizu/internal/netinfo"
 	"github.com/nchapman/mizu/internal/post"
 	mizuserver "github.com/nchapman/mizu/internal/server"
 	"github.com/nchapman/mizu/internal/webmention"
 )
 
-type Server struct {
-	cfg    *config.Config
-	posts  *post.Store
-	feeds  *feeds.Service
-	poller *feeds.Poller
-	auth   *auth.Service
-	media  *media.Store
-	wm     *webmention.Service
-	dist   fs.FS           // built admin SPA (embedded by default)
-	bgCtx  context.Context // lives for the process lifetime; used for fire-and-forget jobs
+// TLSController is the seam admin uses to flip TLS on after the wizard
+// finishes. The real implementation lives in internal/server; admin
+// only sees these two calls so it doesn't have to know about CertMagic.
+type TLSController interface {
+	Enable(ctx context.Context, domains []string, email string, staging bool) error
+	Status() mizuserver.TLSStatus
 }
 
-func New(bgCtx context.Context, cfg *config.Config, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller, a *auth.Service, m *media.Store, wm *webmention.Service, dist fs.FS) *Server {
-	return &Server{bgCtx: bgCtx, cfg: cfg, posts: posts, feeds: feedSvc, poller: poller, auth: a, media: m, wm: wm, dist: dist}
+type Server struct {
+	cfg        *config.Config
+	configPath string
+	// cfgMu guards in-memory mutations of cfg.Site / cfg.Server.TLS
+	// from the wizard handlers against concurrent reads in /me and
+	// the post-create path that reads cfg.Site.BaseURL. The wizard
+	// runs once during onboarding so contention is essentially nil,
+	// but Go's memory model still requires the synchronization.
+	cfgMu    sync.RWMutex
+	posts    *post.Store
+	feeds    *feeds.Service
+	poller   *feeds.Poller
+	auth     *auth.Service
+	media    *media.Store
+	wm       *webmention.Service
+	dist     fs.FS // built admin SPA (embedded by default)
+	publicIP *netinfo.PublicIPCache
+	tls      TLSController
+	bgCtx    context.Context // lives for the process lifetime; used for fire-and-forget jobs
+}
+
+func New(bgCtx context.Context, cfg *config.Config, configPath string, posts *post.Store, feedSvc *feeds.Service, poller *feeds.Poller, a *auth.Service, m *media.Store, wm *webmention.Service, ipCache *netinfo.PublicIPCache, tlsCtrl TLSController, dist fs.FS) *Server {
+	return &Server{
+		bgCtx: bgCtx, cfg: cfg, configPath: configPath,
+		posts: posts, feeds: feedSvc, poller: poller, auth: a, media: m, wm: wm,
+		publicIP: ipCache, tls: tlsCtrl, dist: dist,
+	}
 }
 
 func (s *Server) Routes(r chi.Router) {
@@ -51,6 +74,7 @@ func (s *Server) Routes(r chi.Router) {
 		// the one-time setup token.
 		r.Get("/me", s.me)
 		r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Setup)).Post("/setup", s.setup)
+		r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Setup)).Post("/setup/dns-check", s.setupDNSCheck)
 		r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Login)).Post("/login", s.login)
 		// Logout is reachable pre-auth (a stale cookie should still be
 		// clearable) but the per-IP cap keeps it from being abused as
@@ -83,6 +107,15 @@ func (s *Server) Routes(r chi.Router) {
 			r.Post("/media", s.uploadMedia)
 
 			r.Get("/mentions", s.listMentions)
+
+			// Wizard endpoints that need an authenticated session: the
+			// account-creation step runs unauthenticated (via /setup
+			// above), then logs the operator in; from there everything
+			// else flows through the cookie. Rate-limited under the
+			// setup budget to keep brute-force surface minimal.
+			r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Setup)).Post("/setup/site", s.setupSite)
+			r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Setup)).Post("/setup/enable-tls", s.setupEnableTLS)
+			r.Get("/setup/tls-status", s.setupTLSStatus)
 
 			// User management — any authenticated user can add or
 			// remove others, change their own password. No roles.
@@ -129,10 +162,21 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.cfgMu.RLock()
+	siteTitle := s.cfg.Site.Title
+	s.cfgMu.RUnlock()
 	resp := map[string]any{
 		"configured":    configured,
 		"authenticated": false,
-		"site_title":    s.cfg.Site.Title,
+		"site_title":    siteTitle,
+	}
+	if !configured {
+		win, err := s.auth.Window(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		resp["setup_window"] = win
 	}
 	if c, err := r.Cookie(auth.CookieName); err == nil {
 		if u, err := s.auth.Lookup(r.Context(), c.Value); err == nil && u != nil {
@@ -145,7 +189,6 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Token       string `json:"token"`
 		Email       string `json:"email"`
 		Password    string `json:"password"`
 		DisplayName string `json:"display_name"`
@@ -153,7 +196,7 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, s.cfg.Limits.Body.Setup, &in) {
 		return
 	}
-	u, err := s.auth.Setup(r.Context(), in.Token, in.Email, in.Password, in.DisplayName)
+	u, err := s.auth.Setup(r.Context(), in.Email, in.Password, in.DisplayName)
 	if code, mapped := mapAuthError(err); mapped != nil {
 		http.Error(w, mapped.Error(), code)
 		return
@@ -206,6 +249,151 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	auth.SetCookie(w, token, s.cfg.Server.TLS.Enabled)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// setupDNSCheck resolves a domain via the system resolver and reports
+// whether any of its A records match this server's public IP. Returns
+// hints in plain English so the wizard can surface them verbatim.
+// Public (pre-auth) because the wizard runs this *before* asking the
+// operator to commit account details — it's the "are we ready to set
+// up" pre-flight.
+func (s *Server) setupDNSCheck(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Domain string `json:"domain"`
+	}
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Setup, &in) {
+		return
+	}
+	ip := ""
+	if s.publicIP != nil {
+		// Tight timeout: the wizard waits on this synchronously.
+		ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+		defer cancel()
+		ip, _ = s.publicIP.Get(ctx)
+	}
+	dnsCtx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+	defer cancel()
+	res := netinfo.LookupDomain(dnsCtx, strings.TrimSpace(in.Domain), ip)
+	writeJSON(w, http.StatusOK, res)
+}
+
+// setupSite persists the wizard's site-basics step to config.yml and
+// updates the in-memory cfg copy so the running process picks up the
+// new title/base_url immediately. Authenticated — the wizard runs this
+// after the account-creation step.
+func (s *Server) setupSite(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Title       string `json:"title"`
+		Author      string `json:"author"`
+		BaseURL     string `json:"base_url"`
+		Description string `json:"description"`
+		ThemeName   string `json:"theme_name"`
+	}
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Setup, &in) {
+		return
+	}
+	in.Title = strings.TrimSpace(in.Title)
+	in.Author = strings.TrimSpace(in.Author)
+	in.BaseURL = strings.TrimRight(strings.TrimSpace(in.BaseURL), "/")
+	in.Description = strings.TrimSpace(in.Description)
+	in.ThemeName = strings.TrimSpace(in.ThemeName)
+	if in.Title == "" {
+		http.Error(w, "title required", http.StatusBadRequest)
+		return
+	}
+	if in.BaseURL == "" {
+		http.Error(w, "base_url required", http.StatusBadRequest)
+		return
+	}
+	if u, err := url.Parse(in.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		http.Error(w, "base_url must be an http(s) URL with a host", http.StatusBadRequest)
+		return
+	}
+	if err := config.WriteSite(s.configPath, config.SiteSettings{
+		Title:       in.Title,
+		Author:      in.Author,
+		BaseURL:     in.BaseURL,
+		Description: in.Description,
+		ThemeName:   in.ThemeName,
+	}); err != nil {
+		http.Error(w, "write config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Mutate the in-memory cfg the rest of the process is reading.
+	// The render pipeline reloads its own snapshot from disk via the
+	// fsnotify watch, so it'll pick up the new values too — this just
+	// covers the handlers that read s.cfg directly (e.g. /me's
+	// site_title field, the webmention target check).
+	s.cfgMu.Lock()
+	s.cfg.Site.Title = in.Title
+	s.cfg.Site.Author = in.Author
+	s.cfg.Site.BaseURL = in.BaseURL
+	s.cfg.Site.Description = in.Description
+	if in.ThemeName != "" {
+		s.cfg.Theme.Name = in.ThemeName
+	}
+	s.cfgMu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// setupEnableTLS persists TLS settings, kicks off the in-process
+// runner, and returns 202. The wizard polls /setup/tls-status until
+// the issuance reaches "ready" or "error".
+func (s *Server) setupEnableTLS(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Domains []string `json:"domains"`
+		Email   string   `json:"email"`
+		Staging bool     `json:"staging"`
+	}
+	if !decodeJSON(w, r, s.cfg.Limits.Body.Setup, &in) {
+		return
+	}
+	if len(in.Domains) == 0 {
+		http.Error(w, "at least one domain required", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(in.Email) == "" {
+		http.Error(w, "ACME contact email required", http.StatusBadRequest)
+		return
+	}
+	if s.tls == nil {
+		http.Error(w, "TLS controller not configured", http.StatusServiceUnavailable)
+		return
+	}
+	// Bind the listener FIRST. If port 80/443 is taken or CertMagic
+	// can't start, we surface a 500 to the wizard and leave config.yml
+	// untouched — otherwise a failed-Enable would persist enabled:true
+	// to disk and the next process restart would Fatalf on the same
+	// bind error, locking the operator out of the wizard.
+	if err := s.tls.Enable(s.bgCtx, in.Domains, in.Email, in.Staging); err != nil {
+		http.Error(w, "enable TLS: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := config.WriteTLS(s.configPath, config.TLSSettings{
+		Enabled: true, Domains: in.Domains, Email: in.Email, Staging: in.Staging,
+	}); err != nil {
+		// Bind succeeded but persistence failed. TLS is live for this
+		// process; the operator can retry to make it durable. Reporting
+		// a 500 is honest — without the file write, a restart drops
+		// back to plain HTTP.
+		http.Error(w, "write config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.cfgMu.Lock()
+	s.cfg.Server.TLS.Enabled = true
+	s.cfg.Server.TLS.Domains = in.Domains
+	s.cfg.Server.TLS.Email = in.Email
+	s.cfg.Server.TLS.Staging = in.Staging
+	s.cfgMu.Unlock()
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func (s *Server) setupTLSStatus(w http.ResponseWriter, _ *http.Request) {
+	if s.tls == nil {
+		writeJSON(w, http.StatusOK, mizuserver.TLSStatus{State: "off"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.tls.Status())
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
@@ -310,8 +498,8 @@ func mapAuthError(err error) (int, error) {
 		return http.StatusConflict, err
 	case errors.Is(err, auth.ErrPasswordTooShort), errors.Is(err, auth.ErrInvalidEmail):
 		return http.StatusBadRequest, err
-	case errors.Is(err, auth.ErrBadSetupToken):
-		return http.StatusForbidden, err
+	case errors.Is(err, auth.ErrSetupWindowClosed):
+		return http.StatusGone, err
 	case errors.Is(err, auth.ErrEmailTaken):
 		return http.StatusConflict, err
 	case errors.Is(err, auth.ErrInvalidPassword):
@@ -413,7 +601,10 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 // html is passed in (rather than re-rendered here) so a single
 // create/update doesn't render the body twice.
 func (s *Server) queueWebmentions(p *post.Post, html string) {
-	target := s.cfg.Site.BaseURL + p.Path()
+	s.cfgMu.RLock()
+	baseURL := s.cfg.Site.BaseURL
+	s.cfgMu.RUnlock()
+	target := baseURL + p.Path()
 	go func() {
 		ctx, cancel := context.WithTimeout(s.bgCtx, 2*time.Minute)
 		defer cancel()

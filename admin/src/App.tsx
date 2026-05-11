@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
 import "./App.css";
 import { Login } from "./Login";
-import { Setup } from "./Setup";
 import { Shell } from "./Shell";
+import { SetupWindowClosed, Wizard } from "./Wizard";
 import { Button } from "@/components/ui/button";
 
 type MeUser = { id: number; email: string; display_name: string };
+type SetupWindow = { open: boolean; expires_at?: string };
 type Me = {
   configured: boolean;
   authenticated: boolean;
   site_title?: string;
   user?: MeUser;
+  setup_window?: SetupWindow;
 };
 
 export function App() {
@@ -44,7 +46,10 @@ export function App() {
     );
   }
   if (!me) return null;
-  if (!me.configured) return <Setup onDone={loadMe} siteTitle={me.site_title} />;
+  if (!me.configured) {
+    if (me.setup_window && !me.setup_window.open) return <SetupWindowClosed />;
+    return <Wizard onDone={loadMe} siteTitle={me.site_title} setupWindow={me.setup_window} />;
+  }
   if (!me.authenticated) return <Login onDone={loadMe} siteTitle={me.site_title} />;
   return <Shell onLogout={loadMe} />;
 }

@@ -11,11 +11,15 @@
 package site
 
 import (
+	"context"
+	_ "embed"
 	"errors"
 	"net/http"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -24,18 +28,65 @@ import (
 	"github.com/nchapman/mizu/internal/webmention"
 )
 
+// ConfiguredFn reports whether the install has at least one user. Site
+// uses this to flip every public route to a friendly placeholder until
+// the operator finishes onboarding. nil means "always configured" — a
+// convenient default for tests that don't care about the placeholder
+// path.
+type ConfiguredFn func(ctx context.Context) (bool, error)
+
 // Server wires the public mux. PublicDir is the baked-output root
 // produced by internal/render. The webmention service stays dynamic —
 // it accepts POST /webmention, queues for verification, and the
 // verifier worker enqueues a render when a mention promotes.
 type Server struct {
-	cfg       *config.Config
-	wm        *webmention.Service
-	publicDir string
+	cfg        *config.Config
+	wm         *webmention.Service
+	publicDir  string
+	configured ConfiguredFn
+
+	// cachedConfigured caches the configured-state across requests so
+	// the public root doesn't hit the DB on every hit during the
+	// pre-setup window. Flips one-way (false → true) when the wizard
+	// completes; never goes back during the process lifetime, so a
+	// stale "true" can't appear post-deletion in this process. A stale
+	// "false" right after setup is bounded by cachedConfiguredTTL.
+	cachedConfigured atomic.Bool
+	cachedAt         atomic.Int64
 }
 
-func New(cfg *config.Config, wm *webmention.Service, publicDir string) *Server {
-	return &Server{cfg: cfg, wm: wm, publicDir: publicDir}
+const cachedConfiguredTTL = time.Second
+
+//go:embed placeholder.html
+var placeholderHTML []byte
+
+func New(cfg *config.Config, wm *webmention.Service, publicDir string, configured ConfiguredFn) *Server {
+	return &Server{cfg: cfg, wm: wm, publicDir: publicDir, configured: configured}
+}
+
+// isConfigured returns the cached configured state, refreshing from the
+// callback if the cache is stale. Errors from the callback are treated
+// as "configured" — failing closed (placeholder) on a transient DB
+// error would hide the real site, which is worse than the false
+// negative of skipping the placeholder for one request.
+func (s *Server) isConfigured(ctx context.Context) bool {
+	if s.configured == nil {
+		return true
+	}
+	if s.cachedConfigured.Load() {
+		return true
+	}
+	now := time.Now().Unix()
+	if last := s.cachedAt.Load(); now-last < int64(cachedConfiguredTTL.Seconds()) {
+		return false
+	}
+	ok, err := s.configured(ctx)
+	if err != nil {
+		return true
+	}
+	s.cachedConfigured.Store(ok)
+	s.cachedAt.Store(now)
+	return ok
 }
 
 // Routes mounts:
@@ -44,7 +95,40 @@ func New(cfg *config.Config, wm *webmention.Service, publicDir string) *Server {
 //     cache-control + X-Robots-Tag + Link header decoration.
 func (s *Server) Routes(r chi.Router) {
 	r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Webmention)).Post("/webmention", s.webmention)
-	r.Handle("/*", s.publicHandler())
+	r.Handle("/*", s.gatedPublicHandler())
+}
+
+// gatedPublicHandler intercepts every public GET while the install is
+// unconfigured and returns a small placeholder page (or a 503 for
+// feed/sitemap requests) instead of serving the half-baked public dir.
+// Once setup completes the wrapper falls through to the real handler.
+func (s *Server) gatedPublicHandler() http.Handler {
+	real := s.publicHandler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.isConfigured(r.Context()) {
+			real.ServeHTTP(w, r)
+			return
+		}
+		s.servePlaceholder(w, r)
+	})
+}
+
+// servePlaceholder renders the "awaiting setup" page for HTML requests
+// and a 503 for machine-readable feed/sitemap paths. Feed readers and
+// search crawlers should back off rather than indexing the placeholder
+// as a real homepage.
+func (s *Server) servePlaceholder(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+	w.Header().Set("Cache-Control", "no-store")
+	cleaned := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/"))
+	if cleaned == "/feed.xml" || cleaned == "/sitemap.xml" || cleaned == "/robots.txt" {
+		w.Header().Set("Retry-After", "300")
+		http.Error(w, "this mizu instance has not finished setup yet", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(placeholderHTML)
 }
 
 // publicHandler wraps http.FileServer with the response-header policy
