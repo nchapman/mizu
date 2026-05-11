@@ -33,13 +33,12 @@ import (
 // finishes. The real implementation lives in internal/server; admin
 // only sees these calls so it doesn't have to know about CertMagic.
 //
-// RequestEnable is the wizard/Settings entry: tries to bring TLS up
-// now, but if DNS hasn't propagated to this host's IP yet it persists
-// the intent and lets a background poller retry. CancelPending drops
-// that intent if the operator changes their mind.
+// CertMagic handles retries, exponential backoff on DNS-not-ready
+// errors, and rate-limit-aware ACME retries internally — admin doesn't
+// need to baby-sit the issuance loop. The flow is just: call Enable,
+// poll Status().
 type TLSController interface {
-	RequestEnable(ctx context.Context, domains []string, email string, staging bool) error
-	CancelPending(ctx context.Context) error
+	Enable(ctx context.Context, domains []string, email string, staging bool) error
 	Status() mizuserver.TLSStatus
 }
 
@@ -121,7 +120,6 @@ func (s *Server) Routes(r chi.Router) {
 			// setup budget to keep brute-force surface minimal.
 			r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Setup)).Post("/setup/site", s.setupSite)
 			r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Setup)).Post("/setup/enable-tls", s.setupEnableTLS)
-			r.Delete("/setup/pending-tls", s.setupCancelPendingTLS)
 			r.Get("/setup/tls-status", s.setupTLSStatus)
 
 			// User management — any authenticated user can add or
@@ -373,38 +371,23 @@ func (s *Server) setupEnableTLS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "TLS controller not configured", http.StatusServiceUnavailable)
 		return
 	}
-	// RequestEnable either fires Enable synchronously (DNS already
-	// points here) or persists the intent for the background poller.
-	// Either way we don't write config.yml here — the OnEnabled
-	// callback (wired in main.go to PersistTLSConfig) takes care of
-	// that only after the listener is actually bound, so a failed
-	// Enable can't leave enabled=true on disk and Fatalf the next
-	// restart.
-	if err := s.tls.RequestEnable(s.bgCtx, in.Domains, in.Email, in.Staging); err != nil {
+	// Enable binds the listeners synchronously, then hands the domain
+	// off to CertMagic which manages issuance / retry / renewal on its
+	// own. We don't write config.yml here — the OnEnabled callback
+	// (wired in main.go to PersistTLSConfig) fires once CertMagic has
+	// actually obtained a cert, so a failed issuance can't leave
+	// enabled=true on disk and Fatalf the next restart.
+	if err := s.tls.Enable(s.bgCtx, in.Domains, in.Email, in.Staging); err != nil {
 		http.Error(w, "enable TLS: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// setupCancelPendingTLS drops a stored pending intent so the operator
-// can step away from a "Waiting for DNS" state without restarting.
-func (s *Server) setupCancelPendingTLS(w http.ResponseWriter, r *http.Request) {
-	if s.tls == nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if err := s.tls.CancelPending(r.Context()); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// PersistTLSConfig is the OnEnabled callback for the TLS manager. It
-// writes the now-live TLS settings to config.yml and updates the
-// in-memory cfg so subsequent reads see the same values. Called both
-// on the synchronous wizard path and from the background DNS poller.
+// PersistTLSConfig is the OnEnabled callback for the TLS manager.
+// Fires once CertMagic confirms a cert via `cert_obtained` (including
+// renewals). Writes the live TLS settings to config.yml and updates
+// the in-memory cfg.
 func (s *Server) PersistTLSConfig(domains []string, email string, staging bool) {
 	if err := config.WriteTLS(s.configPath, config.TLSSettings{
 		Enabled: true, Domains: domains, Email: email, Staging: staging,

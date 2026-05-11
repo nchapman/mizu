@@ -7,12 +7,7 @@ import { Separator } from "@/components/ui/separator";
 
 import { changeOwnPassword, Unauthorized } from "./api";
 
-export type TLSPending = {
-  domains?: string[];
-  last_checked?: number;
-  last_error?: string;
-};
-export type TLSStatus = { state: string; error?: string; pending?: TLSPending };
+export type TLSStatus = { state: string; error?: string };
 
 type DNSResult = {
   domain: string;
@@ -113,8 +108,8 @@ export function SettingsView({
 // /setup/enable-tls — are identical to the wizard; only the surrounding
 // chrome differs.
 function HTTPSPanel({ status, onChanged }: { status?: TLSStatus; onChanged?: () => void }) {
-  const enabled = status?.state === "ready" || status?.state === "issuing";
-  const pending = status?.state === "pending";
+  const enabled = status?.state === "ready";
+  const issuing = status?.state === "issuing";
   const [domain, setDomain] = useState("");
   const [email, setEmail] = useState("");
   const [staging, setStaging] = useState(false);
@@ -154,19 +149,10 @@ function HTTPSPanel({ status, onChanged }: { status?: TLSStatus; onChanged?: () 
         setErr((await r.text()) || "Could not enable HTTPS.");
         return;
       }
-      // Server now returns 202 either way: TLS came up immediately, OR
-      // DNS wasn't ready and the request was queued for the background
-      // poller. Refresh status from /me to surface whichever state we
-      // landed in.
       onChanged?.();
     } finally {
       setEnabling("idle");
     }
-  }
-
-  async function cancelPending() {
-    await fetch("/admin/api/setup/pending-tls", { method: "DELETE" });
-    onChanged?.();
   }
 
   return (
@@ -175,16 +161,16 @@ function HTTPSPanel({ status, onChanged }: { status?: TLSStatus; onChanged?: () 
       {enabled ? (
         <>
           <p className="mb-4 text-sm text-muted-foreground">
-            HTTPS is on. To change the domain or rotate certificates, edit{" "}
+            HTTPS is on. CertMagic auto-renews certificates as long as this
+            process keeps running. To change the domain, edit{" "}
             <code className="rounded bg-muted px-1 py-0.5 text-xs">config.yml</code> and restart.
           </p>
           <div className="rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300">
-            TLS state: {status?.state}
-            {status?.error && <span> · {status.error}</span>}
+            TLS state: ready
           </div>
         </>
-      ) : pending ? (
-        <PendingCard pending={status?.pending} onCancel={cancelPending} onRefresh={() => onChanged?.()} />
+      ) : issuing ? (
+        <IssuingCard status={status} onRefresh={() => onChanged?.()} />
       ) : (
         <>
           <p className="mb-4 text-sm text-muted-foreground">
@@ -309,39 +295,29 @@ function PrefRow({
   );
 }
 
-function PendingCard({
-  pending,
-  onCancel,
+function IssuingCard({
+  status,
   onRefresh,
 }: {
-  pending?: TLSPending;
-  onCancel: () => void;
+  status?: TLSStatus;
   onRefresh: () => void;
 }) {
-  const domain = pending?.domains?.[0] ?? "(no domain)";
-  const lastChecked = pending?.last_checked
-    ? new Date(pending.last_checked * 1000).toLocaleTimeString()
-    : "—";
   return (
     <>
       <p className="mb-4 text-sm text-muted-foreground">
-        Waiting for DNS to propagate. We'll keep checking every minute and
-        enable HTTPS the moment your domain points here.
+        HTTPS is being set up. CertMagic is retrying on its own schedule — if
+        DNS hasn't propagated yet it'll keep trying until it does. This
+        normally takes seconds; if DNS just landed it can take a few minutes
+        for the next retry to fire.
       </p>
       <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-4 text-sm text-amber-800 dark:text-amber-300">
-        <div className="mb-2 font-medium">Watching {domain}</div>
-        <div className="text-xs">Last checked at {lastChecked}</div>
-        {pending?.last_error && (
-          <div className="mt-2 text-xs">{pending.last_error}</div>
+        <div className="mb-2 font-medium">Issuing certificate…</div>
+        {status?.error && (
+          <div className="mb-2 text-xs">Last attempt: {status.error}</div>
         )}
-        <div className="mt-3 flex gap-2">
-          <Button type="button" size="sm" variant="outline" onClick={onRefresh}>
-            Refresh
-          </Button>
-          <Button type="button" size="sm" variant="outline" onClick={onCancel}>
-            Stop waiting
-          </Button>
-        </div>
+        <Button type="button" size="sm" variant="outline" onClick={onRefresh}>
+          Refresh
+        </Button>
       </div>
     </>
   );

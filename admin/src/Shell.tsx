@@ -34,10 +34,10 @@ export function Shell({
   // list.
   const clearEditTarget = useCallback(() => setEditTarget(null), []);
 
-  // Surface an attention dot on the menu when HTTPS is off. "issuing",
-  // "pending", and "ready" all count as configured (the operator has
-  // expressed intent); only "off" / "error" prompt for action.
-  const tlsNeedsAttention = !!tls && tls.state !== "ready" && tls.state !== "issuing" && tls.state !== "pending";
+  // Surface an attention dot on the menu when HTTPS is off. "issuing"
+  // and "ready" both mean the operator has expressed intent; only
+  // "off" / "error" prompt for further action.
+  const tlsNeedsAttention = !!tls && tls.state !== "ready" && tls.state !== "issuing";
 
   return (
     <div className="min-h-screen bg-background text-foreground">

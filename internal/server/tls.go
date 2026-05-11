@@ -2,102 +2,68 @@ package server
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/caddyserver/certmagic"
 
 	"github.com/nchapman/mizu/internal/config"
-	mizudb "github.com/nchapman/mizu/internal/db"
 )
 
-// TLSStatus is the read-model the admin UI polls. State transitions are:
+// TLSStatus is the read-model the admin UI polls. State transitions:
 //
-//	off → pending → issuing → ready
-//	                 ↘ error
+//	off → issuing → ready
+//	            ↘ error
 //
-// "pending" means the operator has requested HTTPS but DNS doesn't yet
-// resolve the target domain to this server's public IP; a background
-// poller is checking on a fixed cadence. "issuing" means listeners are
-// bound and CertMagic is driving issuance. "ready" means a cert is
-// installed (best-effort — see the optimistic flip in Enable).
+// "issuing" covers everything between the operator hitting "Enable
+// HTTPS" and the first successful cert. If DNS hasn't propagated yet,
+// CertMagic retries on its own backoff and we stay in "issuing" with
+// the latest validation error surfaced in `Error` for the UI to show.
+// "error" is reserved for hard failures (listener bind, port conflict)
+// that CertMagic can't recover from; the operator must retry by hand.
+// "ready" flips when CertMagic fires the `cert_obtained` event.
 type TLSStatus struct {
-	State   string      `json:"state"`
-	Error   string      `json:"error,omitempty"`
-	Pending *PendingTLS `json:"pending,omitempty"`
+	State string `json:"state"`
+	Error string `json:"error,omitempty"`
 }
-
-// PendingTLS is what the UI shows on the "Waiting for DNS" card. The
-// LastChecked timestamp lets the operator confirm the worker is alive;
-// LastError surfaces the most recent DNS-mismatch hint without making
-// them open the wizard again.
-type PendingTLS struct {
-	Domains     []string `json:"domains"`
-	Email       string   `json:"email"`
-	Staging     bool     `json:"staging"`
-	LastChecked int64    `json:"last_checked,omitempty"`
-	LastError   string   `json:"last_error,omitempty"`
-}
-
-// pendingPollInterval is the cadence at which the background poller
-// re-checks DNS for a pending intent. One minute trades operator
-// patience ("how often is mizu re-checking?") against the cost of a
-// per-tick A-record lookup, which is essentially free.
-const pendingPollInterval = time.Minute
-
-// pendingKey is the app_meta key under which we serialize pending intent.
-const pendingKey = "tls_pending"
 
 // TLSManager owns the certmagic.Config and the two listeners (HTTPS +
 // ACME-challenge/redirect). It can be brought up at boot (if the
 // loaded config has tls.enabled = true) or live from the setup wizard
-// via Enable / RequestEnable.
+// via Enable.
 //
 // The plain-HTTP listener bound on cfg.Server.Addr (e.g. :8080) is
 // left running in parallel: the wizard finishes over that listener,
 // and once TLS is up the SPA redirects clients to https://.
 type TLSManager struct {
-	cfg        *config.Config
-	handler    http.Handler
-	wg         *sync.WaitGroup
-	db         *mizudb.DB
-	publicIPFn func(ctx context.Context) (string, error)
-	bgCtx      context.Context
+	cfg     *config.Config
+	handler http.Handler
+	wg      *sync.WaitGroup
 
-	mu           sync.Mutex
-	state        string
-	lastErr      error
-	pending      *PendingTLS
-	pollerCancel context.CancelFunc
-	onEnabled    func(domains []string, email string, staging bool)
-	main         *http.Server
-	redirect     *http.Server
+	mu        sync.Mutex
+	state     string
+	lastErr   error
+	onEnabled func(domains []string, email string, staging bool)
+
+	// magic is retained on the struct so its certificate cache + the
+	// maintenance goroutine the cache spawns stay alive for the process
+	// lifetime. Renewals fire automatically off that goroutine — there's
+	// nothing else to schedule.
+	magic    *certmagic.Config
+	cache    *certmagic.Cache
+	main     *http.Server
+	redirect *http.Server
 }
 
-// TLSDeps groups the runtime dependencies TLSManager needs beyond the
-// config + handler — keeping the constructor signature manageable.
-type TLSDeps struct {
-	DB       *mizudb.DB
-	PublicIP func(ctx context.Context) (string, error)
-}
-
-// NewTLSManager constructs an idle manager. bgCtx lives for the
-// process lifetime and drives the pending-DNS poller; once it's
-// cancelled the poller exits cleanly. handler is the same chi router
-// the plain HTTP listener serves — TLS just terminates in front of it.
-func NewTLSManager(bgCtx context.Context, handler http.Handler, cfg *config.Config, wg *sync.WaitGroup, deps TLSDeps) *TLSManager {
-	return &TLSManager{
-		cfg: cfg, handler: handler, wg: wg, state: "off",
-		bgCtx: bgCtx, db: deps.DB, publicIPFn: deps.PublicIP,
-	}
+// NewTLSManager constructs an idle manager. handler is the same chi
+// router the plain HTTP listener serves — TLS just terminates in front
+// of it.
+func NewTLSManager(handler http.Handler, cfg *config.Config, wg *sync.WaitGroup) *TLSManager {
+	return &TLSManager{cfg: cfg, handler: handler, wg: wg, state: "off"}
 }
 
 // SetHandler swaps the chi router after construction so main.go can
@@ -109,262 +75,35 @@ func (m *TLSManager) SetHandler(h http.Handler) {
 	m.handler = h
 }
 
-// OnEnabled registers a callback fired once Enable succeeds — either
-// from the synchronous hot path or from the pending-DNS poller.
-// Admin uses this to persist cfg.Server.TLS to disk only after the
-// listener is up, so a failed Enable doesn't leave enabled=true on
-// disk and Fatalf the next restart.
+// OnEnabled registers a callback fired once CertMagic obtains a cert
+// (the `cert_obtained` event). Admin uses this to persist
+// cfg.Server.TLS to disk only after a real cert lands, so a failed
+// issuance can't leave enabled=true on disk and Fatalf the next
+// restart. The callback also fires on renewal — re-writing the same
+// values is a no-op so that's fine.
 func (m *TLSManager) OnEnabled(fn func(domains []string, email string, staging bool)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onEnabled = fn
 }
 
-// RestorePending checks app_meta for a previously-persisted intent
-// and starts the poller if one is present. Call at boot so an instance
-// restart doesn't drop an in-flight pending request on the floor.
-func (m *TLSManager) RestorePending(ctx context.Context) error {
-	if m.db == nil {
-		return nil
-	}
-	var raw string
-	err := m.db.R.QueryRowContext(ctx, `SELECT value FROM app_meta WHERE key = ?`, pendingKey).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("read tls_pending: %w", err)
-	}
-	var p PendingTLS
-	if err := json.Unmarshal([]byte(raw), &p); err != nil {
-		// Don't crash on a malformed row — log and drop it so the
-		// operator can re-request through the UI.
-		log.Printf("tls: dropping malformed tls_pending row: %v", err)
-		_, _ = m.db.W.ExecContext(ctx, `DELETE FROM app_meta WHERE key = ?`, pendingKey)
-		return nil
-	}
-	m.mu.Lock()
-	m.pending = &p
-	m.state = "pending"
-	m.mu.Unlock()
-	m.startPoller()
-	return nil
-}
-
 // EnableFromConfig brings TLS up using whatever's already in cfg.
 // Used at boot when the operator has TLS pre-configured. Returns
-// after listeners are bound; issuance runs in the background.
+// after listeners are bound; issuance runs in the background via
+// CertMagic's own retry/backoff.
 func (m *TLSManager) EnableFromConfig(ctx context.Context) error {
 	t := m.cfg.Server.TLS
 	return m.Enable(ctx, t.Domains, t.Email, t.Staging)
 }
 
-// RequestEnable is the wizard/Settings entry point: try to bring TLS
-// up now, and if DNS doesn't yet resolve the operator's domain to
-// this server's public IP, persist the intent and let the background
-// poller retry every minute until DNS catches up. Either way the
-// caller gets a synchronous "we heard you" response.
-func (m *TLSManager) RequestEnable(ctx context.Context, domains []string, email string, staging bool) error {
-	if len(domains) == 0 {
-		return errors.New("tls: at least one domain required")
-	}
-	if strings.TrimSpace(email) == "" {
-		return errors.New("tls: ACME contact email required")
-	}
-	// Replace any prior pending intent. The operator is expressing
-	// fresh consent; the old poll loop must die.
-	m.cancelPoller()
-
-	ok, hint := m.dnsReady(ctx, domains[0])
-	if ok {
-		// Hot path: DNS is correct, fire Enable synchronously so the
-		// caller gets a meaningful status code (200/500) instead of an
-		// async 202 with a poll loop.
-		_ = m.clearPending(ctx)
-		return m.Enable(ctx, domains, email, staging)
-	}
-
-	pending := &PendingTLS{
-		Domains:     domains,
-		Email:       email,
-		Staging:     staging,
-		LastChecked: time.Now().Unix(),
-		LastError:   hint,
-	}
-	if err := m.savePending(ctx, pending); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	m.pending = pending
-	m.state = "pending"
-	m.lastErr = nil
-	m.mu.Unlock()
-	m.startPoller()
-	return nil
-}
-
-// CancelPending drops a stored intent and stops the poller. No-op when
-// nothing is pending. Used by the UI's "stop waiting" affordance.
-func (m *TLSManager) CancelPending(ctx context.Context) error {
-	m.cancelPoller()
-	if err := m.clearPending(ctx); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	m.pending = nil
-	if m.state == "pending" {
-		m.state = "off"
-	}
-	m.mu.Unlock()
-	return nil
-}
-
-// dnsReady returns true when domain resolves to one of this host's
-// addresses (matching against the public IP discovered via publicIPFn).
-// A returned hint is the same plain-English message the wizard's DNS
-// check would surface, suitable for stashing on the pending row.
-func (m *TLSManager) dnsReady(ctx context.Context, domain string) (bool, string) {
-	ip := ""
-	if m.publicIPFn != nil {
-		ipCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		ip, _ = m.publicIPFn(ipCtx)
-		cancel()
-	}
-	if ip == "" {
-		return false, "Could not determine this server's public IP."
-	}
-	resolver := &net.Resolver{}
-	lookupCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	defer cancel()
-	ips, err := resolver.LookupIP(lookupCtx, "ip4", domain)
-	if err != nil {
-		return false, fmt.Sprintf("Could not resolve A record for %s: %v", domain, err)
-	}
-	for _, a := range ips {
-		if a.String() == ip {
-			return true, ""
-		}
-	}
-	got := make([]string, 0, len(ips))
-	for _, a := range ips {
-		got = append(got, a.String())
-	}
-	return false, fmt.Sprintf("A record points to %s; expected %s.", strings.Join(got, ", "), ip)
-}
-
-// startPoller spins up a single background goroutine that retries the
-// pending intent every pendingPollInterval. Idempotent: callers can
-// invoke after every state change without risking concurrent pollers
-// — the previous one is cancelled first.
-func (m *TLSManager) startPoller() {
-	m.mu.Lock()
-	if m.pollerCancel != nil {
-		m.pollerCancel()
-	}
-	ctx, cancel := context.WithCancel(m.bgCtx)
-	m.pollerCancel = cancel
-	m.mu.Unlock()
-
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		t := time.NewTicker(pendingPollInterval)
-		defer t.Stop()
-		for {
-			if m.tryPending(ctx) {
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-			}
-		}
-	}()
-}
-
-// tryPending attempts the pending intent once. Returns true when the
-// poller should stop (either Enable succeeded or pending was cleared
-// while we slept). Updates the persisted last_checked/last_error so the
-// UI's "Waiting for DNS" card reflects the most recent probe.
-func (m *TLSManager) tryPending(ctx context.Context) bool {
-	m.mu.Lock()
-	p := m.pending
-	m.mu.Unlock()
-	if p == nil || len(p.Domains) == 0 {
-		return true
-	}
-	ok, hint := m.dnsReady(ctx, p.Domains[0])
-	if ok {
-		// DNS caught up. Drop pending state, fire Enable, write config
-		// via the onEnabled callback. If Enable itself errors we surface
-		// it on the manager state — operator sees "error" in the UI and
-		// can retry.
-		_ = m.clearPending(ctx)
-		m.mu.Lock()
-		m.pending = nil
-		m.mu.Unlock()
-		if err := m.Enable(ctx, p.Domains, p.Email, p.Staging); err != nil {
-			log.Printf("tls: pending Enable failed: %v", err)
-			return true
-		}
-		m.mu.Lock()
-		cb := m.onEnabled
-		m.mu.Unlock()
-		if cb != nil {
-			cb(p.Domains, p.Email, p.Staging)
-		}
-		log.Printf("tls: pending intent satisfied; HTTPS live for %v", p.Domains)
-		return true
-	}
-	// Still pending — update the breadcrumb on the row.
-	p.LastChecked = time.Now().Unix()
-	p.LastError = hint
-	_ = m.savePending(ctx, p)
-	m.mu.Lock()
-	m.pending = p
-	m.mu.Unlock()
-	return false
-}
-
-func (m *TLSManager) cancelPoller() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.pollerCancel != nil {
-		m.pollerCancel()
-		m.pollerCancel = nil
-	}
-}
-
-func (m *TLSManager) savePending(ctx context.Context, p *PendingTLS) error {
-	if m.db == nil {
-		return nil
-	}
-	b, err := json.Marshal(p)
-	if err != nil {
-		return err
-	}
-	_, err = m.db.W.ExecContext(ctx,
-		`INSERT INTO app_meta(key, value) VALUES(?, ?)
-		   ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-		pendingKey, string(b),
-	)
-	return err
-}
-
-func (m *TLSManager) clearPending(ctx context.Context) error {
-	if m.db == nil {
-		return nil
-	}
-	_, err := m.db.W.ExecContext(ctx, `DELETE FROM app_meta WHERE key = ?`, pendingKey)
-	return err
-}
-
-// Enable binds the listeners and kicks off CertMagic. The caller is
-// responsible for persisting cfg.Server.TLS to disk after this
-// returns successfully (admin does this via the OnEnabled callback so
-// the same write applies whether Enable was driven by the wizard's
-// synchronous path or by the background poller).
+// Enable binds the HTTPS + ACME listeners and hands the domain off to
+// CertMagic. CertMagic handles DNS-not-ready, transient ACME errors,
+// rate-limit backoff, and renewals on its own — we just need to start
+// it once and stay out of the way.
+//
+// Returns synchronously after listeners are bound. Cert issuance is
+// asynchronous; subscribe to Status() to watch the state transition
+// from "issuing" → "ready" (or to surface a transient `Error`).
 func (m *TLSManager) Enable(ctx context.Context, domains []string, email string, staging bool) error {
 	if len(domains) == 0 {
 		return errors.New("tls: at least one domain required")
@@ -372,26 +111,16 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 	if strings.TrimSpace(email) == "" {
 		return errors.New("tls: ACME contact email required")
 	}
+
 	m.mu.Lock()
 	if m.state == "issuing" || m.state == "ready" {
 		m.mu.Unlock()
 		return errors.New("tls: already enabled")
 	}
+	handler := m.handler
 	m.state = "issuing"
 	m.lastErr = nil
 	m.mu.Unlock()
-
-	certmagic.DefaultACME.Email = email
-	certmagic.DefaultACME.Agreed = true
-	if staging {
-		certmagic.DefaultACME.CA = certmagic.LetsEncryptStagingCA
-	} else {
-		certmagic.DefaultACME.CA = certmagic.LetsEncryptProductionCA
-	}
-	certmagic.Default.Storage = &certmagic.FileStorage{Path: m.cfg.Paths.Certs}
-	magic := certmagic.NewDefault()
-	tc := magic.TLSConfig()
-	tc.NextProtos = append([]string{"h2", "http/1.1"}, tc.NextProtos...)
 
 	addr := m.cfg.Server.TLS.Addr
 	if addr == "" {
@@ -401,14 +130,72 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 	if httpAddr == "" {
 		httpAddr = ":80"
 	}
+	// Catch the most common boot-time misconfig early: the plain HTTP
+	// listener can't share a port with the TLS or ACME listener. Without
+	// this the conflict would surface as an "address already in use"
+	// from inside a goroutine and the UI would just see state="error"
+	// with a cryptic message.
 	if m.cfg.Server.Addr == addr || m.cfg.Server.Addr == httpAddr {
 		m.recordError(fmt.Errorf("tls: server.addr (%s) conflicts with the TLS listener; move the plain HTTP listener to a different port", m.cfg.Server.Addr))
 		return fmt.Errorf("tls: server.addr (%s) overlaps the TLS port; pick a different server.addr (e.g. :8080)", m.cfg.Server.Addr)
 	}
 
+	ca := certmagic.LetsEncryptProductionCA
+	if staging {
+		ca = certmagic.LetsEncryptStagingCA
+	}
+
+	// Build a non-global certmagic config so we don't stomp on the
+	// package-level Default (tests / future callers can coexist) and
+	// hold our own cache reference. The OnEvent hooks are how we drive
+	// the UI: cert_obtained flips state to "ready" and triggers the
+	// config-persist callback; cert_failed updates the surfaced error
+	// without changing state (CertMagic owns retry).
+	var magic *certmagic.Config
+	cache := certmagic.NewCache(certmagic.CacheOptions{
+		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) {
+			return magic, nil
+		},
+	})
+	magic = certmagic.New(cache, certmagic.Config{
+		Storage: &certmagic.FileStorage{Path: m.cfg.Paths.Certs},
+		OnEvent: func(_ context.Context, event string, data map[string]any) error {
+			switch event {
+			case "cert_obtained":
+				m.mu.Lock()
+				m.state = "ready"
+				m.lastErr = nil
+				cb := m.onEnabled
+				m.mu.Unlock()
+				log.Printf("tls: cert obtained for %v", data["identifier"])
+				if cb != nil {
+					cb(domains, email, staging)
+				}
+			case "cert_failed":
+				if err, ok := data["error"].(error); ok && err != nil {
+					m.mu.Lock()
+					m.lastErr = err
+					m.mu.Unlock()
+					log.Printf("tls: cert_failed for %v: %v", data["identifier"], err)
+				}
+			}
+			return nil
+		},
+	})
+	magic.Issuers = []certmagic.Issuer{
+		certmagic.NewACMEIssuer(magic, certmagic.ACMEIssuer{
+			Email:  email,
+			Agreed: true,
+			CA:     ca,
+		}),
+	}
+
+	tc := magic.TLSConfig()
+	tc.NextProtos = append([]string{"h2", "http/1.1"}, tc.NextProtos...)
+
 	mainSrv := &http.Server{
 		Addr:              addr,
-		Handler:           m.handler,
+		Handler:           handler,
 		TLSConfig:         tc,
 		ReadHeaderTimeout: m.cfg.Limits.ReadHeaderTimeout,
 		ReadTimeout:       m.cfg.Limits.ReadTimeout,
@@ -427,6 +214,8 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 	}
 
 	m.mu.Lock()
+	m.magic = magic
+	m.cache = cache
 	m.main = mainSrv
 	m.redirect = redirect
 	m.mu.Unlock()
@@ -454,11 +243,6 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 		m.recordError(err)
 		return err
 	}
-	m.mu.Lock()
-	if m.state == "issuing" {
-		m.state = "ready"
-	}
-	m.mu.Unlock()
 	return nil
 }
 
@@ -478,30 +262,24 @@ func (m *TLSManager) Status() TLSStatus {
 	if m.lastErr != nil {
 		s.Error = m.lastErr.Error()
 	}
-	if m.pending != nil {
-		pcopy := *m.pending
-		// Don't leak the operator's ACME email into the read-model —
-		// keep it server-side only (it's not secret but there's no
-		// reason to surface it). Domain + breadcrumb fields are fine.
-		pcopy.Email = ""
-		s.Pending = &pcopy
-	}
 	return s
 }
 
-// Shutdown stops the redirect server and the main HTTPS server. The
-// process-wide WaitGroup the caller passed at construction is what
-// actually drains the goroutines; this just signals them.
+// Shutdown stops the redirect server, the HTTPS server, and the
+// CertMagic cache's maintenance goroutine. The process-wide WaitGroup
+// drains the listener goroutines; this just signals them.
 func (m *TLSManager) Shutdown(ctx context.Context) {
-	m.cancelPoller()
 	m.mu.Lock()
-	main, redirect := m.main, m.redirect
+	main, redirect, cache := m.main, m.redirect, m.cache
 	m.mu.Unlock()
 	if redirect != nil {
 		_ = redirect.Shutdown(ctx)
 	}
 	if main != nil {
 		_ = main.Shutdown(ctx)
+	}
+	if cache != nil {
+		cache.Stop()
 	}
 }
 

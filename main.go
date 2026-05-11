@@ -157,17 +157,14 @@ func main() {
 	ipCache := netinfo.NewPublicIPCache()
 	// TLSManager is wired below; admin holds it through the
 	// TLSController interface so the wizard's enable-tls handler can
-	// flip the runner without main.go re-wiring. The background-DNS
-	// poller (for pending requests where DNS hasn't propagated yet)
-	// uses ctx so it exits cleanly on shutdown.
-	tlsMgr := mizuserver.NewTLSManager(ctx, nil, cfg, &bg, mizuserver.TLSDeps{
-		DB:       conn,
-		PublicIP: ipCache.Get,
-	})
+	// flip the runner without main.go re-wiring. CertMagic handles all
+	// retry / backoff / DNS-not-ready logic on its own — we just need
+	// to call Enable once.
+	tlsMgr := mizuserver.NewTLSManager(nil, cfg, &bg)
 	adminSrv := admin.New(ctx, cfg, *cfgPath, posts, feedSvc, poller, authSvc, mediaStore, wmSvc, ipCache, tlsMgr, adminDistFS())
-	// When TLS comes up (either synchronously or after the pending
-	// poller catches DNS catching up), persist tls.* to config.yml so
-	// subsequent restarts re-enable automatically.
+	// Persist tls.* to config.yml only once CertMagic fires
+	// cert_obtained, so a failed issuance can't leave enabled=true on
+	// disk and Fatalf the next restart.
 	tlsMgr.OnEnabled(adminSrv.PersistTLSConfig)
 
 	r := chi.NewRouter()
@@ -235,12 +232,6 @@ func main() {
 		if err := tlsMgr.EnableFromConfig(ctx); err != nil {
 			log.Fatalf("tls: %v", err)
 		}
-	}
-	// Pick up any pending intent from a prior boot — operator
-	// requested HTTPS, DNS wasn't ready, process restarted. The poller
-	// keeps trying without needing them to revisit the wizard.
-	if err := tlsMgr.RestorePending(ctx); err != nil {
-		log.Printf("tls: restore pending: %v", err)
 	}
 
 	<-ctx.Done()
