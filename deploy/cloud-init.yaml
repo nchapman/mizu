@@ -23,7 +23,7 @@
 #   docker volume rm mizu_state
 #   docker compose -f /opt/mizu/docker-compose.yml up -d
 # (posts, drafts, and media live in the `content` and `media`
-# volumes — only `state` holds the user table and the first-boot
+# volumes -- only `state` holds the user table and the first-boot
 # marker.)
 #
 # Watchtower polls GHCR hourly. New `vX.Y.Z` tags published from the
