@@ -14,9 +14,14 @@ import type { Route } from "@/lib/router";
 interface Props {
   onNavigate: (r: Route) => void;
   onLogout: () => void;
+  // needsAttention surfaces a small dot on the menu trigger and the
+  // Settings menu item. Today it means "HTTPS isn't configured yet";
+  // if more attention-worthy conditions show up later, group them
+  // here and let Settings be the single landing page.
+  needsAttention?: boolean;
 }
 
-export function TopBar({ onNavigate, onLogout }: Props) {
+export function TopBar({ onNavigate, onLogout, needsAttention }: Props) {
   return (
     <header className="sticky top-0 z-30 mb-6 border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
       <div className="mx-auto flex max-w-2xl items-center justify-between px-4 py-3">
@@ -29,8 +34,14 @@ export function TopBar({ onNavigate, onLogout }: Props) {
         </button>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="icon" aria-label="Menu">
+            <Button variant="ghost" size="icon" aria-label="Menu" className="relative">
               <MoreHorizontal />
+              {needsAttention && (
+                <span
+                  aria-label="Settings needs attention"
+                  className="absolute right-1.5 top-1.5 inline-block h-2 w-2 rounded-full bg-amber-500 ring-2 ring-background"
+                />
+              )}
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-48">
@@ -44,7 +55,13 @@ export function TopBar({ onNavigate, onLogout }: Props) {
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={() => onNavigate("settings")}>
               <SettingsIcon />
-              Settings
+              <span className="flex-1">Settings</span>
+              {needsAttention && (
+                <span
+                  aria-label="HTTPS not configured"
+                  className="ml-2 inline-block h-2 w-2 rounded-full bg-amber-500"
+                />
+              )}
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem onSelect={onLogout}>

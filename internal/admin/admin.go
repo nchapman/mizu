@@ -31,9 +31,15 @@ import (
 
 // TLSController is the seam admin uses to flip TLS on after the wizard
 // finishes. The real implementation lives in internal/server; admin
-// only sees these two calls so it doesn't have to know about CertMagic.
+// only sees these calls so it doesn't have to know about CertMagic.
+//
+// RequestEnable is the wizard/Settings entry: tries to bring TLS up
+// now, but if DNS hasn't propagated to this host's IP yet it persists
+// the intent and lets a background poller retry. CancelPending drops
+// that intent if the operator changes their mind.
 type TLSController interface {
-	Enable(ctx context.Context, domains []string, email string, staging bool) error
+	RequestEnable(ctx context.Context, domains []string, email string, staging bool) error
+	CancelPending(ctx context.Context) error
 	Status() mizuserver.TLSStatus
 }
 
@@ -115,6 +121,7 @@ func (s *Server) Routes(r chi.Router) {
 			// setup budget to keep brute-force surface minimal.
 			r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Setup)).Post("/setup/site", s.setupSite)
 			r.With(mizuserver.RateLimit(s.cfg.Limits.Rate.Setup)).Post("/setup/enable-tls", s.setupEnableTLS)
+			r.Delete("/setup/pending-tls", s.setupCancelPendingTLS)
 			r.Get("/setup/tls-status", s.setupTLSStatus)
 
 			// User management — any authenticated user can add or
@@ -182,6 +189,12 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 		if u, err := s.auth.Lookup(r.Context(), c.Value); err == nil && u != nil {
 			resp["authenticated"] = true
 			resp["user"] = toUserDTO(u)
+			// TLS state is folded in only for authenticated callers —
+			// it carries no PII but advertising "HTTPS is off" to
+			// unauthenticated visitors is needless fingerprinting.
+			if s.tls != nil {
+				resp["tls"] = s.tls.Status()
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -360,32 +373,51 @@ func (s *Server) setupEnableTLS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "TLS controller not configured", http.StatusServiceUnavailable)
 		return
 	}
-	// Bind the listener FIRST. If port 80/443 is taken or CertMagic
-	// can't start, we surface a 500 to the wizard and leave config.yml
-	// untouched — otherwise a failed-Enable would persist enabled:true
-	// to disk and the next process restart would Fatalf on the same
-	// bind error, locking the operator out of the wizard.
-	if err := s.tls.Enable(s.bgCtx, in.Domains, in.Email, in.Staging); err != nil {
+	// RequestEnable either fires Enable synchronously (DNS already
+	// points here) or persists the intent for the background poller.
+	// Either way we don't write config.yml here — the OnEnabled
+	// callback (wired in main.go to PersistTLSConfig) takes care of
+	// that only after the listener is actually bound, so a failed
+	// Enable can't leave enabled=true on disk and Fatalf the next
+	// restart.
+	if err := s.tls.RequestEnable(s.bgCtx, in.Domains, in.Email, in.Staging); err != nil {
 		http.Error(w, "enable TLS: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// setupCancelPendingTLS drops a stored pending intent so the operator
+// can step away from a "Waiting for DNS" state without restarting.
+func (s *Server) setupCancelPendingTLS(w http.ResponseWriter, r *http.Request) {
+	if s.tls == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := s.tls.CancelPending(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// PersistTLSConfig is the OnEnabled callback for the TLS manager. It
+// writes the now-live TLS settings to config.yml and updates the
+// in-memory cfg so subsequent reads see the same values. Called both
+// on the synchronous wizard path and from the background DNS poller.
+func (s *Server) PersistTLSConfig(domains []string, email string, staging bool) {
 	if err := config.WriteTLS(s.configPath, config.TLSSettings{
-		Enabled: true, Domains: in.Domains, Email: in.Email, Staging: in.Staging,
+		Enabled: true, Domains: domains, Email: email, Staging: staging,
 	}); err != nil {
-		// Bind succeeded but persistence failed. TLS is live for this
-		// process; the operator can retry to make it durable. Reporting
-		// a 500 is honest — without the file write, a restart drops
-		// back to plain HTTP.
-		http.Error(w, "write config: "+err.Error(), http.StatusInternalServerError)
+		log.Printf("admin: persist tls config: %v", err)
 		return
 	}
 	s.cfgMu.Lock()
 	s.cfg.Server.TLS.Enabled = true
-	s.cfg.Server.TLS.Domains = in.Domains
-	s.cfg.Server.TLS.Email = in.Email
-	s.cfg.Server.TLS.Staging = in.Staging
+	s.cfg.Server.TLS.Domains = domains
+	s.cfg.Server.TLS.Email = email
+	s.cfg.Server.TLS.Staging = staging
 	s.cfgMu.Unlock()
-	w.WriteHeader(http.StatusAccepted)
 }
 
 func (s *Server) setupTLSStatus(w http.ResponseWriter, _ *http.Request) {

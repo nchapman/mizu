@@ -7,6 +7,22 @@ import { Separator } from "@/components/ui/separator";
 
 import { changeOwnPassword, Unauthorized } from "./api";
 
+export type TLSPending = {
+  domains?: string[];
+  last_checked?: number;
+  last_error?: string;
+};
+export type TLSStatus = { state: string; error?: string; pending?: TLSPending };
+
+type DNSResult = {
+  domain: string;
+  public_ip: string;
+  a_records?: string[];
+  aaaa_records?: string[];
+  matches: boolean;
+  hints?: string[];
+};
+
 // Preferences live in localStorage for now; once we have a real backend
 // store this surface keeps working with a tiny adapter swap.
 const PREFS_KEY = "mizu:prefs";
@@ -36,7 +52,15 @@ function savePrefs(p: Prefs) {
   }
 }
 
-export function SettingsView({ onAuthLost }: { onAuthLost?: () => void } = {}) {
+export function SettingsView({
+  onAuthLost,
+  tlsStatus,
+  onTLSChanged,
+}: {
+  onAuthLost?: () => void;
+  tlsStatus?: TLSStatus;
+  onTLSChanged?: () => void;
+} = {}) {
   const [prefs, setPrefs] = useState<Prefs>(loadPrefs);
 
   useEffect(() => {
@@ -73,8 +97,183 @@ export function SettingsView({ onAuthLost }: { onAuthLost?: () => void } = {}) {
 
       <Separator className="my-8" />
 
+      <HTTPSPanel status={tlsStatus} onChanged={onTLSChanged} />
+
+      <Separator className="my-8" />
+
       <PasswordPanel onAuthLost={onAuthLost} />
     </div>
+  );
+}
+
+// HTTPSPanel surfaces the wizard's Domain + Enable HTTPS flow from the
+// authenticated Shell so an operator who skipped past those steps (or
+// whose DNS hadn't propagated when they ran the wizard) can finish the
+// job whenever they want. The backend endpoints — /setup/dns-check and
+// /setup/enable-tls — are identical to the wizard; only the surrounding
+// chrome differs.
+function HTTPSPanel({ status, onChanged }: { status?: TLSStatus; onChanged?: () => void }) {
+  const enabled = status?.state === "ready" || status?.state === "issuing";
+  const pending = status?.state === "pending";
+  const [domain, setDomain] = useState("");
+  const [email, setEmail] = useState("");
+  const [staging, setStaging] = useState(false);
+  const [dns, setDNS] = useState<DNSResult | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [enabling, setEnabling] = useState<"idle" | "enabling">("idle");
+  const [err, setErr] = useState("");
+
+  async function checkDNS() {
+    setErr("");
+    setChecking(true);
+    try {
+      const r = await fetch("/admin/api/setup/dns-check", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ domain: domain.trim() }),
+      });
+      if (r.ok) setDNS(await r.json());
+      else setErr((await r.text()) || "DNS check failed.");
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  async function enable() {
+    setErr("");
+    if (!domain.trim()) return setErr("Domain required.");
+    if (!email.trim()) return setErr("Contact email required (Let's Encrypt sends renewal warnings here).");
+    setEnabling("enabling");
+    try {
+      const r = await fetch("/admin/api/setup/enable-tls", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ domains: [domain.trim()], email: email.trim(), staging }),
+      });
+      if (!r.ok) {
+        setErr((await r.text()) || "Could not enable HTTPS.");
+        return;
+      }
+      // Server now returns 202 either way: TLS came up immediately, OR
+      // DNS wasn't ready and the request was queued for the background
+      // poller. Refresh status from /me to surface whichever state we
+      // landed in.
+      onChanged?.();
+    } finally {
+      setEnabling("idle");
+    }
+  }
+
+  async function cancelPending() {
+    await fetch("/admin/api/setup/pending-tls", { method: "DELETE" });
+    onChanged?.();
+  }
+
+  return (
+    <section aria-labelledby="https-heading">
+      <h3 id="https-heading" className="mb-1 text-base font-semibold">Domain &amp; HTTPS</h3>
+      {enabled ? (
+        <>
+          <p className="mb-4 text-sm text-muted-foreground">
+            HTTPS is on. To change the domain or rotate certificates, edit{" "}
+            <code className="rounded bg-muted px-1 py-0.5 text-xs">config.yml</code> and restart.
+          </p>
+          <div className="rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300">
+            TLS state: {status?.state}
+            {status?.error && <span> · {status.error}</span>}
+          </div>
+        </>
+      ) : pending ? (
+        <PendingCard pending={status?.pending} onCancel={cancelPending} onRefresh={() => onChanged?.()} />
+      ) : (
+        <>
+          <p className="mb-4 text-sm text-muted-foreground">
+            HTTPS isn't enabled yet. Point your domain's A record at this server, verify with the DNS check, then enable Let's Encrypt.
+          </p>
+          <div className="space-y-3 rounded-md border border-border bg-card p-4">
+            <div className="space-y-1.5">
+              <Label htmlFor="https-domain">Domain</Label>
+              <Input
+                id="https-domain"
+                placeholder="blog.example"
+                value={domain}
+                onChange={(e) => setDomain(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="https-email">Contact email</Label>
+              <Input
+                id="https-email"
+                type="email"
+                placeholder="you@example.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+            </div>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={staging}
+                onChange={(e) => setStaging(e.target.checked)}
+              />
+              Use Let's Encrypt staging (untrusted certs, looser rate limits).
+            </label>
+            <p className="text-xs text-muted-foreground">
+              If DNS hasn't propagated yet, we'll keep checking in the background
+              and turn HTTPS on the moment it's ready — no need to come back.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={checkDNS}
+                disabled={checking || enabling !== "idle" || !domain.trim()}
+              >
+                {checking ? "Checking…" : "Check DNS"}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                onClick={enable}
+                disabled={enabling !== "idle"}
+                className="ml-auto"
+              >
+                {enabling === "enabling" ? "Saving…" : "Enable HTTPS"}
+              </Button>
+            </div>
+            {err && (
+              <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                {err}
+              </div>
+            )}
+            {dns && (
+              <div
+                className={
+                  "rounded-md border px-3 py-2 text-sm " +
+                  (dns.matches
+                    ? "border-emerald-500/40 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300"
+                    : "border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-300")
+                }
+              >
+                {dns.matches ? (
+                  <p>
+                    {dns.domain} → {dns.public_ip}. You're good to enable HTTPS.
+                  </p>
+                ) : (
+                  <div className="space-y-1">
+                    {dns.public_ip && (
+                      <p>This server's public IP appears to be {dns.public_ip}.</p>
+                    )}
+                    {dns.hints?.map((h, i) => <p key={i}>{h}</p>)}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </section>
   );
 }
 
@@ -107,6 +306,44 @@ function PrefRow({
         className="mt-1 h-4 w-4 cursor-pointer accent-primary"
       />
     </div>
+  );
+}
+
+function PendingCard({
+  pending,
+  onCancel,
+  onRefresh,
+}: {
+  pending?: TLSPending;
+  onCancel: () => void;
+  onRefresh: () => void;
+}) {
+  const domain = pending?.domains?.[0] ?? "(no domain)";
+  const lastChecked = pending?.last_checked
+    ? new Date(pending.last_checked * 1000).toLocaleTimeString()
+    : "—";
+  return (
+    <>
+      <p className="mb-4 text-sm text-muted-foreground">
+        Waiting for DNS to propagate. We'll keep checking every minute and
+        enable HTTPS the moment your domain points here.
+      </p>
+      <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-4 text-sm text-amber-800 dark:text-amber-300">
+        <div className="mb-2 font-medium">Watching {domain}</div>
+        <div className="text-xs">Last checked at {lastChecked}</div>
+        {pending?.last_error && (
+          <div className="mt-2 text-xs">{pending.last_error}</div>
+        )}
+        <div className="mt-3 flex gap-2">
+          <Button type="button" size="sm" variant="outline" onClick={onRefresh}>
+            Refresh
+          </Button>
+          <Button type="button" size="sm" variant="outline" onClick={onCancel}>
+            Stop waiting
+          </Button>
+        </div>
+      </div>
+    </>
   );
 }
 

@@ -424,45 +424,34 @@ function TLSStep({
   onNext: () => void;
 }) {
   const [err, setErr] = useState("");
-  const [status, setStatus] = useState<string>("idle");
+  const [status, setStatus] = useState<"idle" | "saving">("idle");
 
   async function enable() {
     setErr("");
     if (!value.domain.trim()) return setErr("Domain required.");
     if (!value.email.trim()) return setErr("Contact email required (Let's Encrypt sends renewal warnings here).");
-    setStatus("enabling");
-    const r = await fetch("/admin/api/setup/enable-tls", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        domains: [value.domain.trim()],
-        email: value.email.trim(),
-        staging: value.staging,
-      }),
-    });
-    if (!r.ok) {
-      setErr((await r.text()) || "Could not enable HTTPS.");
+    setStatus("saving");
+    try {
+      const r = await fetch("/admin/api/setup/enable-tls", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          domains: [value.domain.trim()],
+          email: value.email.trim(),
+          staging: value.staging,
+        }),
+      });
+      if (!r.ok) {
+        setErr((await r.text()) || "Could not enable HTTPS.");
+        return;
+      }
+      // The backend always returns 202: either DNS already resolved and
+      // TLS is coming up now, or DNS isn't ready and a background poller
+      // owns the retry. The Done step explains which case we're in.
+      onNext();
+    } finally {
       setStatus("idle");
-      return;
     }
-    setStatus("issuing");
-    // Poll until ready or error.
-    for (let i = 0; i < 60; i++) {
-      await new Promise((res) => setTimeout(res, 2000));
-      const s = await fetch("/admin/api/setup/tls-status").then((x) => x.json());
-      if (s.state === "ready") {
-        setStatus("ready");
-        onNext();
-        return;
-      }
-      if (s.state === "error") {
-        setErr(s.error || "Issuance failed.");
-        setStatus("idle");
-        return;
-      }
-    }
-    setErr("Issuance is taking longer than expected. Check the server logs.");
-    setStatus("idle");
   }
 
   return (
@@ -495,15 +484,16 @@ function TLSStep({
           Use Let's Encrypt staging (untrusted certs, looser rate limits — handy for testing).
         </label>
         <ErrorMessage err={err} />
+        <p className="text-xs text-muted-foreground">
+          If DNS hasn't propagated yet, that's fine — we'll keep checking in
+          the background and switch HTTPS on the moment it's ready.
+        </p>
         <div className="flex flex-wrap gap-2">
           <Button type="button" variant="outline" onClick={onSkip} disabled={status !== "idle"}>
             Skip for now
           </Button>
           <Button type="button" onClick={enable} disabled={status !== "idle"} className="ml-auto">
-            {status === "enabling" && "Enabling…"}
-            {status === "issuing" && "Issuing certificate…"}
-            {status === "ready" && "Done"}
-            {status === "idle" && "Enable HTTPS"}
+            {status === "saving" ? "Saving…" : "Enable HTTPS"}
           </Button>
         </div>
       </div>

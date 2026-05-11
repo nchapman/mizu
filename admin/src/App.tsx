@@ -7,12 +7,14 @@ import { Button } from "@/components/ui/button";
 
 type MeUser = { id: number; email: string; display_name: string };
 type SetupWindow = { open: boolean; expires_at?: string };
+type TLSStatus = { state: string; error?: string };
 type Me = {
   configured: boolean;
   authenticated: boolean;
   site_title?: string;
   user?: MeUser;
   setup_window?: SetupWindow;
+  tls?: TLSStatus;
 };
 
 export function App() {
@@ -51,5 +53,5 @@ export function App() {
     return <Wizard onDone={loadMe} siteTitle={me.site_title} setupWindow={me.setup_window} />;
   }
   if (!me.authenticated) return <Login onDone={loadMe} siteTitle={me.site_title} />;
-  return <Shell onLogout={loadMe} />;
+  return <Shell onLogout={loadMe} tls={me.tls} onTLSChanged={loadMe} />;
 }
