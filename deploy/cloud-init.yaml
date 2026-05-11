@@ -27,13 +27,8 @@
 # rolls in. Pre-release tags (e.g. `v1.0.0-rc1`) do NOT move :latest,
 # so production hosts only auto-update on stable releases.
 
-# package_update refreshes apt's index so the `packages:` list below
-# can install. package_upgrade is intentionally OFF -- a fresh cloud
-# image is current enough for mizu, and a full dist-upgrade at first
-# boot adds 3-5 minutes of wall-clock plus a mid-boot sshd restart
-# that drops any SSH session the operator started while waiting.
 package_update: true
-package_upgrade: false
+package_upgrade: true
 
 packages:
   - ca-certificates
