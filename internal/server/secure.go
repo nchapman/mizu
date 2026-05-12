@@ -7,23 +7,18 @@ import (
 )
 
 // SecureHeaders returns a middleware that sets the standard set of
-// hardening headers. STS options are always configured; the underlying
-// library only emits Strict-Transport-Security when the request itself
-// arrived over TLS (r.TLS != nil), so plain-HTTP responses never carry
-// the header. This means the wizard's "Enable HTTPS" flip applies to
-// HSTS immediately, without restarting the process.
+// hardening headers: deny framing, sniffing, and constrain referrer
+// leakage. HSTS is intentionally NOT here — see the HSTS middleware,
+// which gates emission on a real (non-self-signed) cert being available.
 //
-// The Content Security Policy is deliberately not set here: the admin
-// SPA and sanitized feed HTML need a CSP designed around their
+// The Content Security Policy is deliberately not set here either: the
+// admin SPA and sanitized feed HTML need a CSP designed around their
 // specific needs and that work belongs in a dedicated change.
 func SecureHeaders() func(http.Handler) http.Handler {
 	s := secure.New(secure.Options{
-		FrameDeny:            true,
-		ContentTypeNosniff:   true,
-		ReferrerPolicy:       "strict-origin-when-cross-origin",
-		STSSeconds:           31536000,
-		STSIncludeSubdomains: true,
-		STSPreload:           false,
+		FrameDeny:          true,
+		ContentTypeNosniff: true,
+		ReferrerPolicy:     "strict-origin-when-cross-origin",
 	})
 	return s.Handler
 }

@@ -8,12 +8,16 @@
 #   1. Docker Engine installs from the official repo.
 #   2. /opt/mizu/docker-compose.yml is dropped into place.
 #   3. Compose pulls ghcr.io/nchapman/mizu:latest and Watchtower.
-#   4. Mizu listens on :80 (and :443 once HTTPS is enabled).
+#   4. Mizu listens on :80 (always 308-redirects to :443) and :443
+#      (HTTPS, with a self-signed cert until you finish the wizard).
 #
 # Then in a browser:
 #   - Point your domain's A record at the VPS's public IP.
-#   - Visit http://<that-ip>/admin (raw IP is fine; DNS doesn't have
-#     to have propagated yet).
+#   - Visit https://<that-ip>/admin (raw IP is fine; DNS doesn't
+#     need to have propagated yet). Your browser will show a
+#     "Not Secure" warning because the cert is self-signed at this
+#     point — click "Advanced" → "Proceed" to continue. This is
+#     expected and goes away once Let's Encrypt issues a real cert.
 #   - The setup wizard walks you through account, site basics, the
 #     DNS preflight, and Let's Encrypt issuance.
 #
@@ -100,4 +104,4 @@ runcmd:
   # shipped by get.docker.com on supported distros.
   - docker compose -f /opt/mizu/docker-compose.yml up -d
 
-final_message: "mizu is up. Open http://<this-host>/admin to finish setup. First boot can take a minute or two while Docker pulls the image."
+final_message: "mizu is up. Open https://<this-host>/admin to finish setup. Click through the one-time browser cert warning (mizu boots with a self-signed cert; the wizard's HTTPS step issues a real Let's Encrypt cert that the browser trusts). First boot can take a minute or two while Docker pulls the image."

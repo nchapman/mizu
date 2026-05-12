@@ -29,16 +29,17 @@ import (
 	"github.com/nchapman/mizu/internal/webmention"
 )
 
-// TLSController is the seam admin uses to flip TLS on after the wizard
-// finishes. The real implementation lives in internal/server; admin
-// only sees these calls so it doesn't have to know about CertMagic.
+// TLSController is the seam admin uses to kick off ACME issuance after
+// the wizard finishes. The real implementation lives in internal/server;
+// admin only sees these calls so it doesn't have to know about
+// CertMagic.
 //
-// CertMagic handles retries, exponential backoff on DNS-not-ready
-// errors, and rate-limit-aware ACME retries internally — admin doesn't
-// need to baby-sit the issuance loop. The flow is just: call Enable,
-// poll Status().
+// The HTTPS listener itself is always on (self-signed bootstrap → real
+// cert when ACME completes), so the controller only handles the
+// "operator wants a real Let's Encrypt cert" transition. CertMagic
+// owns retries, DNS-not-ready backoff, and rate-limit-aware retries.
 type TLSController interface {
-	Enable(ctx context.Context, domains []string, email string, staging bool) error
+	EnableACME(ctx context.Context, domains []string, email string, staging bool) error
 	Status() mizuserver.TLSStatus
 }
 
@@ -217,7 +218,7 @@ func (s *Server) setup(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	auth.SetCookie(w, token, s.cfg.Server.TLS.Enabled)
+	auth.SetCookie(w, token)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -258,7 +259,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	auth.SetCookie(w, token, s.cfg.Server.TLS.Enabled)
+	auth.SetCookie(w, token)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -371,41 +372,41 @@ func (s *Server) setupEnableTLS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "TLS controller not configured", http.StatusServiceUnavailable)
 		return
 	}
-	// Enable binds the listeners synchronously, then hands the domain
-	// off to CertMagic which manages issuance / retry / renewal on its
-	// own. We don't write config.yml here — the OnEnabled callback
-	// (wired in main.go to PersistTLSConfig) fires once CertMagic has
-	// actually obtained a cert, so a failed issuance can't leave
-	// enabled=true on disk and Fatalf the next restart.
-	if err := s.tls.Enable(s.bgCtx, in.Domains, in.Email, in.Staging); err != nil {
+	// EnableACME hands the domain off to CertMagic which manages
+	// issuance / retry / renewal on its own. We don't write config.yml
+	// here — the OnEnabled callback (wired in main.go to
+	// PersistACMEConfig) fires once CertMagic has actually obtained a
+	// cert, so a failed issuance can't leave enabled=true on disk and
+	// Fatalf the next restart.
+	if err := s.tls.EnableACME(s.bgCtx, in.Domains, in.Email, in.Staging); err != nil {
 		http.Error(w, "enable TLS: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// PersistTLSConfig is the OnEnabled callback for the TLS manager.
-// Fires once CertMagic confirms a cert via `cert_obtained` (including
-// renewals). Writes the live TLS settings to config.yml and updates
-// the in-memory cfg.
-func (s *Server) PersistTLSConfig(domains []string, email string, staging bool) {
-	if err := config.WriteTLS(s.configPath, config.TLSSettings{
+// PersistACMEConfig is the OnEnabled callback for the TLS manager.
+// Fires once CertMagic confirms a cert via cert_obtained (including
+// renewals). Writes the live ACME settings to config.yml under
+// server.tls.acme and updates the in-memory cfg.
+func (s *Server) PersistACMEConfig(domains []string, email string, staging bool) {
+	if err := config.WriteACME(s.configPath, config.ACMESettings{
 		Enabled: true, Domains: domains, Email: email, Staging: staging,
 	}); err != nil {
-		log.Printf("admin: persist tls config: %v", err)
+		log.Printf("admin: persist acme config: %v", err)
 		return
 	}
 	s.cfgMu.Lock()
-	s.cfg.Server.TLS.Enabled = true
-	s.cfg.Server.TLS.Domains = domains
-	s.cfg.Server.TLS.Email = email
-	s.cfg.Server.TLS.Staging = staging
+	s.cfg.Server.TLS.ACME.Enabled = true
+	s.cfg.Server.TLS.ACME.Domains = domains
+	s.cfg.Server.TLS.ACME.Email = email
+	s.cfg.Server.TLS.ACME.Staging = staging
 	s.cfgMu.Unlock()
 }
 
 func (s *Server) setupTLSStatus(w http.ResponseWriter, _ *http.Request) {
 	if s.tls == nil {
-		writeJSON(w, http.StatusOK, mizuserver.TLSStatus{State: "off"})
+		writeJSON(w, http.StatusOK, mizuserver.TLSStatus{State: "selfsigned"})
 		return
 	}
 	writeJSON(w, http.StatusOK, s.tls.Status())
@@ -415,7 +416,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(auth.CookieName); err == nil {
 		_ = s.auth.DestroySession(r.Context(), c.Value)
 	}
-	auth.ClearCookie(w, s.cfg.Server.TLS.Enabled)
+	auth.ClearCookie(w)
 	w.WriteHeader(http.StatusNoContent)
 }
 

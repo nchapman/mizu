@@ -20,9 +20,11 @@ type SiteSettings struct {
 	ThemeName   string
 }
 
-// TLSSettings is the wizard's TLS-step output. Domains MUST be
-// non-empty when Enabled is true.
-type TLSSettings struct {
+// ACMESettings is the wizard's TLS-step output. Domains MUST be
+// non-empty when Enabled is true. Persisted under server.tls.acme so
+// the always-on HTTPS listener (the cfg.Server.TLS block) stays a
+// separate concern.
+type ACMESettings struct {
 	Enabled bool
 	Domains []string
 	Email   string
@@ -50,23 +52,24 @@ func WriteSite(path string, s SiteSettings) error {
 	})
 }
 
-// WriteTLS merges TLSSettings into config.yml. Enabling TLS without a
-// domain is rejected here so the wizard's confirm step is the only
-// path that flips the live runner.
-func WriteTLS(path string, s TLSSettings) error {
+// WriteACME merges ACMESettings into config.yml under server.tls.acme.
+// Enabling without domains+email is rejected here so the wizard's
+// confirm step is the only path that flips the live runner.
+func WriteACME(path string, s ACMESettings) error {
 	if s.Enabled && len(s.Domains) == 0 {
-		return fmt.Errorf("WriteTLS: enabled requires at least one domain")
+		return fmt.Errorf("WriteACME: enabled requires at least one domain")
 	}
 	if s.Enabled && s.Email == "" {
-		return fmt.Errorf("WriteTLS: enabled requires an ACME contact email")
+		return fmt.Errorf("WriteACME: enabled requires an ACME contact email")
 	}
 	return mutateYAML(path, func(root *yaml.Node) error {
 		server := ensureMap(root, "server")
 		tls := ensureMap(server, "tls")
-		setBool(tls, "enabled", s.Enabled)
-		setSequenceStrings(tls, "domains", s.Domains)
-		setScalar(tls, "email", s.Email)
-		setBool(tls, "staging", s.Staging)
+		acme := ensureMap(tls, "acme")
+		setBool(acme, "enabled", s.Enabled)
+		setSequenceStrings(acme, "domains", s.Domains)
+		setScalar(acme, "email", s.Email)
+		setBool(acme, "staging", s.Staging)
 		return nil
 	})
 }

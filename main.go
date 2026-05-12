@@ -155,25 +155,18 @@ func main() {
 		log.Fatalf("media: %v", err)
 	}
 	ipCache := netinfo.NewPublicIPCache()
-	// TLSManager is wired below; admin holds it through the
-	// TLSController interface so the wizard's enable-tls handler can
-	// flip the runner without main.go re-wiring. CertMagic handles all
-	// retry / backoff / DNS-not-ready logic on its own — we just need
-	// to call Enable once. The container always binds the plain
-	// listener on cfg.Server.Addr (internal port, host-mapped to :80);
-	// there is no separate internal :80 listener. Once TLS is enabled,
-	// the TLSManager swaps the plain handler in place (via the
-	// SwapHandler below) to add ACME-challenge passthrough and
-	// HTTP→HTTPS redirect behavior, and adds its own HTTPS listener on
-	// cfg.Server.TLS.Addr (host-mapped to :443).
-	tlsMgr := mizuserver.NewTLSManager(nil, cfg, &bg)
+	// TLSManager owns both an always-on HTTPS listener (self-signed at
+	// boot, swapped to a real cert when CertMagic gets one) and the
+	// ACME runner the wizard kicks off. Admin holds it through the
+	// TLSController interface for that purpose.
+	r := chi.NewRouter()
+	tlsMgr := mizuserver.NewTLSManager(r, cfg, &bg)
 	adminSrv := admin.New(ctx, cfg, *cfgPath, posts, feedSvc, poller, authSvc, mediaStore, wmSvc, ipCache, tlsMgr, adminDistFS())
-	// Persist tls.* to config.yml only once CertMagic fires
+	// Persist tls.acme.* to config.yml only once CertMagic fires
 	// cert_obtained, so a failed issuance can't leave enabled=true on
 	// disk and Fatalf the next restart.
-	tlsMgr.OnEnabled(adminSrv.PersistTLSConfig)
+	tlsMgr.OnEnabled(adminSrv.PersistACMEConfig)
 
-	r := chi.NewRouter()
 	// Deliberately NOT using middleware.RealIP. mizu binds the public
 	// listener directly and there is no trusted reverse proxy, so any
 	// X-Forwarded-For header is attacker-controlled and would let a
@@ -184,6 +177,9 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Compress(5))
 	r.Use(mizuserver.SecureHeaders())
+	// HSTS waits until CertMagic has a real cert. Self-signed boot
+	// must not pin the bootstrap cert in browsers — see hsts.go.
+	r.Use(mizuserver.HSTS(tlsMgr.HasRealCert))
 	r.Use(mizuserver.RateLimit(cfg.Limits.Rate.Global))
 
 	r.Route("/admin", adminSrv.Routes)
@@ -206,39 +202,33 @@ func main() {
 	siteSrv := site.New(cfg, wmSvc, cfg.Paths.Public, authSvc.Configured)
 	siteSrv.Routes(r)
 
-	// The plain listener serves through a SwapHandler so the TLS
-	// manager can wrap the chi router with ACME-challenge + redirect
-	// behavior in place once HTTPS is enabled, without tearing down
-	// the listener that the wizard's own session is sitting on.
-	plain := mizuserver.NewSwapHandler(r)
-	srv := &http.Server{
+	// Plain listener: always 308-redirects to https on the same Host,
+	// with ACME HTTP-01 challenges layered in front when ACME is
+	// configured. Docker maps host :80 -> this internal port.
+	plainSrv := &http.Server{
 		Addr:              cfg.Server.Addr,
-		Handler:           plain,
+		Handler:           tlsMgr.PlainRedirectHandler(),
 		ReadHeaderTimeout: cfg.Limits.ReadHeaderTimeout,
 		ReadTimeout:       cfg.Limits.ReadTimeout,
 		WriteTimeout:      cfg.Limits.WriteTimeout,
 		IdleTimeout:       cfg.Limits.IdleTimeout,
 		MaxHeaderBytes:    cfg.Limits.MaxHeaderBytes,
 	}
-
-	tlsMgr.SetHandler(r)
-	tlsMgr.OnPlainHandlerChange(r, plain.Set)
-
-	// Plain listener always runs. Docker maps host :80 -> this internal
-	// port, so the operator types http://<host>/ (no port number).
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
-		log.Printf("mizu listening on %s (plain http; docker maps host :80 -> here)", cfg.Server.Addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("mizu listening on %s (plain http → 308 https; docker maps host :80 -> here)", cfg.Server.Addr)
+		if err := plainSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("http server: %v", err)
 		}
 	}()
 
-	if cfg.Server.TLS.Enabled {
-		if err := tlsMgr.EnableFromConfig(ctx); err != nil {
-			log.Fatalf("tls: %v", err)
-		}
+	// Always-on HTTPS listener with self-signed bootstrap cert. If
+	// cfg.Server.TLS.ACME.Enabled is true, Start also kicks off ACME
+	// issuance so the cert flips to Let's Encrypt without operator
+	// intervention.
+	if err := tlsMgr.Start(ctx); err != nil {
+		log.Fatalf("tls: %v", err)
 	}
 
 	<-ctx.Done()
@@ -249,7 +239,7 @@ func main() {
 	shutWG.Add(2)
 	go func() {
 		defer shutWG.Done()
-		_ = srv.Shutdown(shutCtx)
+		_ = plainSrv.Shutdown(shutCtx)
 	}()
 	go func() {
 		defer shutWG.Done()

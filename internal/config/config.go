@@ -42,26 +42,34 @@ type Server struct {
 	TLS  TLS    `yaml:"tls"`
 }
 
-// TLS controls automatic HTTPS via CertMagic. When Enabled is false the
-// binary serves plain HTTP on Server.Addr. When enabled, the binary
-// additionally binds Addr for HTTPS and grows ACME challenge + redirect
-// behavior on the existing plain-HTTP listener.
+// TLS configures the always-on HTTPS listener. The listener binds
+// regardless of any setting here — plain :Addr (host :80) always
+// redirects to https, and the HTTPS listener serves a self-signed cert
+// out of the box so the operator's first byte is encrypted. The only
+// thing under operator control is whether mizu auto-issues a real cert
+// from Let's Encrypt; that lives in the ACME block.
 //
 // Addr is an internal port: in the standard Docker deployment the host
-// maps 443 -> Addr (e.g. :8443) so the container can run unprivileged
-// without CAP_NET_BIND_SERVICE. ACME HTTP-01 challenges and the HTTP
-// to HTTPS redirect ride on Server.Addr (internally :8080, host-mapped
-// to :80) -- there is no separate :80 listener inside the container.
-//
-// Email is required by the ACME terms of service. Staging swaps in the
-// Let's Encrypt staging endpoint, which has higher rate limits and
-// issues certs that browsers don't trust -- useful for end-to-end
-// testing without burning the production rate-limit budget.
+// maps 443 -> Addr (default :8443) so the container can run
+// unprivileged without CAP_NET_BIND_SERVICE.
 type TLS struct {
+	Addr string `yaml:"addr"`
+	ACME ACME   `yaml:"acme"`
+}
+
+// ACME captures the wizard's "Enable HTTPS with Let's Encrypt" decision.
+// When Enabled is true and Domains+Email are set, mizu hands the domain
+// off to CertMagic at boot and every restart thereafter; CertMagic
+// owns issuance, renewal, retry, and DNS-not-ready backoff.
+//
+// Email is required by ACME terms of service. Staging swaps in the
+// Let's Encrypt staging endpoint, which has higher rate limits and
+// issues certs that browsers don't trust — useful for end-to-end
+// testing without burning the production rate-limit budget.
+type ACME struct {
 	Enabled bool     `yaml:"enabled"`
 	Domains []string `yaml:"domains"`
 	Email   string   `yaml:"email"`
-	Addr    string   `yaml:"addr"`
 	Staging bool     `yaml:"staging"`
 }
 
@@ -244,12 +252,12 @@ func defaultRate(r *RateSpec, requests int, per time.Duration) {
 }
 
 func (c *Config) validate() error {
-	if c.Server.TLS.Enabled {
-		if len(c.Server.TLS.Domains) == 0 {
-			return fmt.Errorf("server.tls.enabled requires at least one entry in server.tls.domains")
+	if c.Server.TLS.ACME.Enabled {
+		if len(c.Server.TLS.ACME.Domains) == 0 {
+			return fmt.Errorf("server.tls.acme.enabled requires at least one entry in server.tls.acme.domains")
 		}
-		if c.Server.TLS.Email == "" {
-			return fmt.Errorf("server.tls.enabled requires server.tls.email (ACME contact)")
+		if c.Server.TLS.ACME.Email == "" {
+			return fmt.Errorf("server.tls.acme.enabled requires server.tls.acme.email (ACME contact)")
 		}
 	}
 	return nil

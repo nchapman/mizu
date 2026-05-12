@@ -12,32 +12,39 @@ site:
   description: A mizu-powered site.
 
 server:
-  # addr is the internal port the plain-HTTP listener binds. In the
-  # standard Docker deployment the host maps :80 -> this port. Pick
-  # something above 1024 so the container can run unprivileged.
+  # addr is the internal port the plain-HTTP listener binds. It always
+  # 308-redirects to HTTPS on the same host. In the standard Docker
+  # deployment the host maps :80 -> this port. Pick something above
+  # 1024 so the container can run unprivileged.
   addr: ":8080"
-  # tls:
-  #   enabled: true
-  #   domains: [mizu.fyi]
-  #   email: ops@mizu.fyi
-  #   addr: ":8443"
-  #   staging: false
-  # ^ Optional. Easiest path: skip this block, run the wizard's
-  # "Enable HTTPS" step, and the wizard will write it for you. When
-  # enabled, mizu obtains certificates from Let's Encrypt automatically
-  # (via CertMagic) and serves HTTPS on `addr` (internal port; the
-  # host maps :443 -> here). ACME HTTP-01 challenges and the plain
-  # HTTP -> HTTPS redirect ride on `server.addr` -- there is no
-  # separate :80 listener inside the binary. Set staging: true to
-  # test against the LE staging endpoint (untrusted certs, friendlier
-  # rate limits) before going live.
-  #
-  # Heads-up: when TLS is on, mizu emits HSTS with includeSubdomains
-  # for one year. If you ever serve a sibling subdomain over plain
-  # HTTP after a visitor hits this site, their browser will refuse to
-  # reach it for the rest of that year. Either keep every subdomain
-  # on HTTPS or take HSTS off the table by leaving TLS handled by a
-  # different process.
+  tls:
+    # The HTTPS listener is always on, regardless of anything in this
+    # block. At boot mizu generates a persistent self-signed cert under
+    # paths.certs/selfsigned/ and serves it from this port; the host
+    # maps :443 -> here. The first browser visit shows a cert warning,
+    # which goes away once Let's Encrypt issues a real cert via the
+    # wizard.
+    addr: ":8443"
+    # acme:
+    #   enabled: true
+    #   domains: [mizu.fyi]
+    #   email: ops@mizu.fyi
+    #   staging: false
+    # ^ Optional. Easiest path: skip this block, run the wizard's
+    # "Issue a real HTTPS certificate" step, and the wizard will write
+    # it for you. When enabled, mizu hands the domain off to CertMagic
+    # which obtains and renews a Let's Encrypt cert; the cert resolver
+    # transparently swaps the self-signed bootstrap for the real cert
+    # the moment it's available. Set staging: true to test against the
+    # LE staging endpoint (untrusted certs, friendlier rate limits)
+    # before going live.
+    #
+    # Heads-up: once a real cert is in place, mizu emits HSTS with
+    # includeSubdomains for one year. If you ever serve a sibling
+    # subdomain over plain HTTP after a visitor hits this site, their
+    # browser will refuse to reach it for the rest of that year. Either
+    # keep every subdomain on HTTPS or take HSTS off the table by
+    # leaving TLS handled by a different process.
 
 paths:
   content: ./content

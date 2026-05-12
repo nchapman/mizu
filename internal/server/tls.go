@@ -2,14 +2,16 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/caddyserver/certmagic"
 
@@ -18,130 +20,214 @@ import (
 
 // TLSStatus is the read-model the admin UI polls. State transitions:
 //
-//	off → issuing → ready
-//	            ↘ error
+//	selfsigned → issuing → ready
+//	                    ↘ error
 //
-// "issuing" covers everything between the operator hitting "Enable
-// HTTPS" and the first successful cert. If DNS hasn't propagated yet,
-// CertMagic retries on its own backoff and we stay in "issuing" with
-// the latest validation error surfaced in `Error` for the UI to show.
-// "error" is reserved for hard failures (listener bind, port conflict)
-// that CertMagic can't recover from; the operator must retry by hand.
-// "ready" flips when CertMagic fires the `cert_obtained` event.
+// "selfsigned" is the boot state — the HTTPS listener is live, serving
+// the persistent self-signed cert generated under cfg.Paths.Certs. The
+// operator's first visit is encrypted from byte one (with a click-
+// through cert warning) so the account-creation password is never sent
+// in cleartext.
+//
+// "issuing" covers everything between EnableACME being called (boot or
+// wizard) and the first cert_obtained event from CertMagic. DNS-not-
+// ready, transient ACME failures, rate-limit backoff — all of those
+// stay in "issuing" with the latest validation error in `Error`.
+// CertMagic owns the retries; we just surface them.
+//
+// "ready" flips when CertMagic has a real cert in cache (either fresh
+// from cert_obtained, or already cached from a previous run). The
+// HSTS predicate flips true at the same time.
+//
+// "error" is reserved for hard failures (listener bind, malformed
+// config) that CertMagic can't recover from.
 type TLSStatus struct {
 	State string `json:"state"`
 	Error string `json:"error,omitempty"`
 }
 
-// TLSManager owns the certmagic.Config and the HTTPS listener. It can
-// be brought up at boot (if the loaded config has tls.enabled = true)
-// or live from the setup wizard via Enable.
+// TLSManager owns the always-on HTTPS listener and the CertMagic
+// instance that may layer a real Let's Encrypt cert on top of the
+// self-signed bootstrap.
 //
-// There is no separate :80 listener inside the container. ACME HTTP-01
-// challenges and the HTTP→HTTPS redirect ride on the always-on plain
-// listener that main.go owns on cfg.Server.Addr (an internal port,
-// host-mapped to :80 by Docker). When Enable succeeds, the manager
-// hands main.go a wrapped handler that adds ACME and redirect behavior
-// in front of the chi router; main.go installs it via the callback
-// registered with OnPlainHandlerChange.
+// Listener lifecycle:
+//   - Start(ctx) at boot binds the HTTPS listener. The *tls.Config's
+//     GetCertificate is layered: CertMagic's cache first, self-signed
+//     fallback if nothing is cached for the SNI. Plain :80 is owned by
+//     main.go and always 308-redirects to https on the same Host.
+//   - EnableACME(...) hands a domain off to CertMagic. No listener
+//     manipulation, no plain-handler swap — the listener is already up.
+//   - Shutdown(ctx) signals the HTTPS listener and stops the cache's
+//     maintenance goroutine.
 type TLSManager struct {
 	cfg     *config.Config
 	handler http.Handler
 	wg      *sync.WaitGroup
 
-	mu              sync.Mutex
-	state           string
-	lastErr         error
-	onEnabled       func(domains []string, email string, staging bool)
-	setPlainHandler func(http.Handler)
-	// plainHandlerBase is the unwrapped chi router. Retained on the
-	// manager for one reason: if Enable's ManageAsync call fails after
-	// we've already swapped the plain listener to the ACME+redirect
-	// wrapper, we need the original to swap back to.
-	plainHandlerBase http.Handler
+	mu      sync.Mutex
+	state   string
+	lastErr error
+	// onEnabled fires once CertMagic confirms a cert via cert_obtained.
+	// Admin uses it to persist tls.acme.* to config.yml only after a
+	// real cert has actually been obtained, so a failed issuance can't
+	// leave enabled=true on disk and Fatalf the next restart.
+	onEnabled func(domains []string, email string, staging bool)
 
-	// magic is retained on the struct so its certificate cache + the
-	// maintenance goroutine the cache spawns stay alive for the process
-	// lifetime. Renewals fire automatically off that goroutine — there's
-	// nothing else to schedule.
+	// magic and cache are retained so the cert cache + its maintenance
+	// goroutine stay alive for the process lifetime. Renewals fire
+	// automatically off that goroutine.
 	magic *certmagic.Config
 	cache *certmagic.Cache
 	main  *http.Server
 
-	// closed flips once Shutdown begins. Enable consults it under mu
-	// before m.wg.Add(1) so a late wizard-flip can't add to the
-	// WaitGroup that bg.Wait() is already draining (Add-after-Wait
-	// panics on a zero counter; even with a non-zero counter the order
-	// of operations here is fragile and worth pinning down).
-	closed bool
+	// selfSigned is the bootstrap cert returned by the layered
+	// GetCertificate when CertMagic doesn't have one cached. Held in an
+	// atomic.Pointer so a future "rotate self-signed" operation can
+	// swap it without restarting the listener.
+	selfSigned atomic.Pointer[tls.Certificate]
 
-	// rollingBack tells the HTTPS listener goroutine to skip its
-	// recordError call when Enable's sync rollback path is shutting it
-	// down. Without this, a bind-failure in the goroutine and the
-	// ManageAsync error in the sync path race to set lastErr; we want
-	// the ManageAsync error to win because that's the one Enable
-	// returns to the API caller.
-	rollingBack atomic.Bool
+	// hasRealCert flips true once CertMagic confirms a real cert is
+	// available (either from a fresh cert_obtained event or from a
+	// cache pre-populated by a previous run). Read by HSTS middleware.
+	hasRealCert atomic.Bool
+
+	// acmeDomains/Email/Staging are the operator-supplied args from
+	// the most recent EnableACME call. Stored here (rather than read
+	// out of m.cfg) so the cert_obtained event handler can pass them
+	// to PersistACMEConfig — which is the very thing that updates
+	// m.cfg, so reading from cfg in that callback would be stale.
+	// All three are guarded by m.mu.
+	acmeDomains []string
+	acmeEmail   string
+	acmeStaging bool
+	// issuerInstalled flips true the first time EnableACME assigns
+	// magic.Issuers. Subsequent EnableACME calls with the same args
+	// no-op via the state guard; calls with new args refuse — see
+	// the comment in EnableACME for the reasoning.
+	issuerInstalled bool
 }
 
-// NewTLSManager constructs an idle manager. handler is the same chi
-// router the plain HTTP listener serves — TLS just terminates in front
-// of it.
+// NewTLSManager constructs the manager. handler is the chi router the
+// HTTPS listener serves. Call Start(ctx) before serving.
 func NewTLSManager(handler http.Handler, cfg *config.Config, wg *sync.WaitGroup) *TLSManager {
-	return &TLSManager{cfg: cfg, handler: handler, wg: wg, state: "off"}
-}
-
-// SetHandler swaps the chi router after construction so main.go can
-// hand the manager an early reference (nil) and fill it in once the
-// router is built. Safe to call once before Enable.
-func (m *TLSManager) SetHandler(h http.Handler) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.handler = h
+	return &TLSManager{
+		cfg: cfg, handler: handler, wg: wg, state: "selfsigned",
+	}
 }
 
 // OnEnabled registers a callback fired once CertMagic obtains a cert
-// (the `cert_obtained` event). Admin uses this to persist
-// cfg.Server.TLS to disk only after a real cert lands, so a failed
-// issuance can't leave enabled=true on disk and Fatalf the next
-// restart. The callback also fires on renewal — re-writing the same
-// values is a no-op so that's fine.
+// (the cert_obtained event, including renewals).
 func (m *TLSManager) OnEnabled(fn func(domains []string, email string, staging bool)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onEnabled = fn
 }
 
-// OnPlainHandlerChange registers the callback the manager fires to
-// swap the plain-HTTP listener's handler in main.go. base is the
-// untreated chi router used when TLS is off; the manager wraps it with
-// ACME + redirect when Enable succeeds. Must be called before Enable.
-func (m *TLSManager) OnPlainHandlerChange(base http.Handler, fn func(http.Handler)) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.plainHandlerBase = base
-	m.setPlainHandler = fn
+// HasRealCert reports whether CertMagic has a real (non-self-signed)
+// certificate available. Used by the HSTS middleware so we never pin
+// the bootstrap cert in browsers.
+func (m *TLSManager) HasRealCert() bool {
+	return m.hasRealCert.Load()
 }
 
-// EnableFromConfig brings TLS up using whatever's already in cfg.
-// Used at boot when the operator has TLS pre-configured. Returns
-// after listeners are bound; issuance runs in the background via
-// CertMagic's own retry/backoff.
-func (m *TLSManager) EnableFromConfig(ctx context.Context) error {
-	t := m.cfg.Server.TLS
-	return m.Enable(ctx, t.Domains, t.Email, t.Staging)
-}
-
-// Enable binds the HTTPS listener, wraps the plain-HTTP handler with
-// ACME-challenge + redirect-to-HTTPS behavior, and hands the domain
-// off to CertMagic. CertMagic handles DNS-not-ready, transient ACME
-// errors, rate-limit backoff, and renewals on its own — we just need
-// to start it once and stay out of the way.
+// Start binds the HTTPS listener with a layered certificate resolver
+// (CertMagic cache → self-signed fallback) and brings the CertMagic
+// instance + cert cache online. If the loaded config has ACME enabled,
+// also kicks off domain management; otherwise the manager sits in
+// "selfsigned" until EnableACME is called from the wizard.
 //
-// Returns synchronously after listeners are bound. Cert issuance is
-// asynchronous; subscribe to Status() to watch the state transition
-// from "issuing" → "ready" (or to surface a transient `Error`).
-func (m *TLSManager) Enable(ctx context.Context, domains []string, email string, staging bool) error {
+// Returns synchronously after the listener is bound. Cert issuance is
+// asynchronous; subscribe to Status() to watch state transitions.
+func (m *TLSManager) Start(ctx context.Context) error {
+	if m.handler == nil {
+		return errors.New("tls: handler not set")
+	}
+
+	cert, err := LoadOrCreateSelfSigned(SelfSignedCertOptions{
+		Dir:        selfSignedDir(m.cfg),
+		ExtraHosts: []string{HostFromBaseURL(m.cfg.Site.BaseURL)},
+		// IP SANs are intentionally limited to loopback for the bootstrap
+		// cert; the public IP isn't reliably known at this point in boot
+		// and `localhost`/loopback covers the LAN/SSH-tunnel case. Once
+		// ACME issues a real cert it'll cover the configured domain.
+	})
+	if err != nil {
+		return fmt.Errorf("tls: self-signed bootstrap: %w", err)
+	}
+	m.selfSigned.Store(cert)
+
+	magic, cache := m.buildCertMagic()
+	m.mu.Lock()
+	m.magic = magic
+	m.cache = cache
+	m.mu.Unlock()
+
+	addr := m.cfg.Server.TLS.Addr
+	if addr == "" {
+		addr = ":8443"
+	}
+	tc := m.buildTLSConfig(magic)
+
+	// Bind the listener up front (rather than relying on
+	// http.Server.ListenAndServeTLS) so the resolved address — including
+	// the OS-assigned port when addr is `:0` — is available immediately
+	// for tests, status output, and future log lines.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("tls: bind %s: %w", addr, err)
+	}
+	tlsLn := tls.NewListener(ln, tc)
+
+	mainSrv := &http.Server{
+		Addr:              ln.Addr().String(),
+		Handler:           m.handler,
+		TLSConfig:         tc,
+		ReadHeaderTimeout: m.cfg.Limits.ReadHeaderTimeout,
+		ReadTimeout:       m.cfg.Limits.ReadTimeout,
+		WriteTimeout:      m.cfg.Limits.WriteTimeout,
+		IdleTimeout:       m.cfg.Limits.IdleTimeout,
+		MaxHeaderBytes:    m.cfg.Limits.MaxHeaderBytes,
+	}
+	m.mu.Lock()
+	m.main = mainSrv
+	m.mu.Unlock()
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		log.Printf("mizu listening on %s (https; bootstrap self-signed until ACME issues a real cert)", mainSrv.Addr)
+		if err := mainSrv.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
+			log.Printf("https server: %v", err)
+			m.recordError(fmt.Errorf("https listener: %w", err))
+		}
+	}()
+
+	if m.cfg.Server.TLS.ACME.Enabled {
+		acme := m.cfg.Server.TLS.ACME
+		if err := m.EnableACME(ctx, acme.Domains, acme.Email, acme.Staging); err != nil {
+			// Don't kill the process — the listener is up on self-signed.
+			// The operator can retry from the wizard / settings.
+			log.Printf("tls: boot-time ACME enable failed (continuing on self-signed): %v", err)
+		}
+	}
+	return nil
+}
+
+// EnableACME hands a domain off to CertMagic. Idempotent on the same
+// args — calling while already issuing is a no-op. CertMagic owns
+// retries, backoff, and renewal; this function returns synchronously
+// after kicking off management. Watch Status() for the issuance to
+// land.
+//
+// Issuer install-once: magic.Issuers is set exactly once, on the first
+// successful EnableACME call. CertMagic's renewal goroutine reads
+// cfg.Issuers without locking (just `make+copy`), so mutating Issuers
+// after the cert cache has gone live is a memory-model race even though
+// the slice header read is atomic on x86/arm64. A second EnableACME
+// with different email/staging is rejected with an error rather than
+// silently re-assigning — operators who need to change those must
+// restart the process so the next boot constructs a fresh magic.Config.
+func (m *TLSManager) EnableACME(ctx context.Context, domains []string, email string, staging bool) error {
 	if len(domains) == 0 {
 		return errors.New("tls: at least one domain required")
 	}
@@ -150,181 +236,65 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 	}
 
 	m.mu.Lock()
-	if m.closed {
+	if m.magic == nil {
 		m.mu.Unlock()
-		// Shutdown has begun. Refusing the Add here keeps the
-		// process-wide WaitGroup ordering invariant: every Add happens
-		// before bg.Wait observes the counter at zero.
-		return errors.New("tls: manager shutting down")
-	}
-	if m.handler == nil {
-		m.mu.Unlock()
-		// Belt-and-braces guard. If main.go ever forgets to wire
-		// SetHandler before Enable, net/http would silently fall back
-		// to DefaultServeMux and serve a confusing empty 404 over HTTPS
-		// instead of erroring loudly. Fail fast.
-		return errors.New("tls: handler not set; call SetHandler before Enable")
-	}
-	if m.setPlainHandler == nil || m.plainHandlerBase == nil {
-		m.mu.Unlock()
-		return errors.New("tls: plain handler swap not wired; call OnPlainHandlerChange before Enable")
+		return errors.New("tls: Start has not been called")
 	}
 	if m.state == "issuing" || m.state == "ready" {
 		m.mu.Unlock()
-		return errors.New("tls: already enabled")
+		return nil
 	}
-	handler := m.handler
-	plainBase := m.plainHandlerBase
-	setPlain := m.setPlainHandler
-	m.lastErr = nil
-	// Reserve the WaitGroup slot now, while still holding mu and
-	// before we've done any heavy work. The goroutine that consumes it
-	// is started further down; if anything between here and there
-	// fails (or panics), defer m.wg.Done in the failure paths is the
-	// caller's responsibility — but in practice we only fail before
-	// the goroutine starts via the ManageAsync rollback below, which
-	// is itself responsible for shutting the goroutine down.
-	m.wg.Add(1)
-	m.rollingBack.Store(false)
-	m.mu.Unlock()
-
-	addr := m.cfg.Server.TLS.Addr
-	if addr == "" {
-		addr = ":8443"
+	if m.issuerInstalled && (m.acmeEmail != email || m.acmeStaging != staging) {
+		// First call already wired magic.Issuers; mutating it now would
+		// race with a maintenance/renewal goroutine. Make the operator
+		// restart instead.
+		m.mu.Unlock()
+		return errors.New("tls: ACME email/staging changed — restart the process to apply")
 	}
-
-	ca := certmagic.LetsEncryptProductionCA
-	if staging {
-		ca = certmagic.LetsEncryptStagingCA
+	magic := m.magic
+	if !m.issuerInstalled {
+		ca := certmagic.LetsEncryptProductionCA
+		if staging {
+			ca = certmagic.LetsEncryptStagingCA
+		}
+		magic.Issuers = []certmagic.Issuer{
+			certmagic.NewACMEIssuer(magic, certmagic.ACMEIssuer{
+				Email:  email,
+				Agreed: true,
+				CA:     ca,
+			}),
+		}
+		m.issuerInstalled = true
 	}
-
-	// Build a non-global certmagic config so we don't stomp on the
-	// package-level Default (tests / future callers can coexist) and
-	// hold our own cache reference. The OnEvent hooks are how we drive
-	// the UI: cert_obtained flips state to "ready" and triggers the
-	// config-persist callback; cert_failed updates the surfaced error
-	// without changing state (CertMagic owns retry).
-	var magic *certmagic.Config
-	cache := certmagic.NewCache(certmagic.CacheOptions{
-		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) {
-			return magic, nil
-		},
-	})
-	magic = certmagic.New(cache, certmagic.Config{
-		Storage: &certmagic.FileStorage{Path: m.cfg.Paths.Certs},
-		OnEvent: func(_ context.Context, event string, data map[string]any) error {
-			switch event {
-			case "cert_obtained":
-				m.mu.Lock()
-				m.state = "ready"
-				m.lastErr = nil
-				cb := m.onEnabled
-				m.mu.Unlock()
-				log.Printf("tls: cert obtained for %v", data["identifier"])
-				if cb != nil {
-					cb(domains, email, staging)
-				}
-			case "cert_failed":
-				if err, ok := data["error"].(error); ok && err != nil {
-					m.mu.Lock()
-					m.lastErr = err
-					m.mu.Unlock()
-					log.Printf("tls: cert_failed for %v: %v", data["identifier"], err)
-				}
-			}
-			return nil
-		},
-	})
-	magic.Issuers = []certmagic.Issuer{
-		certmagic.NewACMEIssuer(magic, certmagic.ACMEIssuer{
-			Email:  email,
-			Agreed: true,
-			CA:     ca,
-		}),
-	}
-
-	tc := magic.TLSConfig()
-	tc.NextProtos = append([]string{"h2", "http/1.1"}, tc.NextProtos...)
-
-	mainSrv := &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		TLSConfig:         tc,
-		ReadHeaderTimeout: m.cfg.Limits.ReadHeaderTimeout,
-		ReadTimeout:       m.cfg.Limits.ReadTimeout,
-		WriteTimeout:      m.cfg.Limits.WriteTimeout,
-		IdleTimeout:       m.cfg.Limits.IdleTimeout,
-		MaxHeaderBytes:    m.cfg.Limits.MaxHeaderBytes,
-	}
-
-	m.mu.Lock()
-	m.magic = magic
-	m.cache = cache
-	m.main = mainSrv
-	m.mu.Unlock()
-
-	// Install the wrapped handler on the plain listener BEFORE the
-	// HTTPS listener starts so ACME HTTP-01 challenges (which Let's
-	// Encrypt fires inside ManageAsync) hit the challenge handler.
-	// Flip state to "issuing" *after* the swap so a Status() poll
-	// observing "issuing" can rely on the wrapped handler being live.
-	setPlain(buildPlainHandler(magic, domains, plainBase))
-	m.mu.Lock()
+	m.acmeDomains = append(m.acmeDomains[:0:0], domains...) // defensive copy
+	m.acmeEmail = email
+	m.acmeStaging = staging
 	m.state = "issuing"
+	m.lastErr = nil
+	cb := m.onEnabled
 	m.mu.Unlock()
-
-	go func() {
-		defer m.wg.Done()
-		log.Printf("mizu listening on %s (https) for %v", mainSrv.Addr, domains)
-		err := mainSrv.ListenAndServeTLS("", "")
-		if err == nil || err == http.ErrServerClosed {
-			return
-		}
-		log.Printf("https server: %v", err)
-		// During Enable's sync rollback the ManageAsync error is the
-		// authoritative one — skip recordError here so it doesn't race
-		// to overwrite lastErr.
-		if m.rollingBack.Load() {
-			return
-		}
-		m.recordError(fmt.Errorf("https listener: %w", err))
-	}()
 
 	if err := magic.ManageAsync(ctx, domains); err != nil {
-		// ManageAsync failed but the HTTPS listener goroutine is
-		// already running. Shut it down so a Retry from the UI can call
-		// Enable again without "address already in use", and swap the
-		// plain handler back to the bare router.
-		m.rollingBack.Store(true)
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_ = mainSrv.Shutdown(shutdownCtx)
-		cancel()
-		setPlain(plainBase)
-		m.mu.Lock()
-		m.main = nil
-		m.mu.Unlock()
 		m.recordError(err)
 		return err
 	}
-	return nil
-}
 
-// recordError surfaces a failure to the UI. The state transition is
-// asymmetric on purpose: from "off" or "issuing" we flip to "error"
-// (operator needs to intervene), but from "ready" we only update
-// lastErr and log — a transient listener wobble or a renewal-window
-// challenge failure shouldn't downgrade a working install to a red
-// "error" state. If the cert truly stops working the operator will
-// see it in the browser long before this matters, and the next
-// renewal attempt's cert_obtained / cert_failed event will refresh
-// lastErr cleanly.
-func (m *TLSManager) recordError(err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.lastErr = err
-	if m.state != "ready" {
-		m.state = "error"
+	// If a previous run already obtained a cert, CertMagic loads it
+	// into the cache during ManageAsync but does NOT fire
+	// cert_obtained. Probe the cache so the wizard's status display
+	// (and HSTS) reflect reality immediately. The cb fires here AND
+	// from cert_obtained on renewal — PersistACMEConfig is idempotent
+	// (writes the same bytes), so the duplicate is harmless.
+	if m.certAlreadyCached(domains) {
+		m.mu.Lock()
+		m.state = "ready"
+		m.mu.Unlock()
+		m.hasRealCert.Store(true)
+		if cb != nil {
+			cb(domains, email, staging)
+		}
 	}
+	return nil
 }
 
 // Status reports the current state for the wizard's poll loop and the
@@ -340,15 +310,9 @@ func (m *TLSManager) Status() TLSStatus {
 }
 
 // Shutdown stops the HTTPS server and the CertMagic cache's maintenance
-// goroutine. The process-wide WaitGroup drains the listener goroutine;
-// this just signals it.
-//
-// Setting closed under mu before reading main/cache means any racing
-// Enable call observes closed=true and refuses to wg.Add — keeping the
-// "every Add happens before Wait sees the counter at zero" invariant.
+// goroutine. The process-wide WaitGroup drains the listener goroutine.
 func (m *TLSManager) Shutdown(ctx context.Context) {
 	m.mu.Lock()
-	m.closed = true
 	main, cache := m.main, m.cache
 	m.mu.Unlock()
 	if main != nil {
@@ -359,46 +323,166 @@ func (m *TLSManager) Shutdown(ctx context.Context) {
 	}
 }
 
-// buildPlainHandler wraps the bare router with ACME HTTP-01 challenge
-// passthrough and HTTP→HTTPS redirect for requests whose Host matches
-// the configured domains. Requests with any other Host (raw IP, LAN
-// hostnames) fall through to the base handler so:
-//   - the wizard session that just enabled HTTPS doesn't 308 itself to a
-//     domain that hasn't propagated yet,
-//   - LAN clients hitting the box by IP keep working,
-//   - and the Host header is never reflected into the redirect target
-//     (an attacker-supplied Host gets passed to the chi router instead).
+// PlainRedirectHandler is the always-on plain-:80 handler. The inner
+// handler 308-redirects every request to https on the same Host;
+// attacker-supplied Host headers only redirect the attacker to
+// themselves (no auth context here). When EnableACME has installed an
+// ACME issuer, HTTP-01 challenge requests for
+// /.well-known/acme-challenge/<token> are intercepted before the
+// redirect.
 //
-// Security posture for fallthrough: the chi router's auth.Middleware is
-// the effective gate for /admin/* — a forged Host that bypasses the
-// redirect still has to authenticate to reach anything sensitive. Since
-// the session cookie is set Secure once TLS is on, a stolen plain-HTTP
-// request can't carry a valid session anyway.
-func buildPlainHandler(magic *certmagic.Config, domains []string, base http.Handler) http.Handler {
-	allowed := make(map[string]struct{}, len(domains))
-	for _, d := range domains {
-		allowed[strings.ToLower(strings.TrimSuffix(d, "."))] = struct{}{}
-	}
-	core := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// The ACME wrap is consulted PER REQUEST so it picks up the issuer
+// installed by a wizard-driven EnableACME after this handler was
+// constructed. main.go wires this handler before tlsMgr.Start runs;
+// snapshotting magic.Issuers at construction would freeze it as nil.
+func (m *TLSManager) PlainRedirectHandler() http.Handler {
+	redirect := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
+		if host == "" {
+			http.Error(w, "missing Host", http.StatusBadRequest)
+			return
+		}
+		// Strip any explicit port: the redirect target is always the
+		// implicit :443 (or whatever the host has fronted us with).
 		if i := strings.IndexByte(host, ':'); i >= 0 {
 			host = host[:i]
-		}
-		host = strings.ToLower(strings.TrimSuffix(host, "."))
-		if _, ok := allowed[host]; !ok {
-			// Not a configured domain — pass through to the app. This
-			// preserves bootstrap and LAN access without ever sending a
-			// caller-supplied Host into a redirect.
-			base.ServeHTTP(w, r)
-			return
 		}
 		w.Header().Set("Connection", "close")
 		http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusPermanentRedirect)
 	})
-	for _, iss := range magic.Issuers {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if iss := m.acmeIssuer(); iss != nil {
+			iss.HTTPChallengeHandler(redirect).ServeHTTP(w, r)
+			return
+		}
+		redirect.ServeHTTP(w, r)
+	})
+}
+
+// acmeIssuer returns the currently-installed ACME issuer, or nil if
+// EnableACME hasn't been called yet. Held under m.mu; the issuer
+// pointer itself is install-once (see EnableACME) so the returned
+// value is safe to use without a lock.
+func (m *TLSManager) acmeIssuer() *certmagic.ACMEIssuer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.magic == nil {
+		return nil
+	}
+	for _, iss := range m.magic.Issuers {
 		if am, ok := iss.(*certmagic.ACMEIssuer); ok {
-			return am.HTTPChallengeHandler(core)
+			return am
 		}
 	}
-	return core
+	return nil
+}
+
+// recordError surfaces a failure to the UI. From "selfsigned" or
+// "issuing" we flip to "error" — the operator needs to retry. From
+// "ready" we only update lastErr — a transient renewal failure
+// shouldn't downgrade a working install.
+func (m *TLSManager) recordError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastErr = err
+	if m.state != "ready" {
+		m.state = "error"
+	}
+}
+
+// buildCertMagic constructs the CertMagic config + cache. The OnEvent
+// hooks are how we drive the UI: cert_obtained flips state to "ready"
+// and triggers the persist callback; cert_failed updates the surfaced
+// error without changing state (CertMagic owns retry).
+func (m *TLSManager) buildCertMagic() (*certmagic.Config, *certmagic.Cache) {
+	var magic *certmagic.Config
+	cache := certmagic.NewCache(certmagic.CacheOptions{
+		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) {
+			return magic, nil
+		},
+	})
+	magic = certmagic.New(cache, certmagic.Config{
+		Storage: &certmagic.FileStorage{Path: m.cfg.Paths.Certs},
+		OnEvent: func(_ context.Context, event string, data map[string]any) error {
+			switch event {
+			case "cert_obtained":
+				m.mu.Lock()
+				m.state = "ready"
+				m.lastErr = nil
+				cb := m.onEnabled
+				domains, email, staging := m.acmeArgsLocked()
+				m.mu.Unlock()
+				m.hasRealCert.Store(true)
+				log.Printf("tls: cert obtained for %v", data["identifier"])
+				if cb != nil {
+					cb(domains, email, staging)
+				}
+			case "cert_failed":
+				if err, ok := data["error"].(error); ok && err != nil {
+					m.mu.Lock()
+					m.lastErr = err
+					m.mu.Unlock()
+					log.Printf("tls: cert_failed for %v: %v", data["identifier"], err)
+				}
+			}
+			return nil
+		},
+	})
+	return magic, cache
+}
+
+// acmeArgsLocked returns the operator-supplied ACME arguments for the
+// persist callback. Caller must hold m.mu. Reads from manager fields
+// (set by EnableACME) rather than m.cfg — the persist callback's
+// entire job is to update m.cfg, so reading from cfg here would
+// observe stale zero-values on the first wizard-issued cert.
+func (m *TLSManager) acmeArgsLocked() (domains []string, email string, staging bool) {
+	return m.acmeDomains, m.acmeEmail, m.acmeStaging
+}
+
+// buildTLSConfig wraps CertMagic's GetCertificate with a self-signed
+// fallback. On first request for a name CertMagic doesn't have, the
+// listener returns the persistent self-signed cert so the connection
+// completes (with a browser warning) instead of dying with "no
+// certificate available." Once ACME issues a real cert, CertMagic's
+// cache returns it and the fallback is bypassed.
+func (m *TLSManager) buildTLSConfig(magic *certmagic.Config) *tls.Config {
+	base := magic.TLSConfig()
+	cmGet := base.GetCertificate
+	base.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if cert, err := cmGet(hello); err == nil && cert != nil {
+			return cert, nil
+		}
+		ss := m.selfSigned.Load()
+		if ss == nil {
+			return nil, errors.New("tls: no certificate available (self-signed bootstrap missing)")
+		}
+		return ss, nil
+	}
+	// Application protocols on top of the ACME-TLS sentinel certmagic
+	// pre-populated.
+	base.NextProtos = append([]string{"h2", "http/1.1"}, base.NextProtos...)
+	return base
+}
+
+// certAlreadyCached returns true if CertMagic already has a usable
+// cert in cache for any of the supplied domains. After ManageAsync,
+// this catches the "cert from previous run was loaded from storage"
+// case where cert_obtained never fires.
+func (m *TLSManager) certAlreadyCached(domains []string) bool {
+	if m.cache == nil {
+		return false
+	}
+	for _, d := range domains {
+		if len(m.cache.AllMatchingCertificates(d)) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// selfSignedDir returns the directory under cfg.Paths.Certs where the
+// bootstrap self-signed cert is persisted.
+func selfSignedDir(cfg *config.Config) string {
+	return filepath.Join(cfg.Paths.Certs, "selfsigned")
 }

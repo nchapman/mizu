@@ -638,28 +638,30 @@ func (s *Service) Middleware(next http.Handler) http.Handler {
 // (the bypass that a cross-site auto-submitting form exploits). Strict
 // withholds the cookie on every cross-site request. The behavioral cost
 // — clicking a link to /admin from another site lands you unauthed —
-// is fine for an admin UI; the operator just logs in. HttpOnly always
-// set; Secure when serving HTTPS so the cookie can't leak over the
-// first-visit HTTP→HTTPS redirect before HSTS caches.
-func SetCookie(w http.ResponseWriter, token string, secure bool) {
+// is fine for an admin UI; the operator just logs in.
+//
+// Secure is always true: the only listener serving non-redirect traffic
+// is HTTPS (the plain :80 listener 308-redirects everything). A Secure
+// cookie that doesn't go over plain HTTP is the right invariant.
+func SetCookie(w http.ResponseWriter, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    token,
 		Path:     "/admin",
 		HttpOnly: true,
-		Secure:   secure,
+		Secure:   true,
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
 }
 
-func ClearCookie(w http.ResponseWriter, secure bool) {
+func ClearCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    "",
 		Path:     "/admin",
 		HttpOnly: true,
-		Secure:   secure,
+		Secure:   true,
 		SameSite: http.SameSiteStrictMode,
 		MaxAge:   -1,
 	})

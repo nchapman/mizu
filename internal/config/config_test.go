@@ -97,6 +97,9 @@ paths:
 	if c.Server.TLS.Addr != ":8443" {
 		t.Errorf("default tls addr=%q, want :8443", c.Server.TLS.Addr)
 	}
+	if c.Server.TLS.ACME.Enabled {
+		t.Error("ACME unexpectedly enabled in defaults")
+	}
 	if c.Limits.ReadHeaderTimeout != 10*time.Second {
 		t.Errorf("default read_header_timeout=%v", c.Limits.ReadHeaderTimeout)
 	}
@@ -108,7 +111,7 @@ paths:
 	}
 }
 
-func TestLoad_TLSValidation(t *testing.T) {
+func TestLoad_ACMEValidation(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")
 	base := `
@@ -121,30 +124,33 @@ paths:
 	writeFile(t, cfgPath, base+`
 server:
   tls:
-    enabled: true
+    acme:
+      enabled: true
 `)
 	if _, err := Load(cfgPath); err == nil {
-		t.Fatal("expected validation error for tls.enabled without domains/email")
+		t.Fatal("expected validation error for acme.enabled without domains/email")
 	}
 
 	// Domains set but email missing.
 	writeFile(t, cfgPath, base+`
 server:
   tls:
-    enabled: true
-    domains: [example.com]
+    acme:
+      enabled: true
+      domains: [example.com]
 `)
 	if _, err := Load(cfgPath); err == nil {
-		t.Fatal("expected validation error for tls.enabled without email")
+		t.Fatal("expected validation error for acme.enabled without email")
 	}
 
 	// Both set: ok.
 	writeFile(t, cfgPath, base+`
 server:
   tls:
-    enabled: true
-    domains: [example.com]
-    email: ops@example.com
+    acme:
+      enabled: true
+      domains: [example.com]
+      email: ops@example.com
 `)
 	if _, err := Load(cfgPath); err != nil {
 		t.Fatalf("expected ok, got %v", err)
@@ -166,8 +172,8 @@ func TestLoad_MissingFile_StartsFreshInstall(t *testing.T) {
 	if c.Server.Addr == "" || c.Paths.State == "" {
 		t.Errorf("defaults not applied: %+v", c)
 	}
-	if c.Server.TLS.Enabled {
-		t.Error("TLS unexpectedly enabled in fresh-install defaults")
+	if c.Server.TLS.ACME.Enabled {
+		t.Error("ACME unexpectedly enabled in fresh-install defaults")
 	}
 }
 

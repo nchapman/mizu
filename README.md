@@ -22,11 +22,19 @@ make build
 ```
 
 That's it. The first time you boot with no `config.yml` on disk, mizu runs in
-fresh-install mode: open `http://<this-host>:8080/admin` in a browser (the
-binary, when run directly, listens on port 8080 — the Docker image below
-maps host :80 to it) and the setup wizard walks you through account creation,
-site basics, an optional DNS preflight, and optional Let's Encrypt issuance.
-The wizard writes `config.yml` on its way through.
+fresh-install mode: open `https://<this-host>:8443/admin` in a browser (the
+binary, when run directly, listens on :8080 plain → 308-redirects to :8443
+HTTPS; the Docker image below maps host :80 and :443 to those internal ports).
+
+Your browser will show a **"Not Secure" warning** on first visit — mizu boots
+with a persistent self-signed certificate so your account-creation password
+is encrypted from byte one. Click "Advanced" → "Proceed"; the warning goes
+away for good once the wizard's "Issue a real HTTPS certificate" step
+completes Let's Encrypt issuance.
+
+The setup wizard walks you through account creation, site basics, an
+optional DNS preflight, and Let's Encrypt issuance. The wizard writes
+`config.yml` on its way through.
 
 **First-run claim window.** The wizard accepts the first account creation for
 one hour after the server starts. After that the wizard refuses to claim the
@@ -79,7 +87,8 @@ polls GHCR hourly and auto-updates on new stable tags).
 Paste the contents of `deploy/cloud-init.yaml` as the user-data on any
 cloud-init-supporting VPS (Hetzner, DigitalOcean, Oracle ARM, Lightsail,
 etc.). Once it boots, point your domain's A record at the VPS IP and
-open `http://<that-ip>/admin` — the setup wizard handles the rest.
+open `https://<that-ip>/admin` — click through the one-time self-signed
+cert warning and the setup wizard handles the rest.
 
 ## Configuration
 

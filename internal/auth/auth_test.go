@@ -503,7 +503,7 @@ func TestMiddleware(t *testing.T) {
 
 func TestSetCookieAndClearCookie(t *testing.T) {
 	w := httptest.NewRecorder()
-	SetCookie(w, "abc123", false)
+	SetCookie(w, "abc123")
 	cookies := w.Result().Cookies()
 	if len(cookies) != 1 {
 		t.Fatalf("got %d cookies, want 1", len(cookies))
@@ -515,22 +515,20 @@ func TestSetCookieAndClearCookie(t *testing.T) {
 	if !c.HttpOnly || c.SameSite != http.SameSiteStrictMode {
 		t.Errorf("flags wrong: HttpOnly=%v SameSite=%v", c.HttpOnly, c.SameSite)
 	}
-	if c.Secure {
-		t.Error("Secure=true on plain-HTTP cookie")
+	if !c.Secure {
+		t.Error("Secure=false; mizu only serves cookies over HTTPS now")
 	}
 	if c.MaxAge != int(sessionTTL.Seconds()) {
 		t.Errorf("MaxAge=%d, want %d", c.MaxAge, int(sessionTTL.Seconds()))
 	}
 	w = httptest.NewRecorder()
-	SetCookie(w, "abc123", true)
-	if !w.Result().Cookies()[0].Secure {
-		t.Error("Secure=false when secure=true was passed")
-	}
-	w = httptest.NewRecorder()
-	ClearCookie(w, false)
+	ClearCookie(w)
 	cookies = w.Result().Cookies()
 	if len(cookies) != 1 || cookies[0].MaxAge >= 0 {
 		t.Errorf("ClearCookie should set MaxAge<0, got %+v", cookies)
+	}
+	if !cookies[0].Secure {
+		t.Error("ClearCookie must also set Secure so the browser scopes the deletion correctly")
 	}
 }
 

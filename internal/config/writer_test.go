@@ -74,23 +74,23 @@ poller:
 	}
 }
 
-func TestWriteTLS_RejectsEnabledWithoutDomain(t *testing.T) {
+func TestWriteACME_RejectsEnabledWithoutDomain(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yml")
-	if err := WriteTLS(path, TLSSettings{Enabled: true}); err == nil {
+	if err := WriteACME(path, ACMESettings{Enabled: true}); err == nil {
 		t.Fatal("expected error when enabled without domains")
 	}
-	if err := WriteTLS(path, TLSSettings{Enabled: true, Domains: []string{"x.example"}}); err == nil {
+	if err := WriteACME(path, ACMESettings{Enabled: true, Domains: []string{"x.example"}}); err == nil {
 		t.Fatal("expected error when enabled without email")
 	}
 }
 
-func TestWriteTLS_HappyPath(t *testing.T) {
+func TestWriteACME_HappyPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yml")
-	// Seed a site block so we can verify it survives the TLS write.
+	// Seed a site block so we can verify it survives the ACME write.
 	if err := WriteSite(path, SiteSettings{Title: "x", BaseURL: "https://x"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteTLS(path, TLSSettings{
+	if err := WriteACME(path, ACMESettings{
 		Enabled: true, Domains: []string{"a.example", "b.example"}, Email: "ops@example.com",
 	}); err != nil {
 		t.Fatal(err)
@@ -100,13 +100,13 @@ func TestWriteTLS_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !c.Server.TLS.Enabled || c.Server.TLS.Email != "ops@example.com" {
-		t.Errorf("tls=%+v", c.Server.TLS)
+	if !c.Server.TLS.ACME.Enabled || c.Server.TLS.ACME.Email != "ops@example.com" {
+		t.Errorf("acme=%+v", c.Server.TLS.ACME)
 	}
-	if len(c.Server.TLS.Domains) != 2 {
-		t.Errorf("domains=%v", c.Server.TLS.Domains)
+	if len(c.Server.TLS.ACME.Domains) != 2 {
+		t.Errorf("domains=%v", c.Server.TLS.ACME.Domains)
 	}
 	if c.Site.Title != "x" {
-		t.Error("TLS write nuked site block")
+		t.Error("ACME write nuked site block")
 	}
 }

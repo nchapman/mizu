@@ -456,10 +456,12 @@ function TLSStep({
 
   return (
     <Card>
-      <h2 className="mb-2 text-lg font-semibold">Enable HTTPS</h2>
+      <h2 className="mb-2 text-lg font-semibold">Issue a real HTTPS certificate</h2>
       <p className="mb-3 text-sm text-muted-foreground">
-        Optional. We use Let's Encrypt's free certificates. You can skip this
-        and run behind your own TLS terminator instead.
+        You're already on HTTPS — mizu serves a self-signed certificate
+        from boot, which is why you saw the browser warning earlier.
+        Issuing a free Let's Encrypt certificate makes the warning go
+        away for everyone else who visits.
       </p>
       <div className="space-y-3">
         <Field
@@ -508,7 +510,7 @@ function Done({ onClose, tlsDomain }: { onClose: () => void; tlsDomain: string }
   // public tls-status endpoint and only surface the HTTPS link once
   // the manager reports state==="ready". The plain admin link is
   // always available so the operator is never stuck.
-  const [tlsState, setTlsState] = useState<string>(tlsDomain ? "issuing" : "off");
+  const [tlsState, setTlsState] = useState<string>(tlsDomain ? "issuing" : "selfsigned");
   useEffect(() => {
     if (!tlsDomain) return;
     let cancelled = false;
@@ -541,8 +543,8 @@ function Done({ onClose, tlsDomain }: { onClose: () => void; tlsDomain: string }
       {tlsDomain && !tlsReady && (
         <p className="mb-3 text-xs text-muted-foreground">
           {tlsState === "error"
-            ? "HTTPS hit a snag — you can keep using the admin over plain HTTP and retry from Settings."
-            : "Issuing your Let's Encrypt certificate. This usually takes a few seconds once DNS is in place."}
+            ? "Let's Encrypt hit a snag — you can keep using the admin (the self-signed cert still works) and retry from Settings."
+            : "Issuing your Let's Encrypt certificate. This usually takes a few seconds once DNS is in place. The browser warning will disappear automatically."}
         </p>
       )}
       <div className="flex justify-end gap-2">
