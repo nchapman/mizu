@@ -39,8 +39,26 @@ packages:
   - curl
   - gnupg
   - ufw
+  - unattended-upgrades
 
 write_files:
+  # Ubuntu cloud images ship with unattended-upgrades enabled for
+  # security updates by default, but auto-reboot is off — so kernel
+  # and libc patches don't take effect until someone reboots. For a
+  # single-host personal appliance with a non-Linux operator that's
+  # a foot-gun, so we flip it on. We deliberately don't pin a reboot
+  # time: VPS hosts run UTC, the operator's timezone is unknown, and
+  # the default behavior (reboot when the apt-daily-upgrade timer
+  # fires, ~06:00 UTC with random jitter) is no worse than any fixed
+  # time we could pick and avoids a synchronized fleet-wide reboot.
+  # The mizu container has restart: unless-stopped so it comes back
+  # automatically.
+  - path: /etc/apt/apt.conf.d/52unattended-upgrades-local
+    permissions: "0644"
+    owner: root:root
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "true";
+
   - path: /opt/mizu/docker-compose.yml
     permissions: "0644"
     owner: root:root
