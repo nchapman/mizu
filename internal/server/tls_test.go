@@ -125,6 +125,21 @@ func TestTLSManager_RecordErrorFromIssuingFlipsToError(t *testing.T) {
 	}
 }
 
+func TestTLSManager_EnableAfterShutdownRefuses(t *testing.T) {
+	// A wizard click that lands after Shutdown has begun must not call
+	// wg.Add: the process-wide WaitGroup is already being drained, and
+	// Add-after-Wait either panics or sneaks a goroutine past shutdown.
+	m := newTestManager()
+	m.Shutdown(t.Context())
+	err := m.Enable(t.Context(), []string{"x.example"}, "ops@example.com", true)
+	if err == nil || !strings.Contains(err.Error(), "shutting down") {
+		t.Errorf("expected shutting-down guard, got %v", err)
+	}
+	if s := m.Status(); s.State != "off" {
+		t.Errorf("state=%q after post-shutdown Enable, want off", s.State)
+	}
+}
+
 func TestBuildPlainHandler_StripsPortAndCase(t *testing.T) {
 	h := buildPlainHandler(&certmagic.Config{}, []string{"mizu.fyi"}, passthroughBase)
 	req := httptest.NewRequest("GET", "http://Mizu.FYI:8080/x", nil)

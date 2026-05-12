@@ -183,7 +183,7 @@ func main() {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Compress(5))
-	r.Use(mizuserver.SecureHeaders(cfg.Server.TLS))
+	r.Use(mizuserver.SecureHeaders())
 	r.Use(mizuserver.RateLimit(cfg.Limits.Rate.Global))
 
 	r.Route("/admin", adminSrv.Routes)

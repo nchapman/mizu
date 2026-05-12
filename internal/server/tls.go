@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/certmagic"
@@ -66,6 +67,21 @@ type TLSManager struct {
 	magic *certmagic.Config
 	cache *certmagic.Cache
 	main  *http.Server
+
+	// closed flips once Shutdown begins. Enable consults it under mu
+	// before m.wg.Add(1) so a late wizard-flip can't add to the
+	// WaitGroup that bg.Wait() is already draining (Add-after-Wait
+	// panics on a zero counter; even with a non-zero counter the order
+	// of operations here is fragile and worth pinning down).
+	closed bool
+
+	// rollingBack tells the HTTPS listener goroutine to skip its
+	// recordError call when Enable's sync rollback path is shutting it
+	// down. Without this, a bind-failure in the goroutine and the
+	// ManageAsync error in the sync path race to set lastErr; we want
+	// the ManageAsync error to win because that's the one Enable
+	// returns to the API caller.
+	rollingBack atomic.Bool
 }
 
 // NewTLSManager constructs an idle manager. handler is the same chi
@@ -134,6 +150,13 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 	}
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		// Shutdown has begun. Refusing the Add here keeps the
+		// process-wide WaitGroup ordering invariant: every Add happens
+		// before bg.Wait observes the counter at zero.
+		return errors.New("tls: manager shutting down")
+	}
 	if m.handler == nil {
 		m.mu.Unlock()
 		// Belt-and-braces guard. If main.go ever forgets to wire
@@ -154,6 +177,15 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 	plainBase := m.plainHandlerBase
 	setPlain := m.setPlainHandler
 	m.lastErr = nil
+	// Reserve the WaitGroup slot now, while still holding mu and
+	// before we've done any heavy work. The goroutine that consumes it
+	// is started further down; if anything between here and there
+	// fails (or panics), defer m.wg.Done in the failure paths is the
+	// caller's responsibility — but in practice we only fail before
+	// the goroutine starts via the ManageAsync rollback below, which
+	// is itself responsible for shutting the goroutine down.
+	m.wg.Add(1)
+	m.rollingBack.Store(false)
 	m.mu.Unlock()
 
 	addr := m.cfg.Server.TLS.Addr
@@ -241,14 +273,21 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 	m.state = "issuing"
 	m.mu.Unlock()
 
-	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
 		log.Printf("mizu listening on %s (https) for %v", mainSrv.Addr, domains)
-		if err := mainSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			log.Printf("https server: %v", err)
-			m.recordError(fmt.Errorf("https listener: %w", err))
+		err := mainSrv.ListenAndServeTLS("", "")
+		if err == nil || err == http.ErrServerClosed {
+			return
 		}
+		log.Printf("https server: %v", err)
+		// During Enable's sync rollback the ManageAsync error is the
+		// authoritative one — skip recordError here so it doesn't race
+		// to overwrite lastErr.
+		if m.rollingBack.Load() {
+			return
+		}
+		m.recordError(fmt.Errorf("https listener: %w", err))
 	}()
 
 	if err := magic.ManageAsync(ctx, domains); err != nil {
@@ -256,6 +295,7 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 		// already running. Shut it down so a Retry from the UI can call
 		// Enable again without "address already in use", and swap the
 		// plain handler back to the bare router.
+		m.rollingBack.Store(true)
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = mainSrv.Shutdown(shutdownCtx)
 		cancel()
@@ -302,8 +342,13 @@ func (m *TLSManager) Status() TLSStatus {
 // Shutdown stops the HTTPS server and the CertMagic cache's maintenance
 // goroutine. The process-wide WaitGroup drains the listener goroutine;
 // this just signals it.
+//
+// Setting closed under mu before reading main/cache means any racing
+// Enable call observes closed=true and refuses to wg.Add — keeping the
+// "every Add happens before Wait sees the counter at zero" invariant.
 func (m *TLSManager) Shutdown(ctx context.Context) {
 	m.mu.Lock()
+	m.closed = true
 	main, cache := m.main, m.cache
 	m.mu.Unlock()
 	if main != nil {

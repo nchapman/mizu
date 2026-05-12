@@ -502,16 +502,52 @@ function TLSStep({
 }
 
 function Done({ onClose, tlsDomain }: { onClose: () => void; tlsDomain: string }) {
-  const url = tlsDomain ? `https://${tlsDomain}/admin` : "/admin";
+  // If the operator enabled TLS, the cert may still be issuing when the
+  // wizard reaches Done. Linking to https://<domain>/admin before
+  // CertMagic finishes drops them on a browser warning page. Poll the
+  // public tls-status endpoint and only surface the HTTPS link once
+  // the manager reports state==="ready". The plain admin link is
+  // always available so the operator is never stuck.
+  const [tlsState, setTlsState] = useState<string>(tlsDomain ? "issuing" : "off");
+  useEffect(() => {
+    if (!tlsDomain) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const r = await fetch("/admin/api/setup/tls-status");
+        if (!r.ok) return;
+        const j = (await r.json()) as { state?: string };
+        if (!cancelled && j.state) setTlsState(j.state);
+      } catch {
+        // Network blip — the next tick will retry.
+      }
+    };
+    tick();
+    const id = window.setInterval(tick, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [tlsDomain]);
+
+  const tlsReady = tlsState === "ready";
+  const httpsURL = `https://${tlsDomain}/admin`;
   return (
     <Card>
       <h2 className="mb-2 text-lg font-semibold">You're set</h2>
       <p className="mb-3 text-sm text-muted-foreground">
         That's it. Mizu is ready to publish and read feeds.
       </p>
+      {tlsDomain && !tlsReady && (
+        <p className="mb-3 text-xs text-muted-foreground">
+          {tlsState === "error"
+            ? "HTTPS hit a snag — you can keep using the admin over plain HTTP and retry from Settings."
+            : "Issuing your Let's Encrypt certificate. This usually takes a few seconds once DNS is in place."}
+        </p>
+      )}
       <div className="flex justify-end gap-2">
-        {tlsDomain ? (
-          <a href={url}>
+        {tlsDomain && tlsReady ? (
+          <a href={httpsURL}>
             <Button>Open admin over HTTPS</Button>
           </a>
         ) : (
