@@ -16,7 +16,7 @@
 #   - Visit https://<that-ip>/admin (raw IP is fine; DNS doesn't
 #     need to have propagated yet). Your browser will show a
 #     "Not Secure" warning because the cert is self-signed at this
-#     point — click "Advanced" → "Proceed" to continue. This is
+#     point -- click "Advanced" -> "Proceed" to continue. This is
 #     expected and goes away once Let's Encrypt issues a real cert.
 #   - The setup wizard walks you through account, site basics, the
 #     DNS preflight, and Let's Encrypt issuance.
@@ -43,7 +43,7 @@ packages:
 
 write_files:
   # Ubuntu cloud images ship with unattended-upgrades enabled for
-  # security updates by default, but auto-reboot is off — so kernel
+  # security updates by default, but auto-reboot is off -- so kernel
   # and libc patches don't take effect until someone reboots. For a
   # single-host personal appliance with a non-Linux operator that's
   # a foot-gun, so we flip it on. We deliberately don't pin a reboot
