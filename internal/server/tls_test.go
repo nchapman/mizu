@@ -90,6 +90,9 @@ func TestTLSManager_PlainHandlerSwapGuard(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "plain handler swap not wired") {
 		t.Errorf("expected plain-swap guard, got %v", err)
 	}
+	if s := m.Status(); s.State != "off" {
+		t.Errorf("state=%q after guard-rejected Enable, want off", s.State)
+	}
 }
 
 func TestTLSManager_RecordErrorAfterReadyDoesNotDowngrade(t *testing.T) {

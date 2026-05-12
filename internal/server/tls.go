@@ -48,11 +48,15 @@ type TLSManager struct {
 	handler http.Handler
 	wg      *sync.WaitGroup
 
-	mu               sync.Mutex
-	state            string
-	lastErr          error
-	onEnabled        func(domains []string, email string, staging bool)
-	setPlainHandler  func(http.Handler)
+	mu              sync.Mutex
+	state           string
+	lastErr         error
+	onEnabled       func(domains []string, email string, staging bool)
+	setPlainHandler func(http.Handler)
+	// plainHandlerBase is the unwrapped chi router. Retained on the
+	// manager for one reason: if Enable's ManageAsync call fails after
+	// we've already swapped the plain listener to the ACME+redirect
+	// wrapper, we need the original to swap back to.
 	plainHandlerBase http.Handler
 
 	// magic is retained on the struct so its certificate cache + the
@@ -149,7 +153,6 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 	handler := m.handler
 	plainBase := m.plainHandlerBase
 	setPlain := m.setPlainHandler
-	m.state = "issuing"
 	m.lastErr = nil
 	m.mu.Unlock()
 
@@ -231,7 +234,12 @@ func (m *TLSManager) Enable(ctx context.Context, domains []string, email string,
 	// Install the wrapped handler on the plain listener BEFORE the
 	// HTTPS listener starts so ACME HTTP-01 challenges (which Let's
 	// Encrypt fires inside ManageAsync) hit the challenge handler.
+	// Flip state to "issuing" *after* the swap so a Status() poll
+	// observing "issuing" can rely on the wrapped handler being live.
 	setPlain(buildPlainHandler(magic, domains, plainBase))
+	m.mu.Lock()
+	m.state = "issuing"
+	m.mu.Unlock()
 
 	m.wg.Add(1)
 	go func() {
@@ -315,6 +323,12 @@ func (m *TLSManager) Shutdown(ctx context.Context) {
 //   - LAN clients hitting the box by IP keep working,
 //   - and the Host header is never reflected into the redirect target
 //     (an attacker-supplied Host gets passed to the chi router instead).
+//
+// Security posture for fallthrough: the chi router's auth.Middleware is
+// the effective gate for /admin/* — a forged Host that bypasses the
+// redirect still has to authenticate to reach anything sensitive. Since
+// the session cookie is set Secure once TLS is on, a stolen plain-HTTP
+// request can't carry a valid session anyway.
 func buildPlainHandler(magic *certmagic.Config, domains []string, base http.Handler) http.Handler {
 	allowed := make(map[string]struct{}, len(domains))
 	for _, d := range domains {
