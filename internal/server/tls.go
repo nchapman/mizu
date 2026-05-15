@@ -274,18 +274,25 @@ func (m *TLSManager) EnableACME(ctx context.Context, domains []string, email str
 	cb := m.onEnabled
 	m.mu.Unlock()
 
-	if err := magic.ManageAsync(ctx, domains); err != nil {
-		m.recordError(err)
-		return err
+	// If a previous run already obtained a cert, load it synchronously
+	// from storage into the cache so the wizard's status display (and
+	// HSTS) reflect reality immediately. CertMagic's cert_obtained
+	// event only fires on fresh issuance or renewal — not on cache
+	// loads — so without this sync probe state would stay "issuing"
+	// until the next renewal (up to ~60 days for a 90-day cert). The
+	// older post-ManageAsync probe via cache.AllMatchingCertificates
+	// raced the async load goroutine and almost always lost on boot.
+	// The cb fires here AND from cert_obtained on renewal;
+	// PersistACMEConfig is idempotent (writes the same bytes), so the
+	// duplicate is harmless.
+	loaded := false
+	for _, d := range domains {
+		if _, err := magic.CacheManagedCertificate(ctx, d); err == nil {
+			loaded = true
+			break
+		}
 	}
-
-	// If a previous run already obtained a cert, CertMagic loads it
-	// into the cache during ManageAsync but does NOT fire
-	// cert_obtained. Probe the cache so the wizard's status display
-	// (and HSTS) reflect reality immediately. The cb fires here AND
-	// from cert_obtained on renewal — PersistACMEConfig is idempotent
-	// (writes the same bytes), so the duplicate is harmless.
-	if m.certAlreadyCached(domains) {
+	if loaded {
 		m.mu.Lock()
 		m.state = "ready"
 		m.mu.Unlock()
@@ -293,6 +300,11 @@ func (m *TLSManager) EnableACME(ctx context.Context, domains []string, email str
 		if cb != nil {
 			cb(domains, email, staging)
 		}
+	}
+
+	if err := magic.ManageAsync(ctx, domains); err != nil {
+		m.recordError(err)
+		return err
 	}
 	return nil
 }
@@ -463,22 +475,6 @@ func (m *TLSManager) buildTLSConfig(magic *certmagic.Config) *tls.Config {
 	// pre-populated.
 	base.NextProtos = append([]string{"h2", "http/1.1"}, base.NextProtos...)
 	return base
-}
-
-// certAlreadyCached returns true if CertMagic already has a usable
-// cert in cache for any of the supplied domains. After ManageAsync,
-// this catches the "cert from previous run was loaded from storage"
-// case where cert_obtained never fires.
-func (m *TLSManager) certAlreadyCached(domains []string) bool {
-	if m.cache == nil {
-		return false
-	}
-	for _, d := range domains {
-		if len(m.cache.AllMatchingCertificates(d)) > 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // selfSignedDir returns the directory under cfg.Paths.Certs where the
