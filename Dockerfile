@@ -69,13 +69,6 @@ VOLUME ["/app/content", "/app/media", "/app/cache", "/app/state"]
 # container runs unprivileged. Compose files publish them as needed.
 EXPOSE 8080 8443
 
-# Liveness check: the public site root is served from the same
-# binary, so a 200 here means the process is up and the site server
-# is responding. Per-wget `-T 2` connect timeout keeps a half-open
-# port from hanging the probe past the HEALTHCHECK --timeout window.
-HEALTHCHECK --interval=30s --timeout=6s --start-period=10s \
-    CMD wget -qO- -T 2 http://localhost:8080/ >/dev/null 2>&1 || exit 1
-
 # The container expects a config file at /app/config.yml — the
 # operator can either mount one or copy the example and edit it.
 ENTRYPOINT ["/app/mizu", "--config", "/app/config.yml"]

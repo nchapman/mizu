@@ -47,9 +47,14 @@ services:
     # too. Belt + suspenders.
     labels:
       com.centurylinklabs.watchtower.enable: "true"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "-T", "2", "--no-check-certificate", "https://localhost:8443/"]
+      interval: 30s
+      timeout: 6s
+      start_period: 10s
 
   watchtower:
-    image: containrrr/watchtower:latest
+    image: nickfedor/watchtower:latest
     container_name: watchtower
     restart: unless-stopped
     environment:
