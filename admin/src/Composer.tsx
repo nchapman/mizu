@@ -7,7 +7,7 @@ import {
   useState,
 } from "react";
 import { flushSync } from "react-dom";
-import { Code, FileText, Heading, ImagePlus, X } from "lucide-react";
+import { Code, FileText, ImagePlus, TextSelect, Type, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -27,7 +27,11 @@ import {
   updatePost,
   uploadMedia,
 } from "@/api";
-import { MarkdownEditor, type MarkdownEditorHandle } from "@/MarkdownEditor";
+import {
+  MarkdownEditor,
+  type MarkdownEditorHandle,
+  type UploadedImage,
+} from "@/MarkdownEditor";
 import type { EditTarget } from "@/Shell";
 import { cn } from "@/lib/utils";
 
@@ -71,6 +75,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [mode, setMode] = useState<EditorMode>("rich");
+  const [showFormat, setShowFormat] = useState(false);
   // editorKey forces the rich Lexical editor to re-init from a fresh
   // initialValue. Bumped on reset, target loads, and mode flips into
   // rich — anywhere the body changes from outside the editor's own typing.
@@ -165,18 +170,20 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
 
   // Memoized because MarkdownEditor passes this to a useEffect dep list —
   // without useCallback, every keystroke would tear down and re-register
-  // the editor's PASTE/DROP command listeners.
+  // the editor's PASTE/DROP command listeners. Returns one descriptor
+  // per uploaded image so the rich editor can build ImageNodes directly
+  // (rather than inserting raw `![alt](url)` text that wouldn't render).
   const uploadAndCollect = useCallback(
-    async (files: File[]): Promise<string[]> => {
+    async (files: File[]): Promise<UploadedImage[]> => {
       if (files.length === 0) return [];
       setErr("");
       setUploading(true);
       try {
-        const out: string[] = [];
+        const out: UploadedImage[] = [];
         for (const f of files) {
           const m = await uploadMedia(f);
-          const alt = f.name.replace(/\.[^.]+$/, "");
-          out.push(`![${alt}](${m.url})\n`);
+          const altText = f.name.replace(/\.[^.]+$/, "");
+          out.push({ src: m.url, altText });
         }
         return out;
       } catch (e) {
@@ -194,13 +201,13 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
   );
 
   async function uploadFilesMd(files: File[]) {
-    const snippets = await uploadAndCollect(files);
-    for (const s of snippets) insertAtCaret(s);
+    const uploads = await uploadAndCollect(files);
+    for (const u of uploads) insertAtCaret(`![${u.altText}](${u.src})\n`);
   }
 
   async function uploadFilesRich(files: File[]) {
-    const snippets = await uploadAndCollect(files);
-    if (snippets.length > 0) editorRef.current?.insertText(snippets.join(""));
+    const uploads = await uploadAndCollect(files);
+    for (const u of uploads) editorRef.current?.insertImage(u.src, u.altText);
   }
 
   function onPaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
@@ -219,12 +226,14 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
 
   // Flipping into rich means the editor has to re-init from the current
   // (possibly md-edited) body. Flipping into md is just a render swap —
-  // body is already current.
+  // body is already current. The format toolbar belongs to rich mode
+  // only; collapse it on the way out so the user re-opts in next time.
   function setEditorMode(next: EditorMode) {
     setMode((prev) => {
       if (prev !== next && next === "rich") setEditorKey((k) => k + 1);
       return next;
     });
+    if (next === "md") setShowFormat(false);
   }
 
   async function submit(e: React.FormEvent) {
@@ -286,7 +295,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
     ? "Publish"
     : "Post";
 
-  const draftLabel = target?.kind === "draft" ? "save draft" : "draft";
+  const draftLabel = target?.kind === "draft" ? "Save draft" : "Save as draft";
 
   return (
     <TooltipProvider delayDuration={250}>
@@ -327,13 +336,14 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             initialValue={body}
             onChange={setBody}
             onUploadImages={uploadAndCollect}
-            placeholder="What's on your mind? (paste or drop images to upload)"
+            placeholder="What's on your mind?"
             minHeight={showTitle ? "12em" : "5em"}
+            showToolbar={showFormat}
           />
         ) : (
           <textarea
             ref={textareaRef}
-            placeholder="What's on your mind? (paste or drop images to upload)"
+            placeholder="What's on your mind?"
             value={body}
             onChange={(e) => setBody(e.target.value)}
             onPaste={onPaste}
@@ -369,8 +379,9 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
               label={showTitle ? "Hide title" : "Add title"}
               onClick={() => setShowTitle((v) => !v)}
               ariaName="title"
+              active={showTitle}
             >
-              <Heading />
+              <Type />
             </ToolbarButton>
             <ToolbarButton
               label={uploading ? "Uploading…" : "Add image"}
@@ -380,6 +391,16 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
             >
               <ImagePlus />
             </ToolbarButton>
+            {mode === "rich" && (
+              <ToolbarButton
+                label={showFormat ? "Hide formatting" : "Show formatting"}
+                ariaName="format"
+                onClick={() => setShowFormat((v) => !v)}
+                active={showFormat}
+              >
+                <TextSelect />
+              </ToolbarButton>
+            )}
             <ToolbarButton
               label={mode === "rich" ? "Edit raw Markdown source" : "Back to rich editor"}
               ariaName="source"
@@ -404,7 +425,7 @@ export const Composer = forwardRef<ComposerHandle, Props>(function Composer(
           <div className="flex items-center gap-2">
             {target && (
               <Button type="button" variant="ghost" size="sm" onClick={reset}>
-                cancel
+                Cancel
               </Button>
             )}
             {target?.kind !== "post" && (

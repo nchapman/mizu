@@ -20,12 +20,37 @@
   min-height: 1.4em;
 }
 
+.lex-content-wrap {
+  position: relative;
+}
+
+/* Placeholder overlays the contenteditable inside the wrapper, so it
+   stays put whether or not the formatting toolbar is visible above. */
 .lex-placeholder {
   position: absolute;
-  top: .4em; left: .4em;
+  top: 0; left: 0;
   color: #999;
   pointer-events: none;
   user-select: none;
+}
+
+.lex-image-wrap {
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: middle;
+}
+.lex-image {
+  display: inline-block;
+  max-width: 100%;
+  /* Cap vertical footprint so a tall portrait doesn't dominate the
+     composer; the published page still renders the image at its full
+     intrinsic dimensions. */
+  max-height: 320px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border-radius: 4px;
+  margin: .25em 0;
 }
 
 .lex-p { margin: 0 0 .4em; }

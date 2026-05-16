@@ -22,6 +22,13 @@ export default defineConfig({
         secure: false,
         changeOrigin: true,
       },
+      // Uploaded media is served by the Go binary out of the public dir;
+      // proxy it so images inserted into the composer render in dev too.
+      "/media": {
+        target: "https://localhost:8443",
+        secure: false,
+        changeOrigin: true,
+      },
     },
   },
   test: {

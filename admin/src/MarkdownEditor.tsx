@@ -7,10 +7,8 @@
 //
 // Image paste/drop is delegated to the parent via `onUploadImages`,
 // which uploads the files and returns Markdown image-syntax strings;
-// the editor inserts them at the caret. We don't register a custom
-// ImageNode for the prototype, so the inserted text remains as
-// `![alt](url)` in rich mode rather than rendering inline — but it
-// roundtrips through the markdown serializer cleanly.
+// the editor parses them through the IMAGE transformer so they render
+// inline as <img>. ImageNodes serialize back to `![alt](url)`.
 
 import { forwardRef, useEffect, useImperativeHandle, useMemo } from "react";
 import type { Ref } from "react";
@@ -37,30 +35,47 @@ import { CodeNode, CodeHighlightNode } from "@lexical/code";
 import {
   $getSelection,
   $isRangeSelection,
+  $insertNodes,
   COMMAND_PRIORITY_LOW,
   PASTE_COMMAND,
   DROP_COMMAND,
 } from "lexical";
 
+import {
+  $createImageNode,
+  IMAGE_TRANSFORMER,
+  ImageNode,
+} from "@/lex/ImageNode";
+import { Toolbar } from "@/lex/Toolbar";
+
+const ALL_TRANSFORMERS = [IMAGE_TRANSFORMER, ...TRANSFORMERS];
+
 export interface MarkdownEditorHandle {
   // insertText drops a literal string at the caret. The string is NOT
   // re-parsed as Markdown — it lands as plain text in the rich tree.
-  // Used today for inline `![alt](url)` after image upload, which
-  // roundtrips correctly through the Markdown serializer even though
-  // it does not render as an image in rich mode.
   insertText(text: string): void;
+  // insertImage inserts an inline ImageNode at the caret. Use this for
+  // uploaded images so they render as <img> rather than `![…](…)` text.
+  insertImage(src: string, altText: string): void;
   focus(): void;
 }
 
 interface Props {
   initialValue: string;
   onChange: (markdown: string) => void;
-  // Returns one Markdown snippet per uploaded file; the editor inserts
-  // them at the current selection. Errors should be handled by the
-  // parent (which owns the uploading/error UI).
-  onUploadImages?: (files: File[]) => Promise<string[]>;
+  // Returns one {src, alt} per uploaded file; the editor inserts an
+  // ImageNode at the current selection for each. Errors should be
+  // handled by the parent.
+  onUploadImages?: (files: File[]) => Promise<UploadedImage[]>;
   placeholder?: string;
   minHeight?: string;
+  // When true, render the formatting toolbar above the content area.
+  showToolbar?: boolean;
+}
+
+export interface UploadedImage {
+  src: string;
+  altText: string;
 }
 
 const editorTheme = {
@@ -82,7 +97,7 @@ function ChangeBridge({ onChange }: { onChange: (md: string) => void }) {
     <OnChangePlugin
       onChange={(state) => {
         state.read(() => {
-          onChange($convertToMarkdownString(TRANSFORMERS));
+          onChange($convertToMarkdownString(ALL_TRANSFORMERS));
         });
       }}
     />
@@ -92,25 +107,29 @@ function ChangeBridge({ onChange }: { onChange: (md: string) => void }) {
 function PasteAndDropBridge({
   onUploadImages,
 }: {
-  onUploadImages?: (files: File[]) => Promise<string[]>;
+  onUploadImages?: (files: File[]) => Promise<UploadedImage[]>;
 }) {
   const [editor] = useLexicalComposerContext();
 
   useEffect(() => {
     if (!onUploadImages) return;
 
-    const insertSnippets = (snippets: string[]) => {
-      if (snippets.length === 0) return;
-      editor.update(() => {
-        const sel = $getSelection();
-        if ($isRangeSelection(sel)) sel.insertText(snippets.join(""));
+    const insertImages = (uploads: UploadedImage[]) => {
+      if (uploads.length === 0) return;
+      // Focus first so a selection exists; otherwise $insertNodes silently
+      // drops the images when the editor has never been focused (e.g. user
+      // hits the upload button without clicking into the editor).
+      editor.focus(() => {
+        editor.update(() => {
+          $insertNodes(uploads.map((u) => $createImageNode(u.src, u.altText)));
+        });
       });
     };
 
     const handleFiles = (files: File[]) => {
       const images = files.filter((f) => f.type.startsWith("image/"));
       if (images.length === 0) return false;
-      void onUploadImages(images).then(insertSnippets);
+      void onUploadImages(images).then(insertImages);
       return true;
     };
 
@@ -159,6 +178,15 @@ function ImperativeBridge({
           if ($isRangeSelection(sel)) sel.insertText(text);
         });
       },
+      insertImage(src: string, altText: string) {
+        // Focus first so $insertNodes has a selection to anchor to —
+        // otherwise the call no-ops when the editor isn't already focused.
+        editor.focus(() => {
+          editor.update(() => {
+            $insertNodes([$createImageNode(src, altText)]);
+          });
+        });
+      },
       focus() {
         editor.focus();
       },
@@ -169,7 +197,7 @@ function ImperativeBridge({
 }
 
 export const MarkdownEditor = forwardRef<MarkdownEditorHandle, Props>(function MarkdownEditor(
-  { initialValue, onChange, onUploadImages, placeholder, minHeight },
+  { initialValue, onChange, onUploadImages, placeholder, minHeight, showToolbar },
   ref,
 ) {
   // LexicalComposer reads initialConfig once on mount, so the only
@@ -189,11 +217,12 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, Props>(function M
         AutoLinkNode,
         CodeNode,
         CodeHighlightNode,
+        ImageNode,
       ],
       onError(err: Error) {
         console.error("lexical:", err);
       },
-      editorState: () => $convertFromMarkdownString(initialValue, TRANSFORMERS),
+      editorState: () => $convertFromMarkdownString(initialValue, ALL_TRANSFORMERS),
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
@@ -202,24 +231,27 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, Props>(function M
   return (
     <LexicalComposer initialConfig={initialConfig}>
         <div className="lex-editor-shell">
-          <RichTextPlugin
-            contentEditable={
-              <ContentEditable
-                className="lex-content"
-                style={{ minHeight: minHeight ?? "8em" }}
-              />
-            }
-            placeholder={
-              placeholder ? (
-                <div className="lex-placeholder">{placeholder}</div>
-              ) : null
-            }
-            ErrorBoundary={LexicalErrorBoundary}
-          />
+          {showToolbar && <Toolbar />}
+          <div className="lex-content-wrap">
+            <RichTextPlugin
+              contentEditable={
+                <ContentEditable
+                  className="lex-content"
+                  style={{ minHeight: minHeight ?? "8em" }}
+                />
+              }
+              placeholder={
+                placeholder ? (
+                  <div className="lex-placeholder">{placeholder}</div>
+                ) : null
+              }
+              ErrorBoundary={LexicalErrorBoundary}
+            />
+          </div>
           <HistoryPlugin />
           <ListPlugin />
           <LinkPlugin />
-          <MarkdownShortcutPlugin transformers={TRANSFORMERS} />
+          <MarkdownShortcutPlugin transformers={ALL_TRANSFORMERS} />
           <ChangeBridge onChange={onChange} />
           <PasteAndDropBridge onUploadImages={onUploadImages} />
           <ImperativeBridge handleRef={ref} />

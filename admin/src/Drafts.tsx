@@ -87,7 +87,7 @@ export function DraftsView({
       <EmptyState
         icon={FileText}
         title="No drafts"
-        description={`Compose something and hit "draft" to save it without publishing.`}
+        description={`Compose something and hit "Save as draft" to keep it without publishing.`}
       />
     );
   }
