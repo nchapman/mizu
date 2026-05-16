@@ -6,6 +6,7 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 
 import { changeOwnPassword, Unauthorized } from "./api";
+import { applyTheme, loadThemePref, saveThemePref, type ThemePref } from "./lib/theme";
 
 export type TLSStatus = { state: string; error?: string };
 
@@ -57,10 +58,17 @@ export function SettingsView({
   onTLSChanged?: () => void;
 } = {}) {
   const [prefs, setPrefs] = useState<Prefs>(loadPrefs);
+  const [theme, setTheme] = useState<ThemePref>(loadThemePref);
 
   useEffect(() => {
     savePrefs(prefs);
   }, [prefs]);
+
+  function chooseTheme(next: ThemePref) {
+    setTheme(next);
+    saveThemePref(next);
+    applyTheme(next);
+  }
 
   function toggle<K extends keyof Prefs>(key: K) {
     setPrefs((p) => ({ ...p, [key]: !p[key] }));
@@ -74,6 +82,7 @@ export function SettingsView({
       <Separator className="mb-4" />
 
       <div className="space-y-4">
+        <ThemeRow value={theme} onChange={chooseTheme} />
         <PrefRow
           id="auto-mark-read"
           label="Auto-mark read on scroll"
@@ -269,6 +278,72 @@ function HTTPSPanel({ status, onChanged }: { status?: TLSStatus; onChanged?: () 
   );
 }
 
+const THEME_OPTIONS: { value: ThemePref; label: string }[] = [
+  { value: "light", label: "Light" },
+  { value: "dark", label: "Dark" },
+  { value: "system", label: "System" },
+];
+
+function ThemeRow({
+  value,
+  onChange,
+}: {
+  value: ThemePref;
+  onChange: (v: ThemePref) => void;
+}) {
+  // Arrow-key navigation across a custom radiogroup. Native <input
+  // type="radio"> would do this for free, but we want the segmented-
+  // control look, so handle it ourselves.
+  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const idx = THEME_OPTIONS.findIndex((o) => o.value === value);
+    const delta = e.key === "ArrowRight" ? 1 : -1;
+    const next = (idx + delta + THEME_OPTIONS.length) % THEME_OPTIONS.length;
+    onChange(THEME_OPTIONS[next].value);
+  }
+  return (
+    <div className="flex items-start justify-between gap-4">
+      <div className="min-w-0 flex-1">
+        <span id="theme-label" className="text-sm font-medium leading-none">
+          Appearance
+        </span>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          Light, dark, or follow your operating system.
+        </p>
+      </div>
+      <div
+        role="radiogroup"
+        aria-labelledby="theme-label"
+        onKeyDown={onKeyDown}
+        className="inline-flex overflow-hidden rounded-md border border-input"
+      >
+        {THEME_OPTIONS.map((o) => {
+          const selected = value === o.value;
+          return (
+            <button
+              key={o.value}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              tabIndex={selected ? 0 : -1}
+              onClick={() => onChange(o.value)}
+              className={
+                "px-3 py-1 text-xs transition-colors " +
+                (selected
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-background text-foreground hover:bg-muted")
+              }
+            >
+              {o.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function PrefRow({
   id,
   label,
@@ -411,7 +486,7 @@ function PasswordPanel({ onAuthLost }: { onAuthLost?: () => void }) {
           </div>
         )}
         {ok && (
-          <div role="status" className="rounded-md border border-emerald-300 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+          <div role="status" className="rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300">
             Password changed.
           </div>
         )}

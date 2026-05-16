@@ -4,14 +4,15 @@
 
 .lex-editor-shell {
   position: relative;
-  border: 1px solid #ccc;
+  border: 1px solid hsl(var(--input));
   border-radius: 4px;
-  background: white;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
   padding: .4em;
   font-size: 1em;
   font-family: inherit;
 }
-.lex-editor-shell.drag-active { outline: 2px dashed #4a90e2; }
+.lex-editor-shell.drag-active { outline: 2px dashed hsl(var(--ring)); }
 
 .lex-content {
   outline: none;
@@ -29,7 +30,7 @@
 .lex-placeholder {
   position: absolute;
   top: 0; left: 0;
-  color: #999;
+  color: hsl(var(--muted-foreground));
   pointer-events: none;
   user-select: none;
 }
@@ -65,7 +66,8 @@
 .lex-italic { font-style: italic; }
 .lex-code-inline {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  background: #f3f3f3;
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
   padding: 0 .2em;
   border-radius: 3px;
   font-size: .95em;
@@ -74,7 +76,8 @@
 .lex-code-block {
   display: block;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  background: #f6f6f6;
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
   padding: .5em;
   border-radius: 4px;
   font-size: .95em;
@@ -86,8 +89,8 @@
 .lex-quote {
   margin: 0 0 .4em;
   padding-left: .8em;
-  border-left: 3px solid #ccc;
-  color: #555;
+  border-left: 3px solid hsl(var(--border));
+  color: hsl(var(--muted-foreground));
 }
 
-.lex-link { color: #1a6abf; text-decoration: underline; }
+.lex-link { color: hsl(var(--primary)); text-decoration: underline; }

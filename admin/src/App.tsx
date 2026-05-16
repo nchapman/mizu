@@ -4,6 +4,7 @@ import { Login } from "./Login";
 import { Shell } from "./Shell";
 import { SetupWindowClosed, Wizard } from "./Wizard";
 import { Button } from "@/components/ui/button";
+import { applyTheme, loadThemePref, subscribeSystemTheme } from "./lib/theme";
 
 type MeUser = { id: number; email: string; display_name: string };
 type SetupWindow = { open: boolean; expires_at?: string };
@@ -38,6 +39,12 @@ export function App() {
   useEffect(() => {
     loadMe();
   }, [loadMe]);
+
+  // Track OS-level dark mode changes so the "system" preference reflects
+  // them without a reload. No-op when the user has pinned light or dark.
+  useEffect(() => {
+    return subscribeSystemTheme(() => applyTheme(loadThemePref()));
+  }, []);
 
   if (initErr) {
     return (
