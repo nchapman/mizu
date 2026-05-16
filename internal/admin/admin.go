@@ -870,6 +870,14 @@ func (s *Server) addSubscription(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "feed url resolves to a blocked address", http.StatusBadRequest)
 		return
 	}
+	if errors.Is(err, feeds.ErrNoFeedFound) {
+		http.Error(w, "no feed found at that URL", http.StatusBadRequest)
+		return
+	}
+	if errors.Is(err, feeds.ErrDiscoverFailed) {
+		http.Error(w, "could not reach that URL", http.StatusBadRequest)
+		return
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

@@ -15,7 +15,13 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/admin/api": "http://localhost:8080",
+      // mizu's always-on HTTPS means :8080 308-redirects to HTTPS, so
+      // proxy straight to :8443 and skip self-signed cert verification.
+      "/admin/api": {
+        target: "https://localhost:8443",
+        secure: false,
+        changeOrigin: true,
+      },
     },
   },
   test: {

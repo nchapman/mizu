@@ -89,6 +89,16 @@ func newHarness(t *testing.T) *harness {
 		}
 		return raw, nil
 	})
+	// Subscribe runs auto-discovery before persisting. Tests subscribe to
+	// URLs whose hosts aren't reachable; swap the discovery HTTP client
+	// for one that pretends every URL is already a feed.
+	feedSvc.SetDiscoverHTTPForTest(http.DefaultClient)
+	feedSvc.SetDiscoverForTest(func(_ context.Context, _ *http.Client, raw string) (string, error) {
+		if strings.TrimSpace(raw) == "" {
+			return "", feeds.ErrInvalidURL
+		}
+		return raw, nil
+	})
 	poller := feeds.NewPoller(feedStore, 0, "test/1.0")
 	feeds.SetPollerHTTPForTest(poller, http.DefaultClient)
 

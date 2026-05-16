@@ -91,7 +91,7 @@ export function SubscriptionsView({ onAuthLost }: { onAuthLost: () => void }) {
       >
         <div className="flex gap-2">
           <Input
-            placeholder="Feed URL (https://example.com/feed.xml)"
+            placeholder="Site or feed URL (e.g. news.ycombinator.com)"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             className="flex-1"

@@ -3,6 +3,7 @@ package feeds
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,6 +33,11 @@ func newService(t *testing.T) *Service {
 	st := NewStore(conn)
 	s := NewService(st, filepath.Join(dir, "subs.opml"), "My Site")
 	s.validate = noopValidate
+	// Pass-through discovery: these tests construct feed URLs directly
+	// rather than exercising the auto-discovery fetch.
+	s.discover = func(ctx context.Context, _ *http.Client, raw string) (string, error) {
+		return noopValidate(ctx, raw)
+	}
 	return s
 }
 

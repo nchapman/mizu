@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -25,6 +26,12 @@ type Service struct {
 	// tripping the SSRF guard.
 	validate func(ctx context.Context, raw string) (string, error)
 
+	// discover resolves an operator-supplied URL (which may be a bare
+	// host or an HTML page) to a canonical feed URL via autodiscovery.
+	// Tests swap discoverHTTP to point at a loopback httptest server.
+	discover     func(ctx context.Context, client *http.Client, raw string) (string, error)
+	discoverHTTP *http.Client
+
 	// mu serializes mutation of the (DB, OPML) pair so concurrent
 	// subscribe/unsubscribe requests can't interleave OPML writes with
 	// DB updates. RLock allows concurrent reads (ListFeeds) without
@@ -33,7 +40,14 @@ type Service struct {
 }
 
 func NewService(store *Store, opmlPath, siteTitle string) *Service {
-	return &Service{Store: store, opmlPath: opmlPath, siteTitle: siteTitle, validate: validateFeedURL}
+	return &Service{
+		Store:        store,
+		opmlPath:     opmlPath,
+		siteTitle:    siteTitle,
+		validate:     validateFeedURL,
+		discover:     Discover,
+		discoverHTTP: safehttp.NewClient(),
+	}
 }
 
 // LoadFromOPML reads the on-disk OPML and upserts each subscription into
@@ -110,7 +124,16 @@ func validateFeedURL(ctx context.Context, raw string) (string, error) {
 // commits to ensure the durable source of truth is updated first; if
 // the OPML write fails, the DB stays untouched.
 func (s *Service) Subscribe(ctx context.Context, feedURL, title, siteURL, category string) (*Feed, error) {
-	feedURL, err := s.validate(ctx, feedURL)
+	// Resolve operator input to a real feed URL first. The input may be
+	// a bare host or an HTML page; Discover follows <link rel="alternate">.
+	// safehttp guards the fetch at dial time, so we don't need to
+	// pre-validate the input host — but we DO re-validate the resolved
+	// URL before persisting, since autodiscovery can point anywhere.
+	resolved, err := s.discover(ctx, s.discoverHTTP, feedURL)
+	if err != nil {
+		return nil, err
+	}
+	feedURL, err = s.validate(ctx, resolved)
 	if err != nil {
 		return nil, err
 	}
